@@ -57,7 +57,10 @@ jobs:
         run: |
           set -o pipefail
           cargo tauri build ${{ matrix.args }} 2>&1 | tee build.log || {
-            tail -n 120 build.log | while IFS= read -r line; do echo "::error::$line" ; done || true
+            echo "=== ERROR LINES ==="
+            grep -nE "error(\[E[0-9]+\])?:|error\[|panicked|failed to" build.log | tail -n 60 | while IFS= read -r line; do echo "::error::$line" ; done || true
+            echo "=== RAW TAIL ==="
+            tail -n 200 build.log | while IFS= read -r line; do echo "::error::$line" ; done || true
             exit 1
           }
       - name: Release (tauri-action)
