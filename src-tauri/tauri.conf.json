@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "AI路由助手",
+  "productName": "ai-credit-manager",
   "version": "0.1.77",
   "identifier": "cn.aicredit.manager",
   "build": {
