@@ -18,7 +18,7 @@ Rust + Tauri 2 实现的多平台 AI 编程工具积分管理桌面应用：多�
 
 ## 平台
 
-- Windows 10/11 x64（NSIS 安装包 / MSI）
+- Windows 10/11 x64（NSIS 安装包）
 - macOS 11+（Intel / Apple Silicon DMG）
 - Linux x64（deb / AppImage / rpm）
 
@@ -29,7 +29,7 @@ Rust + Tauri 2 实现的多平台 AI 编程工具积分管理桌面应用：多�
 ```bash
 cargo install tauri-cli --version "^2" --locked
 cargo tauri build
-# 产物在 target/release/bundle/
+# 产物在 target/release/bundle/（Windows: nsis/*.exe; macOS: dmg/*.dmg; Linux: deb/*.deb, appimage/*.AppImage, rpm/*.rpm）
 ```
 
 仅构建调试版：
