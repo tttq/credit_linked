@@ -152,7 +152,15 @@ async fn list_models(
     }
     let mut data = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    for platform in Platform::all() {
+    // strict（仅允许当前平台）时：模型目录也只取当前平台
+    let strict = st.store.get_setting("gatewayStrict", "1").ok().map(|v| v == "1").unwrap_or(true);
+    let current = st.router.current_platform();
+    let targets: Vec<Platform> = if strict {
+        vec![current]
+    } else {
+        Platform::all().to_vec()
+    };
+    for platform in targets {
         let Some(cred) = st.router.accounts_for(platform).into_iter().next() else { continue };
         let models = match platform {
             Platform::WorkBuddy | Platform::WorkBuddyIntl => upstream::wb_fetch_models(&cred).await,
