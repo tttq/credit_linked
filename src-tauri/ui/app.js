@@ -357,7 +357,7 @@ const GW_PLATFORMS = {
   'trae-global':      { label: 'Trae 国际版', provider: 'trae', chat: true },
   'zcode':            { label: 'ZCode (智谱)', provider: 'zcode', chat: true },
   'minimax':          { label: 'MiniMax', provider: 'minimax', chat: true },
-  'qoder':            { label: 'Qoder', provider: 'qoder', chat: false },
+  'qoder':            { label: 'Qoder', provider: 'qoder', chat: true },
   'codearts':         { label: '华为码道', provider: 'codearts', chat: false },
 };
 let GW_STATUS = null;

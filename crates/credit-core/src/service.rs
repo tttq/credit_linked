@@ -160,6 +160,11 @@ impl Service {
                     meta: json!({}),
                 }
             }
+            "minimax" => {
+                let live = crate::adapters::minimax_local::read_live_auth()
+                    .ok_or_else(|| PlatformError::Local("未发现 MiniMax Code 登录信息（客户端未安装或未登录）".into()))?;
+                crate::adapters::minimax_local::to_cred(live)
+            }
             "zcode" => {
                 let Some(live) = crate::adapters::zcode_local::read_live_auth() else {
                     return Err(PlatformError::Local("未发现 ZCode 登录信息（客户端未安装或未登录）".into()));

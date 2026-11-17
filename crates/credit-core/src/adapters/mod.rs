@@ -4,6 +4,7 @@ pub mod qoder_local;
 pub mod trae;
 pub mod workbuddy;
 pub mod minimax;
+pub mod minimax_local;
 pub mod qoder;
 pub mod codearts;
 pub mod zcode;

@@ -409,9 +409,9 @@ pub fn zcode_chat_body(messages: &[Value], system: &str, model: &str, max_tokens
 // ============================ MiniMax ============================
 
 /// MiniMax 官方 API（Anthropic 兼容 + OpenAI 兼容双通道）
-pub const MINIMAX_API_BASE: &str = "https://api.minimaxi.com";
+pub const MINIMAX_API_BASE: &str = "https://agent.minimax.cn";
 /// MiniMax anthropic 兼容 chat 路径
-pub const MINIMAX_ANTHROPIC_PATH: &str = "/anthropic/v1/messages";
+pub const MINIMAX_ANTHROPIC_PATH: &str = "/mavis/api/v1/llm/v1/messages";
 
 /// MiniMax chat 请求头（凭据：MMOAT OAuth token 或 API key）
 pub fn minimax_chat_headers(token: &str) -> Vec<(String, String)> {

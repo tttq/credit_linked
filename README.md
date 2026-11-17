@@ -2,8 +2,6 @@
 
 Rust + Tauri 2 实现的多平台 AI 编程工具积分管理桌面应用：多账号登录、自动签到、额度直显、积分统计、账号路由。
 
-> 本仓库为 [AI Credit Manager (Electron)](https://github.com/) 的 Rust 复刻版本，协议逻辑对齐原版 vendor adapters。
-
 ## 功能
 
 | 模块 | 说明 |

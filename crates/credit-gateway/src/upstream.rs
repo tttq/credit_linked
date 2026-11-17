@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use futures_core::Stream;
 use futures_util::StreamExt;
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use credit_core::adapters::Cred;
 use credit_core::error::PlatformError;
@@ -703,7 +703,16 @@ impl QoderSigner {
             .map_err(|e| PlatformError::Local(format!("sidecar spawn: {e}")))?;
         let mut c = child;
         let stdin = c.stdin.take().ok_or_else(|| PlatformError::Local("sidecar stdin".into()))?;
-        let stdout = c.stdout.take().ok_or_else(|| PlatformError::Local("sidecar stdout".into()))?;
+        let mut stdout = c.stdout.take().ok_or_else(|| PlatformError::Local("sidecar stdout".into()))?;
+        // 消费 ready 帧 {"ok":true,"ready":true}
+        {
+            use tokio::io::AsyncBufReadExt;
+            let mut reader = tokio::io::BufReader::new(&mut stdout);
+            let mut ready_line = String::new();
+            reader.read_line(&mut ready_line).await
+                .map_err(|e| PlatformError::Local(format!("sidecar ready: {e}")))?;
+        }
+        let stdout = stdout;
         Ok(Self { child: c, stdin, stdout })
     }
 
