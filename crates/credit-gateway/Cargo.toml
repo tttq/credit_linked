@@ -13,4 +13,5 @@ uuid.workspace = true
 axum = { version = "0.7", default-features = false, features = ["tokio", "http1", "json"] }
 reqwest = { workspace = true, features = ["stream"] }
 futures-core = "0.3"
+bytes = "1"
 futures-util = "0.3"

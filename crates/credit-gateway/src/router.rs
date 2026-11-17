@@ -52,7 +52,7 @@ impl Router {
     // ---------- 路由规则 ----------
 
     pub fn list_rules(&self) -> Vec<RouteRule> {
-        let raw = self.store.get_setting("gw_rules", "[]").unwrap_or_else(|| "[]".into());
+        let raw = self.store.get_setting("gw_rules", "[]").unwrap_or_else(|_| "[]".into());
         serde_json::from_str(&raw).unwrap_or_default()
     }
 

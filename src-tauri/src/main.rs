@@ -5,6 +5,9 @@
 
 use credit_core::db::Store;
 use credit_core::service::Service;
+use credit_gateway::protocol::Platform;
+use credit_gateway::Router;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tauri::Manager;
 
@@ -253,6 +256,75 @@ async fn auto_tick(app: &tauri::AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+// ===== 模型网关（像本地 Ollama 一样对外提供 OpenAI 接口） =====
+
+/// 网关端口（settings 表 gateway.port 可覆盖）
+const GATEWAY_DEFAULT_PORT: u16 = 8756;
+
+fn gw_router() -> Result<Router, String> {
+    Ok(Router::new(Arc::new(Store::open_default().map_err(|e| e.to_string())?)))
+}
+
+#[tauri::command]
+async fn gateway_status() -> Result<serde_json::Value, String> {
+    let router = gw_router()?;
+    let current = router.current_platform();
+    let accounts: serde_json::Map<String, serde_json::Value> = Platform::all().iter()
+        .map(|p| (p.as_str().to_string(), serde_json::json!(router.accounts_for(*p).len())))
+        .collect();
+    let s = svc()?;
+    let port: u16 = s.store.get_setting("gatewayPort", &GATEWAY_DEFAULT_PORT.to_string())
+        .ok().and_then(|v| v.parse().ok()).unwrap_or(GATEWAY_DEFAULT_PORT);
+    let api_key = s.store.get_setting("gatewayApiKey", "").unwrap_or_default();
+    Ok(serde_json::json!({
+        "running": true,
+        "port": port,
+        "baseUrl": format!("http://127.0.0.1:{port}"),
+        "platform": current.as_str(),
+        "platformLabel": current.display(),
+        "accounts": accounts,
+        "rules": router.list_rules(),
+        "auth": !api_key.is_empty(),
+    }))
+}
+
+#[tauri::command]
+async fn gateway_set_platform(platform: String) -> Result<serde_json::Value, String> {
+    let router = gw_router()?;
+    let p = Platform::parse(&platform).ok_or_else(|| format!("未知平台: {platform}"))?;
+    router.set_current_platform(p);
+    Ok(serde_json::json!({ "ok": true, "current": p.as_str(), "label": p.display() }))
+}
+
+#[tauri::command]
+async fn gateway_add_rule(modelPattern: String, platform: String, account: String, weight: i64, enabled: bool) -> Result<serde_json::Value, String> {
+    let router = gw_router()?;
+    let rule = credit_gateway::RouteRule {
+        id: String::new(),
+        model_pattern: if modelPattern.is_empty() { "*".into() } else { modelPattern },
+        platform,
+        account,
+        weight: weight.max(1) as u32,
+        enabled,
+        created_at: String::new(),
+    };
+    let saved = router.add_rule(rule);
+    serde_json::to_value(saved).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn gateway_update_rule(rule: serde_json::Value) -> Result<(), String> {
+    let router = gw_router()?;
+    let r: credit_gateway::RouteRule = serde_json::from_value(rule).map_err(|e| e.to_string())?;
+    if router.update_rule(r) { Ok(()) } else { Err("规则不存在".into()) }
+}
+
+#[tauri::command]
+async fn gateway_delete_rule(id: String) -> Result<(), String> {
+    let router = gw_router()?;
+    if router.delete_rule(&id) { Ok(()) } else { Err("规则不存在".into()) }
+}
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
@@ -265,6 +337,25 @@ fn main() {
                     tokio::time::sleep(std::time::Duration::from_secs(60)).await;
                 }
             });
+            // 启动模型网关（axum，监听 127.0.0.1:8756；端口/密钥从 settings 读）
+            tauri::async_runtime::spawn(async move {
+                let store = match Store::open_default() {
+                    Ok(s) => Arc::new(s),
+                    Err(e) => { eprintln!("gateway store: {e}"); return; }
+                };
+                let port = store.get_setting("gatewayPort", &GATEWAY_DEFAULT_PORT.to_string())
+                    .ok().and_then(|v| v.parse::<u16>().ok()).unwrap_or(GATEWAY_DEFAULT_PORT);
+                let api_key = store.get_setting("gatewayApiKey", "").unwrap_or_default();
+                let state = Arc::new(credit_gateway::GatewayState {
+                    store: store.clone(),
+                    router: Router::new(store),
+                    api_key,
+                });
+                let addr = SocketAddr::from(([127, 0, 0, 1], port));
+                if let Err(e) = credit_gateway::serve(state, addr).await {
+                    eprintln!("gateway serve: {e}");
+                }
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -273,6 +364,7 @@ fn main() {
             account_delete, account_toggle_auto,
             statistics, daily_income, settings_get, settings_set, account_list_all, open_url,
             login_open_window, login_close_window,
+            gateway_status, gateway_set_platform, gateway_add_rule, gateway_update_rule, gateway_delete_rule,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

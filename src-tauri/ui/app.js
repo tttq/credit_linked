@@ -100,7 +100,8 @@ async function refreshAll() {
     $('#cycle-label').textContent = '今日周期 ' + SNAP.cycle;
     $('#today-str').textContent = new Date().toLocaleDateString('zh-CN', { weekday: 'long', month: 'long', day: 'numeric' });
     $('#sched-time').textContent = SETTINGS.randomTime ? '随机' : SETTINGS.time;
-    renderNav(); renderOverview(); renderAccounts(); renderCheckin(); refreshStatistics(); renderSettings(); renderRouting();
+    await refreshGateway();
+  renderNav(); renderOverview(); renderAccounts(); renderCheckin(); refreshStatistics(); renderSettings(); renderRouting();
     if (curPage === 'overview') drawOverview();
     backfillQuotas();
     applyRefreshInterval();
@@ -346,15 +347,114 @@ $$('#stat-period button').forEach(b => b.addEventListener('click', () => {
 }));
 $('#stat-account').addEventListener('change', () => { statAccount = $('#stat-account').value || 'all'; drawStatistics(); });
 
-// ===== 账号路由（占位） =====
+// ===== 账号路由 + 模型网关 =====
+// 平台清单（与 credit-gateway 的 Platform 对齐）
+const GW_PLATFORMS = {
+  'workbuddy':        { label: 'WorkBuddy 国内版', provider: 'workbuddy' },
+  'workbuddy-intl':   { label: 'WorkBuddy 国际版', provider: 'workbuddy-intl' },
+  'trae':             { label: 'Trae 国内版 (SOLO)', provider: 'trae' },
+  'trae-enterprise':  { label: 'Trae 企业版', provider: 'trae' },
+  'trae-global':      { label: 'Trae 国际版', provider: 'trae' },
+};
+let GW_STATUS = null;
+
+async function refreshGateway() {
+  try {
+    GW_STATUS = await invoke('gateway_status');
+  } catch (e) { GW_STATUS = null; }
+}
+
 function renderRouting() {
+  const el = $('#route-matrix');
+  if (!GW_STATUS) { el.innerHTML = '<div class="empty">网关状态读取失败</div>'; return; }
+  const st = GW_STATUS;
+  const platRows = Object.entries(GW_PLATFORMS).map(([name, meta]) => {
+    const count = (st.accounts || {})[name] || 0;
+    const isCurrent = st.platform === name;
+    return '<div class="route-row" data-platform="' + name + '">' +
+      '<div style="flex:1"><strong style="font-size:13.5px">' + esc(meta.label) +
+      (isCurrent ? ' <span class="tag" style="background:var(--accent-soft);color:var(--accent)">当前平台</span>' : '') +
+      '</strong><div class="subtle" style="margin-top:3px">账号池 provider：' + esc(meta.provider) + ' · 可用账号 ' + count + ' 个</div></div>' +
+      (isCurrent ? '' : '<button class="small" data-switch="' + name + '">切换到此平台</button>') +
+      '</div>';
+  }).join('');
+  const ruleRows = (st.rules || []).map(r =>
+    '<div class="route-row" data-rule="' + esc(r.id) + '">' +
+    '<div style="flex:1"><strong style="font-size:13.5px">模型前缀 ' + esc(r.model_pattern) + '</strong>' +
+    '<div class="subtle" style="margin-top:3px">' +
+    (r.platform ? '平台 → ' + esc(GW_PLATFORMS[r.platform]?.label || r.platform) : '平台 → 跟随当前') +
+    (r.account ? ' · 账号 → ' + esc(r.account) : ' · 账号 → 平台默认') +
+    (r.enabled ? '' : ' · 已停用') + '</div></div>' +
+    '<button class="small" data-rule-toggle="' + esc(r.id) + '" data-enabled="' + (r.enabled ? '1' : '0') + '">' + (r.enabled ? '停用' : '启用') + '</button>' +
+    '<button class="small" data-rule-del="' + esc(r.id) + '">删除</button>' +
+    '</div>').join('') || '<div class="empty">暂无规则 —— 全部请求按当前平台 + 平台内默认选号</div>';
+
+  el.innerHTML =
+    // 网关地址卡
+    '<section class="surface" style="margin-bottom:14px"><div class="setting-row">' +
+    '<div><h3>本地网关（OpenAI 兼容接口）</h3><p class="subtle">像本地 Ollama 一样，把下面的接口地址填进任意支持 OpenAI 的客户端。</p></div>' +
+    '<div><strong style="font-family:monospace;font-size:13px">' + esc(st.baseUrl) + '/v1</strong>' +
+    '<div class="subtle" style="margin-top:4px">GET /v1/models · POST /v1/chat/completions · 端口 ' + st.port + '</div></div></div>' +
+    '<p class="notice">模型 id 用 <code>平台/模型</code>（如 <code>workbuddy/glm-5.3-flash</code>）；裸模型 id 走下方当前平台。</p></section>' +
+    // 当前平台
+    '<h3 class="spaced">请求平台（裸模型 id 的默认路由）</h3>' + platRows +
+    // 规则
+    '<h3 class="spaced">路由规则（按模型前缀固定平台/账号）</h3>' + ruleRows +
+    '<div class="actions" style="margin-top:10px"><button id="rule-add" class="small primary">＋ 新建规则</button></div>';
+
+  el.querySelectorAll('[data-switch]').forEach(b => b.addEventListener('click', async () => {
+    b.disabled = true;
+    try {
+      await invoke('gateway_set_platform', { platform: b.dataset.switch });
+      toast('已切换请求平台');
+      await refreshGateway(); renderRouting();
+    } catch (e) { toast('切换失败: ' + e, 4200); }
+    b.disabled = false;
+  }));
+  el.querySelectorAll('[data-rule-del]').forEach(b => b.addEventListener('click', async () => {
+    try {
+      await invoke('gateway_delete_rule', { id: b.dataset.ruleDel });
+      toast('规则已删除');
+      await refreshGateway(); renderRouting();
+    } catch (e) { toast('删除失败: ' + e, 4200); }
+  }));
+  el.querySelectorAll('[data-rule-toggle]').forEach(b => b.addEventListener('click', async () => {
+    const rule = (GW_STATUS.rules || []).find(r => r.id === b.dataset.ruleToggle);
+    if (!rule) return;
+    try {
+      await invoke('gateway_update_rule', { rule: { ...rule, enabled: rule.enabled ? false : true } });
+      await refreshGateway(); renderRouting();
+    } catch (e) { toast('操作失败: ' + e, 4200); }
+  }));
+  $('#rule-add').addEventListener('click', () => showRuleModal());
+}
+
+function showRuleModal() {
   const accs = SNAP?.accounts || [];
-  $('#route-matrix').innerHTML = accs.length ? accs.map(a =>
-    '<div class="route-row">' + picon(a.provider) +
-    '<div style="flex:1"><strong style="font-size:13.5px">' + esc(platName(a.provider) + ' · ' + (a.name || a.uid.slice(0, 10))) + '</strong>' +
-    '<div class="subtle" style="margin-top:3px">' + esc(a.uid) + '</div></div>' +
-    '<span class="tag">默认路由</span><span class="tag" style="background:#f7ecd9;color:var(--amber)">规则待开放</span></div>').join('')
-    : '<div class="empty">添加账号后可配置路由</div>';
+  const accOptions = accs.map(a => '<option value="' + esc(a.provider + ':' + a.uid) + '">' + esc(platName(a.provider) + ' · ' + (a.name || a.uid.slice(0, 10))) + '</option>').join('');
+  const platOptions = Object.entries(GW_PLATFORMS).map(([k, v]) => '<option value="' + k + '">' + esc(v.label) + '</option>').join('');
+  const mask = document.createElement('div');
+  mask.className = 'modal-mask'; mask.style.display = 'flex';
+  mask.innerHTML = '<div class="modal"><h3>新建路由规则</h3>' +
+    '<div class="desc">模型前缀命中的请求固定路由到指定平台/账号；留空表示跟随当前平台。</div>' +
+    '<div style="display:grid;gap:10px;margin:12px 0">' +
+    '<label class="subtle">模型前缀（* 匹配全部）<input id="rule-model" placeholder="如 workbuddy/glm-5.3-flash 或 *" style="width:100%;padding:8px;border-radius:9px;border:1px solid var(--line);font:inherit"></label>' +
+    '<label class="subtle">目标平台<select id="rule-platform" style="width:100%;padding:8px;border-radius:9px;border:1px solid var(--line);font:inherit"><option value="">跟随当前平台</option>' + platOptions + '</select></label>' +
+    '<label class="subtle">指定账号（可选）<select id="rule-account" style="width:100%;padding:8px;border-radius:9px;border:1px solid var(--line);font:inherit"><option value="">平台内默认选号</option>' + accOptions + '</select></label>' +
+    '</div><div class="foot"><button id="rule-cancel">取消</button><button id="rule-save" class="primary">保存</button></div></div>';
+  document.body.appendChild(mask);
+  mask.querySelector('#rule-cancel').addEventListener('click', () => mask.remove());
+  mask.querySelector('#rule-save').addEventListener('click', async () => {
+    const modelPattern = mask.querySelector('#rule-model').value.trim() || '*';
+    const platform = mask.querySelector('#rule-platform').value;
+    const account = mask.querySelector('#rule-account').value;
+    try {
+      await invoke('gateway_add_rule', { modelPattern, platform, account, weight: 1, enabled: true });
+      toast('规则已保存');
+      mask.remove();
+      await refreshGateway(); renderRouting();
+    } catch (e) { toast('保存失败: ' + e, 4200); }
+  });
 }
 
 // ===== 设置 =====

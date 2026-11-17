@@ -1,12 +1,13 @@
 //! 上游调用层：模型目录抓取 + chat SSE 流式转发。
 //!
-//! 所有请求直接用凭据打上游；chat 一律流式（WorkBuddy 上游拒绝非流式，
-//! Trae SOLO 通道也是 stream-only），非流式响应由网关层聚合。
+//! chat 一律流式（WorkBuddy 上游拒绝非流式，Trae SOLO 通道也是 stream-only），
+//! 非流式响应由网关层聚合。SSE 解析用统一的"泵"结构：拉 chunk → 行缓冲 → 逐条吐事件。
 
 use std::time::Duration;
 
 use futures_core::Stream;
-use serde_json::{json, Value};
+use futures_util::StreamExt;
+use serde_json::Value;
 
 use credit_core::adapters::Cred;
 use credit_core::error::PlatformError;
@@ -16,15 +17,10 @@ use crate::protocol::*;
 /// 上游 chat 产出的一条流事件
 #[derive(Debug, Clone)]
 pub enum StreamEvent {
-    /// 正文增量
     Text(String),
-    /// 思考增量
     Reasoning(String),
-    /// token 用量
     Usage { input: u64, output: u64, total: Option<u64> },
-    /// 正常结束
     Done { finish: String },
-    /// 上游错误（message, code）
     Error(String, String),
 }
 
@@ -41,9 +37,9 @@ pub struct ModelInfo {
     pub credit_multiplier: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub supports_images: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub supports_tool_call: Option<bool>,
 }
+
+pub type EventStream = std::pin::Pin<Box<dyn Stream<Item = Result<StreamEvent, String>> + Send>>;
 
 fn http_client() -> &'static reqwest::Client {
     static C: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
@@ -56,22 +52,37 @@ fn http_client() -> &'static reqwest::Client {
     })
 }
 
+fn truncate(s: &str, n: usize) -> String {
+    if s.len() <= n {
+        s.to_string()
+    } else {
+        format!("{}…", &s[..n])
+    }
+}
+
+async fn send_sse(req: reqwest::RequestBuilder) -> Result<reqwest::Response, String> {
+    let resp = req.send().await.map_err(|e| format!("network: {e}"))?;
+    let status = resp.status().as_u16();
+    if !(200..300).contains(&status) {
+        let text = resp.text().await.unwrap_or_default();
+        return Err(format!("upstream HTTP {status}: {}", truncate(&text, 400)));
+    }
+    Ok(resp)
+}
+
 // ============================ WorkBuddy ============================
 
-/// WorkBuddy 模型目录：GET {chat_base}/v3/config，code!=0 信封，data.models × agents(cli)
+/// WorkBuddy 模型目录：GET {chat_base}/v3/config
 pub async fn wb_fetch_models(cred: &Cred) -> Result<Vec<ModelInfo>, PlatformError> {
     let domain = cred.meta.get("domain").and_then(|d| d.as_str()).unwrap_or("");
     let global = wb_is_global(domain);
     let base = if global { wb_chat_base(domain) } else { WB_CN_CHAT_BASE };
     let url = format!("{base}/v3/config");
-    let uid = &cred.uid;
-    let enterprise = cred.meta.get("enterpriseId").and_then(|e| e.as_str()).unwrap_or("");
-    let hs = wb_config_headers(&cred.token, uid, domain, global);
+    let hs = wb_config_headers(&cred.token, &cred.uid, domain, global);
     let mut req = http_client().get(&url);
     for (k, v) in &hs {
         req = req.header(k, v);
     }
-    let _ = enterprise;
     let resp = req.send().await.map_err(|e| PlatformError::Network(e.to_string()))?;
     let status = resp.status().as_u16();
     let body: Value = resp.json().await.map_err(|e| PlatformError::Format(e.to_string()))?;
@@ -84,7 +95,6 @@ pub async fn wb_fetch_models(cred: &Cred) -> Result<Vec<ModelInfo>, PlatformErro
     }
     let data = body.get("data").cloned().unwrap_or(Value::Null);
     let models = data.get("models").and_then(|m| m.as_array()).cloned().unwrap_or_default();
-    // cli 代理桶（决定哪些模型暴露给 CLI 通道）；无桶时全量暴露
     let cli_ids: Option<std::collections::HashSet<String>> = data.get("agents").and_then(|a| a.as_array()).and_then(|agents| {
         agents.iter().find(|ag| ag.get("id").and_then(|i| i.as_str()) == Some("cli"))
             .and_then(|cli| cli.get("models"))
@@ -94,11 +104,7 @@ pub async fn wb_fetch_models(cred: &Cred) -> Result<Vec<ModelInfo>, PlatformErro
     let mut out = Vec::new();
     for m in models {
         let id = m.get("id").and_then(|i| i.as_str()).unwrap_or_default().to_string();
-        if id.is_empty() || m.get("disabled").and_then(|d| d.as_bool()).unwrap_or(false) {
-            continue;
-        }
-        // auto 路由不算模型
-        if id == "auto" {
+        if id.is_empty() || id == "auto" || m.get("disabled").and_then(|d| d.as_bool()).unwrap_or(false) {
             continue;
         }
         if let Some(set) = &cli_ids {
@@ -118,17 +124,13 @@ pub async fn wb_fetch_models(cred: &Cred) -> Result<Vec<ModelInfo>, PlatformErro
             max_tokens: Some(output),
             credit_multiplier: m.pointer("/credits/base").and_then(|v| v.as_f64()),
             supports_images: m.get("supportsImages").and_then(|v| v.as_bool()),
-            supports_tool_call: m.get("supportsToolCall").and_then(|v| v.as_bool()),
         });
     }
     Ok(out)
 }
 
 /// WorkBuddy chat：POST {chat_base}/v2/chat/completions（OpenAI 线格式 SSE）
-pub async fn wb_chat_stream(
-    cred: &Cred,
-    body: Value,
-) -> Result<impl Stream<Item = Result<StreamEvent, String>>, String> {
+pub async fn wb_chat_stream(cred: &Cred, body: Value) -> Result<EventStream, String> {
     let domain = cred.meta.get("domain").and_then(|d| d.as_str()).unwrap_or("");
     let base = if wb_is_global(domain) { wb_chat_base(domain) } else { WB_CN_CHAT_BASE };
     let url = format!("{base}/v2/chat/completions");
@@ -138,94 +140,13 @@ pub async fn wb_chat_stream(
     for (k, v) in &hs {
         req = req.header(k, v);
     }
-    let resp = req.send().await.map_err(|e| e.to_string())?;
-    let status = resp.status().as_u16();
-    if !(200..300).contains(&status) {
-        let text = resp.text().await.unwrap_or_default();
-        return Err(format!("upstream HTTP {status}: {}", truncate(&text, 400)));
-    }
+    let resp = send_sse(req).await?;
     Ok(parse_openai_sse(resp.bytes_stream()))
-}
-
-/// OpenAI 线格式 SSE → StreamEvent 流
-fn parse_openai_sse(
-    stream: impl Stream<Item = Result<bytes::Bytes, reqwest::Error>>,
-) -> impl Stream<Item = Result<StreamEvent, String>> {
-    futures_util::stream::try_unfold(
-        (stream, SseBuffer::default()),
-        |(mut stream, mut buf)| async move {
-            loop {
-                if let Some(ev) = buf.next_event() {
-                    return Ok(Some((ev, (stream, buf))));
-                }
-                match stream.next().await {
-                    Some(Ok(chunk)) => buf.feed(&chunk),
-                    Some(Err(e)) => return Err(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())),
-                    None => {
-                        let tail = buf.take_tail();
-                        return Ok::<_, std::io::Error>(tail.map(|ev| (ev, (stream, buf))));
-                    }
-                }
-            }
-        },
-    )
-    .map_err(|e| e.to_string())
-}
-
-fn parse_openai_chunk(v: &Value) -> Vec<StreamEvent> {
-    let mut out = Vec::new();
-    // OpenAI 错误体
-    if let Some(err) = v.get("error") {
-        let msg = err.get("message").and_then(|m| m.as_str()).unwrap_or("upstream error").to_string();
-        let code = err.get("code").and_then(|c| c.as_str()).unwrap_or("upstream_error").to_string();
-        out.push(StreamEvent::Error(msg, code));
-        return out;
-    }
-    // WorkBuddy 队列/错误信封 {"code":6020,...}
-    if let Some(code) = v.get("code").and_then(|c| c.as_i64()) {
-        if code != 0 && v.get("choices").is_none() {
-            let msg = v.get("message").or_else(|| v.get("msg")).and_then(|m| m.as_str()).unwrap_or("upstream refused").to_string();
-            out.push(StreamEvent::Error(msg, code.to_string()));
-            return out;
-        }
-    }
-    if let Some(choices) = v.get("choices").and_then(|c| c.as_array()) {
-        for ch in choices {
-            let delta = ch.get("delta").cloned().unwrap_or(Value::Null);
-            if let Some(rc) = delta.get("reasoning_content").and_then(|r| r.as_str()) {
-                if !rc.is_empty() {
-                    out.push(StreamEvent::Reasoning(rc.to_string()));
-                }
-            }
-            if let Some(rc) = delta.get("reasoning").and_then(|r| r.as_str()) {
-                if !rc.is_empty() {
-                    out.push(StreamEvent::Reasoning(rc.to_string()));
-                }
-            }
-            if let Some(c) = delta.get("content").and_then(|c| c.as_str()) {
-                if !c.is_empty() {
-                    out.push(StreamEvent::Text(c.to_string()));
-                }
-            }
-            if let Some(fr) = ch.get("finish_reason").and_then(|f| f.as_str()) {
-                if !fr.is_empty() {
-                    out.push(StreamEvent::Done { finish: fr.to_string() });
-                }
-            }
-        }
-    }
-    if let Some(u) = v.get("usage") {
-        let input = u.get("prompt_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
-        let output = u.get("completion_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
-        let total = u.get("total_tokens").and_then(|t| t.as_u64());
-        out.push(StreamEvent::Usage { input, output, total });
-    }
-    out
 }
 
 // ============================ Trae ============================
 
-/// Trae 模型目录：GET {remote}/models?functions=...（data.list[]）
+/// Trae 模型目录：GET {remote}/models?functions=...
 pub async fn trae_fetch_models(cred: &Cred, intl: bool) -> Result<Vec<ModelInfo>, PlatformError> {
     let base = if intl { TRAE_AI_REMOTE_BASE } else { TRAE_CN_REMOTE_BASE };
     let functions = if intl {
@@ -261,27 +182,21 @@ pub async fn trae_fetch_models(cred: &Cred, intl: bool) -> Result<Vec<ModelInfo>
         };
         let features = row.get("features").cloned().unwrap_or(Value::Null);
         let multimodal = row.get("multimodal").and_then(|v| v.as_bool());
-        let consumption_rate = features.pointer("/consumption_rate/data/rate").and_then(|v| v.as_f64());
+        let rate = features.pointer("/consumption_rate/data/rate").and_then(|v| v.as_f64());
         out.push(ModelInfo {
             name: row.get("display_name").and_then(|n| n.as_str()).filter(|s| !s.is_empty()).unwrap_or(&id).to_string(),
             id,
             context_window: ctx,
             max_tokens: max_ctx,
-            credit_multiplier: consumption_rate,
+            credit_multiplier: rate,
             supports_images: multimodal,
-            supports_tool_call: None,
         });
     }
     Ok(out)
 }
 
 /// Trae chat：POST {chat}/api/agent/v3/llm_utils_chat（自定义 SSE 事件流）
-pub async fn trae_chat_stream(
-    cred: &Cred,
-    intl: bool,
-    enterprise: bool,
-    body: Value,
-) -> Result<impl Stream<Item = Result<StreamEvent, String>>, String> {
+pub async fn trae_chat_stream(cred: &Cred, intl: bool, enterprise: bool, body: Value) -> Result<EventStream, String> {
     let base = if enterprise {
         TRAE_ENTERPRISE_HOST.to_string()
     } else if intl {
@@ -295,159 +210,81 @@ pub async fn trae_chat_stream(
     for (k, v) in &hs {
         req = req.header(k, v);
     }
-    let resp = req.send().await.map_err(|e| e.to_string())?;
-    let status = resp.status().as_u16();
-    if !(200..300).contains(&status) {
-        let text = resp.text().await.unwrap_or_default();
-        // 企业网关拒绝也可能是 200+首帧 event:error，这里只拦真 HTTP 错
-        let code = if status == 400 || status == 401 || status == 403 { "auth" } else { "upstream" };
-        return Err(format!("upstream HTTP {status} [{code}]: {}", truncate(&text, 400)));
-    }
+    let resp = send_sse(req).await?;
     Ok(parse_trae_sse(resp.bytes_stream()))
 }
 
-/// Trae 自定义 SSE → StreamEvent 流（对齐 decodeTraeEvent）
-fn parse_trae_sse(
-    stream: impl Stream<Item = Result<bytes::Bytes, reqwest::Error>>,
-) -> impl Stream<Item = Result<StreamEvent, String>> {
-    futures_util::stream::try_unfold(
-        (stream, TraeSseBuffer::default()),
-        |(mut stream, mut buf)| async move {
-            loop {
-                if let Some(ev) = buf.pop_event() {
-                    return Ok(Some((ev, (stream, buf))));
-                }
-                match stream.next().await {
-                    Some(Ok(chunk)) => buf.feed(&chunk),
-                    Some(Err(e)) => return Err(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())),
-                    None => {
-                        let tail = buf.take_tail_event();
-                        return Ok::<_, std::io::Error>(tail.map(|ev| (ev, (stream, buf))));
-                    }
-                }
-            }
-        },
-    )
-    .map_err(|e| e.to_string())
+// ============================ SSE 解析 ============================
+
+/// 事件来源（决定缓冲与解析分支）
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum SseKind {
+    OpenAi,
+    Trae,
 }
 
-/// decodeTraeEvent 对齐：event 名 + data JSON → StreamEvent
-fn decode_trae_event(event_name: &str, data: &str) -> Option<StreamEvent> {
-    if data == "[DONE]" {
-        return Some(StreamEvent::Done { finish: "stop".into() });
-    }
-    let Ok(v) = serde_json::from_str::<Value>(data) else {
-        return None;
-    };
-    match event_name {
-        "request_wait_in_queue" => {
-            let pos = v.get("position").and_then(|p| p.as_u64()).unwrap_or(0);
-            Some(StreamEvent::Error(format!("上游排队中（第 {pos} 位），请稍后重试"), "queue".into()))
-        }
-        "progress_notice" => None,
-        "token_usage" => Some(StreamEvent::Usage {
-            input: v.get("prompt_tokens").and_then(|t| t.as_u64()).unwrap_or(0),
-            output: v.get("completion_tokens").and_then(|t| t.as_u64()).unwrap_or(0),
-            total: v.get("total_tokens").and_then(|t| t.as_u64()),
-        }),
-        "metadata" | "timing_cost" => None,
-        "done" => Some(StreamEvent::Done {
-            finish: v.get("finish_reason").and_then(|f| f.as_str()).unwrap_or("stop").to_string(),
-        }),
-        "error" => {
-            let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
-            let msg = v.get("message").and_then(|m| m.as_str()).unwrap_or("").to_string();
-            let readable = match code {
-                1005 => "该模型需要付费套餐".to_string(),
-                4011 | 4001 => "该账号已被限频或模型不在套餐内（可换账号/模型重试）".to_string(),
-                _ => format!("上游错误 code={code}: {msg}"),
-            };
-            Some(StreamEvent::Error(readable, code.to_string()))
-        }
-        "output" => {
-            let mut out = Vec::new();
-            if let Some(rc) = v.get("reasoning_content").and_then(|r| r.as_str()) {
-                if !rc.is_empty() {
-                    out.push(StreamEvent::Reasoning(rc.to_string()));
-                }
-            }
-            if let Some(c) = v.get("response").and_then(|r| r.as_str()) {
-                if !c.is_empty() {
-                    out.push(StreamEvent::Text(c.to_string()));
-                }
-            }
-            out.into_iter().next()
-        }
-        _ => {
-            // 未命名事件也可能带 response
-            if v.get("response").and_then(|r| r.as_str()).is_some() || v.get("reasoning_content").is_some() {
-                let mut out = Vec::new();
-                if let Some(rc) = v.get("reasoning_content").and_then(|r| r.as_str()) {
-                    if !rc.is_empty() {
-                        out.push(StreamEvent::Reasoning(rc.to_string()));
-                    }
-                }
-                if let Some(c) = v.get("response").and_then(|r| r.as_str()) {
-                    if !c.is_empty() {
-                        out.push(StreamEvent::Text(c.to_string()));
-                    }
-                }
-                out.into_iter().next()
-            } else if v.get("finish_reason").is_some() {
-                Some(StreamEvent::Done {
-                    finish: v.get("finish_reason").and_then(|f| f.as_str()).unwrap_or("stop").to_string(),
-                })
-            } else {
-                None
-            }
-        }
-    }
-}
-
-fn truncate(s: &str, n: usize) -> String {
-    if s.len() <= n {
-        s.to_string()
-    } else {
-        format!("{}…", &s[..n])
-    }
-}
-
-// ============================ SSE 缓冲 ============================
-
-/// OpenAI 风格 SSE 缓冲：data: 行 → 事件队列（一帧可展开多条事件）
-#[derive(Default)]
-struct SseBuffer {
+/// SSE 泵：拉 chunk → 缓冲 → 逐条吐事件
+struct Pump {
+    kind: SseKind,
     buf: Vec<u8>,
     queue: std::collections::VecDeque<StreamEvent>,
+    stream: std::pin::Pin<Box<dyn Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send>>,
+    done: bool,
 }
 
-impl SseBuffer {
+impl Pump {
+    fn new(kind: SseKind, stream: impl Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static) -> Self {
+        Self { kind, buf: Vec::new(), queue: Default::default(), stream: Box::pin(stream), done: false }
+    }
     fn feed(&mut self, chunk: &[u8]) {
         self.buf.extend_from_slice(chunk);
     }
-    /// 取下一条事件：队列优先，否则解析下一个 data: 帧
-    fn next_event(&mut self) -> Option<StreamEvent> {
+    /// 队列优先，否则解析下一帧
+    fn pop(&mut self) -> Option<StreamEvent> {
         if let Some(ev) = self.queue.pop_front() {
             return Some(ev);
         }
         loop {
-            let frame = self.next_frame()?;
-            if frame == "[DONE]" {
-                return Some(StreamEvent::Done { finish: "stop".into() });
-            }
-            if let Ok(v) = serde_json::from_str::<Value>(&frame) {
-                let events = parse_openai_chunk(&v);
-                if events.is_empty() {
-                    continue;
+            let (name, data) = self.next_block()?;
+            match self.kind {
+                SseKind::OpenAi => {
+                    let evs: Vec<StreamEvent> = self.decode_openai(&data);
+                    let mut it = evs.into_iter();
+                    if let Some(first) = it.next() {
+                        self.queue.extend(it);
+                        return Some(first);
+                    }
                 }
-                let mut it = events.into_iter();
-                let first = it.next().unwrap();
-                self.queue.extend(it);
-                return Some(first);
+                SseKind::Trae => {
+                    if let Some(ev) = decode_trae_event(&name, &data) {
+                        return Some(ev);
+                    }
+                }
             }
         }
     }
-    /// 流结束后残余帧
+    /// 取下一个完整 SSE 块（空行分隔）；流已结束则处理残余
+    fn next_block(&mut self) -> Option<(String, String)> {
+        loop {
+            if let Some(pos) = find_block_end(&self.buf) {
+                let block = String::from_utf8_lossy(&self.buf[..pos.0]).to_string();
+                self.buf.drain(..pos.1);
+                if let Some(ev) = parse_event_block(&block) {
+                    return Some(ev);
+                }
+                continue;
+            }
+            return None;
+        }
+    }
+    fn decode_openai(&self, data: &str) -> Vec<StreamEvent> {
+        if data == "[DONE]" {
+            return vec![StreamEvent::Done { finish: "stop".into() }];
+        }
+        let Ok(v) = serde_json::from_str::<Value>(data) else { return Vec::new() };
+        parse_openai_chunk(&v)
+    }
+    /// 流结束后的残余帧
     fn take_tail(&mut self) -> Option<StreamEvent> {
         if let Some(ev) = self.queue.pop_front() {
             return Some(ev);
@@ -457,102 +294,35 @@ impl SseBuffer {
         }
         let block = String::from_utf8_lossy(&self.buf).to_string();
         self.buf.clear();
-        for line in block.lines() {
-            if let Some(data) = line.strip_prefix("data:") {
-                let d = data.trim();
-                if d.is_empty() {
-                    continue;
-                }
-                if d == "[DONE]" {
-                    return Some(StreamEvent::Done { finish: "stop".into() });
-                }
-                if let Ok(v) = serde_json::from_str::<Value>(d) {
-                    let events = parse_openai_chunk(&v);
-                    if !events.is_empty() {
-                        let mut it = events.into_iter();
-                        let first = it.next().unwrap();
-                        self.queue.extend(it);
-                        return Some(first);
-                    }
-                }
-            }
-        }
-        None
-    }
-    /// 内部：取下一个 data: 帧
-    fn next_frame(&mut self) -> Option<String> {
-        loop {
-            let pos = find_double_newline(&self.buf)?;
-            let block = String::from_utf8_lossy(&self.buf[..pos]).to_string();
-            self.buf.drain(..pos + 2);
-            for line in block.lines() {
-                if let Some(data) = line.strip_prefix("data:") {
-                    let d = data.trim();
-                    if d.is_empty() {
-                        continue;
-                    }
-                    return Some(d.to_string());
-                }
-            }
-        }
-    }
-}
-
-/// Trae 事件缓冲（event: + data: 成对）
-#[derive(Default)]
-struct TraeSseBuffer {
-    buf: Vec<u8>,
-    queue: std::collections::VecDeque<StreamEvent>,
-}
-
-type TraeEvent = (String, String);
-
-impl TraeSseBuffer {
-    fn feed(&mut self, chunk: &[u8]) {
-        self.buf.extend_from_slice(chunk);
-    }
-    fn pop_event(&mut self) -> Option<StreamEvent> {
-        if let Some(ev) = self.queue.pop_front() {
-            return Some(ev);
-        }
-        loop {
-            let (name, data) = self.next_event()?;
-            if let Some(ev) = decode_trae_event(&name, &data) {
-                return Some(ev);
-            }
-        }
-    }
-    fn next_event(&mut self) -> Option<TraeEvent> {
-        loop {
-            let pos = find_double_newline(&self.buf)?;
-            let block = String::from_utf8_lossy(&self.buf[..pos]).to_string();
-            self.buf.drain(..pos + 2);
-            if let Some(e) = parse_event_block(&block) {
-                return Some(e);
-            }
-        }
-    }
-    fn take_tail_event(&mut self) -> Option<StreamEvent> {
-        if let Some(ev) = self.queue.pop_front() {
-            return Some(ev);
-        }
-        if self.buf.is_empty() {
-            return None;
-        }
-        let block = String::from_utf8_lossy(&self.buf).to_string();
-        self.buf.clear();
         let (name, data) = parse_event_block(&block)?;
-        decode_trae_event(&name, &data)
+        Some(match self.kind {
+            SseKind::OpenAi => self.decode_openai(&data).into_iter().next()?,
+            SseKind::Trae => decode_trae_event(&name, &data)?,
+        })
     }
+
 }
 
-fn find_double_newline(buf: &[u8]) -> Option<usize> {
-    buf.windows(2).position(|w| w == b"\n\n").or_else(|| {
-        buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 2)
-    })
+/// 块边界：\n\n 或 \r\n\r\n（返回 (内容长度, 总消耗)）
+fn find_block_end(buf: &[u8]) -> Option<(usize, usize)> {
+    for i in 0..buf.len().saturating_sub(1) {
+        if buf[i] == b'\n' {
+            if buf[i + 1] == b'\n' {
+                return Some((i, i + 2));
+            }
+            if i + 3 < buf.len() && buf[i + 1] == b'\r' && buf[i + 2] == b'\n' {
+                return Some((i, i + 4));
+            }
+            if buf[i - 1] == b'\r' && buf[i + 1] == b'\n' {
+                // \r\n\n 混合：视为边界
+                return Some((i - 1, i + 2));
+            }
+        }
+    }
+    None
 }
 
-fn parse_event_block(block: &str) -> Option<TraeEvent> {
+fn parse_event_block(block: &str) -> Option<(String, String)> {
     let mut event_name = String::new();
     let mut data = String::new();
     for line in block.lines() {
@@ -562,11 +332,155 @@ fn parse_event_block(block: &str) -> Option<TraeEvent> {
             if !data.is_empty() {
                 data.push('\n');
             }
-            data.push_str(d.trim_start_matches(' '));
+            data.push_str(d.strip_prefix(' ').unwrap_or(d));
         }
     }
     if data.is_empty() && event_name.is_empty() {
         return None;
     }
     Some((event_name, data))
+}
+
+/// OpenAI 线格式 chunk → 事件列表
+pub fn parse_openai_chunk(v: &Value) -> Vec<StreamEvent> {
+    let mut out = Vec::new();
+    if let Some(err) = v.get("error") {
+        let msg = err.get("message").and_then(|m| m.as_str()).unwrap_or("upstream error").to_string();
+        let code = err.get("code").and_then(|c| {
+            c.as_str().map(|s| s.to_string()).or_else(|| c.as_i64().map(|i| i.to_string()))
+        }).unwrap_or_else(|| "upstream_error".into());
+        return vec![StreamEvent::Error(msg, code)];
+    }
+    if let Some(code) = v.get("code").and_then(|c| c.as_i64()) {
+        if code != 0 && v.get("choices").is_none() {
+            let msg = v.get("message").or_else(|| v.get("msg")).and_then(|m| m.as_str()).unwrap_or("upstream refused").to_string();
+            return vec![StreamEvent::Error(msg, code.to_string())];
+        }
+    }
+    if let Some(choices) = v.get("choices").and_then(|c| c.as_array()) {
+        for ch in choices {
+            let delta = ch.get("delta").cloned().unwrap_or(Value::Null);
+            for key in ["reasoning_content", "reasoning"] {
+                if let Some(rc) = delta.get(key).and_then(|r| r.as_str()) {
+                    if !rc.is_empty() {
+                        out.push(StreamEvent::Reasoning(rc.to_string()));
+                    }
+                }
+            }
+            if let Some(c) = delta.get("content").and_then(|c| c.as_str()) {
+                if !c.is_empty() {
+                    out.push(StreamEvent::Text(c.to_string()));
+                }
+            }
+            if let Some(fr) = ch.get("finish_reason").and_then(|f| f.as_str()) {
+                if !fr.is_empty() {
+                    out.push(StreamEvent::Done { finish: fr.to_string() });
+                }
+            }
+        }
+    }
+    if let Some(u) = v.get("usage") {
+        if u.is_object() {
+            let input = u.get("prompt_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
+            let output = u.get("completion_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
+            let total = u.get("total_tokens").and_then(|t| t.as_u64());
+            if input > 0 || output > 0 {
+                out.push(StreamEvent::Usage { input, output, total });
+            }
+        }
+    }
+    out
+}
+
+/// Trae 事件（decodeTraeEvent 对齐）→ StreamEvent
+pub fn decode_trae_event(event_name: &str, data: &str) -> Option<StreamEvent> {
+    if data == "[DONE]" {
+        return Some(StreamEvent::Done { finish: "stop".into() });
+    }
+    let v: Value = serde_json::from_str(data).ok()?;
+    match event_name {
+        "request_wait_in_queue" => {
+            let pos = v.get("position").and_then(|p| p.as_u64()).unwrap_or(0);
+            Some(StreamEvent::Error(format!("上游排队中（第 {pos} 位），请稍后重试"), "queue".into()))
+        }
+        "progress_notice" | "metadata" | "timing_cost" => None,
+        "token_usage" => Some(StreamEvent::Usage {
+            input: v.get("prompt_tokens").and_then(|t| t.as_u64()).unwrap_or(0),
+            output: v.get("completion_tokens").and_then(|t| t.as_u64()).unwrap_or(0),
+            total: v.get("total_tokens").and_then(|t| t.as_u64()),
+        }),
+        "done" => Some(StreamEvent::Done {
+            finish: v.get("finish_reason").and_then(|f| f.as_str()).unwrap_or("stop").to_string(),
+        }),
+        "error" => {
+            let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
+            let msg = v.get("message").and_then(|m| m.as_str()).unwrap_or("").to_string();
+            let readable = match code {
+                1005 => "该模型需要付费套餐".to_string(),
+                4011 | 4001 => "该账号被限频或模型不在套餐内（可换账号/模型重试）".to_string(),
+                _ => format!("上游错误 code={code}: {msg}"),
+            };
+            Some(StreamEvent::Error(readable, code.to_string()))
+        }
+        "output" => {
+            let reasoning = v.get("reasoning_content").and_then(|r| r.as_str()).unwrap_or("");
+            let text = v.get("response").and_then(|r| r.as_str()).unwrap_or("");
+            // reasoning 优先（同一帧两者都有时先吐思考）
+            if !reasoning.is_empty() {
+                Some(StreamEvent::Reasoning(reasoning.to_string()))
+            } else if !text.is_empty() {
+                Some(StreamEvent::Text(text.to_string()))
+            } else {
+                None
+            }
+        }
+        _ => {
+            // 未命名事件兜底
+            let reasoning = v.get("reasoning_content").and_then(|r| r.as_str()).unwrap_or("");
+            let text = v.get("response").and_then(|r| r.as_str()).unwrap_or("");
+            if !reasoning.is_empty() {
+                Some(StreamEvent::Reasoning(reasoning.to_string()))
+            } else if !text.is_empty() {
+                Some(StreamEvent::Text(text.to_string()))
+            } else if let Some(fr) = v.get("finish_reason").and_then(|f| f.as_str()) {
+                Some(StreamEvent::Done { finish: fr.to_string() })
+            } else {
+                None
+            }
+        }
+    }
+}
+
+fn pump_stream(kind: SseKind, stream: std::pin::Pin<Box<dyn Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send>>) -> EventStream {
+    Box::pin(futures_util::stream::unfold(Pump::new(kind, stream), |mut p| async move {
+        loop {
+            if let Some(ev) = p.pop() {
+                return Some((Ok(ev), p));
+            }
+            if p.done {
+                return p.take_tail().map(|ev| (Ok(ev), p));
+            }
+            match p.stream.next().await {
+                Some(Ok(chunk)) => p.feed(&chunk),
+                Some(Err(e)) => return Some((Err(format!("stream: {e}")), p)),
+                None => {
+                    p.done = true;
+                    if let Some(ev) = p.take_tail() {
+                        return Some((Ok(ev), p));
+                    }
+                    return None;
+                }
+            }
+        }
+    }))
+}
+
+/// OpenAI 线格式 SSE → EventStream
+pub fn parse_openai_sse(stream: impl Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static) -> EventStream {
+    pump_stream(SseKind::OpenAi, Box::pin(stream))
+}
+
+/// Trae 自定义 SSE → EventStream
+pub fn parse_trae_sse(stream: impl Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static) -> EventStream {
+    pump_stream(SseKind::Trae, Box::pin(stream))
 }
