@@ -1,0 +1,16 @@
+[package]
+name = "credit-gateway"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+credit-core = { path = "../credit-core" }
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+axum = { version = "0.7", default-features = false, features = ["tokio", "http1", "json"] }
+reqwest = { workspace = true, features = ["stream"] }
+futures-core = "0.3"
+futures-util = "0.3"

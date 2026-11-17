@@ -1,0 +1,332 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>AI路由助手</title>
+<script src="vendor/echarts.min.js"></script>
+<style>
+:root {
+  font-family: "Segoe UI Variable", "Microsoft YaHei UI", "Microsoft YaHei", sans-serif;
+  font-size: 14px;
+  --accent: #6862ed; --accent-soft: #eeebff;
+  --surface: rgba(255, 255, 255, .82);
+  --line: #eae9f1; --subtle: #7f7d91; --text: #25252f;
+  --green: #20966c; --amber: #b97826; --red: #d5455c;
+  --bg: #f7f7fb;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { color: var(--text); background: var(--bg); height: 100vh; overflow: hidden; }
+#shell { display: flex; min-height: 100vh; background: radial-gradient(ellipse at 8% 0%, #edebffb0 0, transparent 45%), #fafafe; height: 100vh; overflow: hidden; }
+.sidebar {
+  width: 218px; flex-shrink: 0; position: fixed; inset: 0 auto 0 0;
+  padding: 26px 16px 18px; display: flex; flex-direction: column;
+  background: linear-gradient(145deg, #eeebffb8, #f2efff5c);
+  border-right: 1px solid #ffffff80; -webkit-backdrop-filter: blur(24px); backdrop-filter: blur(24px);
+}
+.app-logo { display: flex; align-items: center; gap: 10px; padding: 0 10px 22px; }
+.app-mark { width: 34px; height: 34px; border-radius: 10px; background: linear-gradient(135deg, #6862ed, #9d7bf0); display: flex; align-items: center; justify-content: center; color: #fff; font-weight: 700; font-size: 17px; }
+.app-brand-copy span { font-weight: 700; font-size: 15px; }
+.nav-label { color: var(--subtle); font-size: 12px; padding: 0 14px 10px; }
+nav button, .nav-btn {
+  display: flex; align-items: center; gap: 10px; padding: 10px 14px; border-radius: 10px;
+  cursor: pointer; color: var(--text); font-size: 13.5px; margin-bottom: 2px; border: 0; background: transparent; font: inherit; width: 100%; text-align: left;
+}
+nav button:hover { background: rgba(104, 98, 237, .08); }
+nav button.selected { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+nav button svg { width: 20px; height: 20px; flex-shrink: 0; }
+.sidebar-footer { margin-top: auto; padding-top: 26px; color: var(--subtle); font-size: 11px; display: flex; align-items: center; gap: 6px; }
+.workspace { margin-left: 218px; flex: 1; min-width: 0; padding: 0 30px 22px; height: 100vh; display: flex; flex-direction: column; }
+.account-toolbar { height: 56px; display: flex; align-items: center; gap: 12px; flex-shrink: 0; }
+.account-toolbar .spacer { flex: 1; }
+button, .button { cursor: pointer; border: 1px solid var(--line); background: #fff; color: var(--text); border-radius: 9px; padding: 8px 14px; font: inherit; font-size: 13px; transition: all .15s; }
+button:hover { border-color: var(--accent); color: var(--accent); }
+button:disabled { opacity: .55; cursor: wait; }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+button.primary:hover { filter: brightness(1.08); color: #fff; }
+button.danger-ghost { color: var(--red); }
+button.small { padding: 4px 10px; font-size: 12px; border-radius: 7px; }
+button.text-button { border: 0; background: transparent; }
+main { flex: 1; overflow-y: auto; min-height: 0; }
+.page { display: none; } .page.active { display: block; }
+h1 { font-size: 18px; font-weight: 700; } h2 { font-size: 15px; } h3 { font-size: 14px; }
+.subtle { color: var(--subtle); font-size: 12px; }
+.surface { background: var(--surface); border: 1px solid var(--line); border-radius: 16px; }
+.page-header { display: flex; justify-content: space-between; align-items: center; gap: 20px; margin: 8px 0 24px; }
+.page-header .subtle { margin-top: 5px; }
+.page-header .actions { display: flex; gap: 10px; }
+.tag { display: inline-block; border-radius: 7px; background: var(--accent-soft); font-size: 11px; padding: 4px 7px; }
+.tag.amber { background: #f7ecd9; color: var(--amber); }
+.notice { font-size: 12px; line-height: 1.8; background: var(--accent-soft); padding: 12px 16px; border-radius: 12px; margin: 14px 0; color: var(--subtle); }
+.empty { color: var(--subtle); text-align: center; padding: 36px 0; font-size: 13px; }
+.section-heading { display: flex; justify-content: space-between; align-items: center; gap: 16px; margin: 24px 0 14px; }
+.text-button { color: var(--accent); font-size: 13px; }
+
+/* 总览 */
+.overview-caption { display: flex; align-items: baseline; gap: 12px; margin: 4px 0 10px; }
+.overview-caption h1 { font-size: 17px; }
+.overview-caption>span { font-size: 12px; }
+.overview-header { display: flex; align-items: center; gap: 14px; margin-bottom: 12px; }
+.overview-header .actions { margin-left: auto; display: flex; gap: 10px; }
+.chart-wrap { width: 100%; height: 320px; }
+.chart-card { padding: 18px 22px; margin-bottom: 14px; }
+.chart-card .section-heading { margin: 0 0 8px; }
+.pills { display: inline-flex; gap: 3px; background: #fff; border: 1px solid var(--line); border-radius: 10px; padding: 3px; }
+.pills button { padding: 5px 14px; border-radius: 8px; font-size: 12.5px; border-color: transparent; background: transparent; color: var(--subtle); }
+.pills button.active { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+.tool-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 10px; }
+.tool-card { padding: 13px 15px; border-radius: 12px; --tool-brand: var(--accent); border: 1px solid color-mix(in srgb, var(--tool-brand) 42%, var(--line)); }
+.tool-card[data-provider=trae] { --tool-brand: #20b978; }
+.tool-card[data-provider=workbuddy] { --tool-brand: #00ba9c; }
+.tool-card[data-provider=minimax] { --tool-brand: #20b9ec; }
+.tool-card[data-provider=qoder] { --tool-brand: #606570; }
+.tool-card[data-provider=codearts] { --tool-brand: #e93442; }
+.tool-card[data-provider=codearts-desktop] { --tool-brand: #854cf5; }
+.tool-identity { display: flex; gap: 10px; align-items: center; }
+.tool-identity img, .tool-identity .picon { width: 22px; height: 22px; border-radius: 6px; }
+.tool-identity .picon { display: flex; align-items: center; justify-content: center; color: #fff; font-weight: 700; font-size: 12px; background: var(--tool-brand); }
+.tool-identity h3 { font-size: 13.5px; }
+.tool-identity p { font-size: 11.5px; }
+.tool-balance { display: flex; align-items: baseline; justify-content: space-between; gap: 6px; margin: 8px 0 4px; }
+.tool-balance strong { font-size: 22px; font-weight: 650; }
+.tool-balance>span { font-size: 12px; }
+.tool-result { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 3px 8px; align-items: center; font-size: 12px; }
+.checkin-done { color: var(--green); font-weight: 600; }
+
+/* 账号管理 */
+.account-platform-list { display: grid; gap: 16px; }
+.account-platform-group { overflow: hidden; border: 1px solid var(--line); border-radius: 16px; box-shadow: 0 3px 14px #28235009; background: var(--surface); }
+.account-platform-header { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 15px 20px; border-bottom: 1px solid var(--line); }
+.account-platform-heading { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.account-platform-heading h2 { font-size: 15px; margin: 0; }
+.account-platform-heading img, .account-platform-heading .picon { width: 30px; height: 30px; border-radius: 8px; }
+.account-platform-heading .picon { display: flex; align-items: center; justify-content: center; color: #fff; font-weight: 700; background: var(--tool-brand, var(--accent)); }
+.account-capability { font-size: 11px; padding: 3px 8px; border-radius: 6px; background: var(--accent-soft); color: var(--subtle); white-space: nowrap; }
+.account-capability.multi { color: var(--accent); background: color-mix(in srgb, var(--accent) 9%, transparent); }
+.account-platform-count { font-size: 12px; white-space: nowrap; }
+.account-platform-header>.actions { flex-shrink: 0; gap: 10px; display: flex; }
+.account-group-row { display: grid; grid-template-columns: minmax(160px, 1fr) minmax(140px, 230px) 110px 200px; align-items: center; gap: 18px; padding: 15px 20px; min-height: 72px; }
+.account-group-row+.account-group-row { border-top: 1px solid var(--line); }
+.single-account-identity { min-width: 0; }
+.single-account-identity>strong { display: block; font-size: 14px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.single-account-identity>small { display: block; margin-top: 4px; font-size: 12px; color: var(--subtle); overflow-wrap: anywhere; }
+.single-account-balance strong { font-size: 16px; }
+.single-account-balance small { display: block; margin-top: 3px; font-size: 11.5px; color: var(--subtle); }
+.single-account-status { justify-self: center; }
+.account-row-actions { display: flex; gap: 6px; justify-content: flex-end; align-items: center; }
+.status { display: inline-flex; gap: 6px; align-items: center; font-size: 12px; white-space: nowrap; }
+.status .dot { width: 7px; height: 7px; border-radius: 50%; }
+.st-ok { color: var(--green); } .st-ok .dot { background: var(--green); }
+.st-warn { color: var(--amber); } .st-warn .dot { background: var(--amber); }
+.st-bad { color: var(--red); } .st-bad .dot { background: var(--red); }
+.st-idle { color: var(--subtle); } .st-idle .dot { background: var(--subtle); }
+.switch { position: relative; width: 34px; height: 20px; flex-shrink: 0; cursor: pointer; display: inline-block; }
+.switch input { display: none; }
+.switch .track { position: absolute; inset: 0; background: #d9d7e6; border-radius: 10px; transition: background .15s; }
+.switch .knob { position: absolute; top: 2px; left: 2px; width: 16px; height: 16px; border-radius: 50%; background: #fff; transition: left .15s; box-shadow: 0 1px 3px rgba(0,0,0,.2); }
+.switch input:checked + .track { background: var(--accent); }
+.switch input:checked + .track .knob { left: 16px; }
+
+/* 签到中心 */
+.progress-hero { display: flex; align-items: center; gap: 50px; padding: 24px 30px; background: var(--accent-soft); border-radius: 20px; margin-bottom: 16px; }
+.progress-hero>div:first-child { flex: 1; }
+.progress-hero strong { font-size: 42px; }
+.progress-hero p { font-size: 12.5px; color: var(--subtle); margin-top: 3px; }
+.progress { height: 7px; background: #e2def0; border-radius: 10px; overflow: hidden; margin-top: 10px; }
+.progress span { display: block; height: 100%; background: var(--accent); border-radius: 10px; transition: width .3s; }
+.checkin-filters { margin: 6px 0 14px; flex-wrap: wrap; display: inline-flex; }
+.checkin-filters button { padding: 5px 12px; min-height: 28px; }
+.checkin-filter-count { opacity: .7; margin-left: 3px; }
+.checkin-list { display: grid; gap: 10px; }
+.checkin-row { display: flex; align-items: center; gap: 15px; padding: 16px 20px; --tool-brand: var(--accent); border: 1px solid color-mix(in srgb, var(--tool-brand) 42%, var(--line)); border-radius: 12px; }
+.checkin-row[data-provider=trae] { --tool-brand: #20b978; }
+.checkin-row[data-provider=workbuddy] { --tool-brand: #00ba9c; }
+.checkin-row[data-provider=minimax] { --tool-brand: #20b9ec; }
+.checkin-row[data-provider=qoder] { --tool-brand: #606570; }
+.checkin-row[data-provider=codearts] { --tool-brand: #e93442; }
+.checkin-row[data-provider=codearts-desktop] { --tool-brand: #854cf5; }
+.checkin-identity { display: flex; align-items: center; gap: 10px; flex: 1; min-width: 140px; }
+.checkin-identity img, .checkin-identity .picon { width: 24px; height: 24px; border-radius: 7px; }
+.checkin-identity .picon { display: flex; align-items: center; justify-content: center; color: #fff; font-weight: 700; font-size: 12px; background: var(--tool-brand); }
+.checkin-identity strong { font-size: 14px; display: block; }
+.checkin-identity small { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 12px; margin-top: 3px; color: var(--subtle); }
+.checkin-row>div { min-width: 120px; }
+.schedule-strip { display: flex; align-items: center; gap: 20px; margin: 14px 0; padding: 14px 22px; border-radius: 16px; background: var(--surface); font-size: 12px; flex-wrap: wrap; }
+.schedule-strip strong { font-size: 26px; margin: 0 5px; letter-spacing: -.5px; }
+
+/* 积分统计 */
+.statistics-toolbar { display: flex; justify-content: space-between; align-items: center; margin: 0 0 12px; gap: 12px; }
+.statistics-provider { display: flex; align-items: center; gap: 7px; }
+.statistics-provider img, .statistics-provider .picon { width: 22px; height: 22px; border-radius: 6px; }
+.statistics-provider .picon { display: flex; align-items: center; justify-content: center; color: #fff; font-weight: 700; font-size: 12px; background: var(--accent); }
+.statistics-provider select { min-width: 170px; padding: 7px 10px; color: var(--text); background: var(--surface); border: 1px solid var(--line); border-radius: 9px; font: inherit; font-size: 13px; }
+.metrics { display: grid; grid-template-columns: repeat(3, 1fr); padding: 22px 26px; margin: 12px 0 16px; }
+.metrics>div+div { border-left: 1px solid var(--line); padding-left: 30px; }
+.metrics p { font-size: 12px; color: var(--subtle); margin-bottom: 8px; }
+.metrics strong { font-size: 27px; font-weight: 650; }
+.statistics-panels { display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr); gap: 10px; align-items: start; }
+.chart-section { padding: 16px 20px; }
+.chart-wrap-sm { width: 100%; height: 260px; }
+.statistics-ledger { border-radius: 12px; overflow: hidden; background: var(--surface); border: 1px solid var(--line); }
+.statistics-ledger>h3 { font-size: 14px; padding: 13px 14px 8px; }
+.statistics-ledger>h3>small { font-size: 12px; font-weight: 400; margin-left: 5px; color: var(--subtle); }
+.table-wrap { padding: 0 6px 6px; max-height: 420px; overflow: auto; }
+table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+th { text-align: left; color: var(--subtle); font-weight: 500; padding: 7px 8px; border-bottom: 1px solid var(--line); font-size: 11.5px; white-space: nowrap; }
+td { padding: 7px 8px; border-bottom: 1px solid var(--line); }
+
+/* 设置 */
+.settings-panel { padding: 8px 28px 24px; }
+.task-settings { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 28px; }
+.setting-row { display: flex; align-items: center; gap: 15px; padding: 21px 0; border-bottom: 1px solid var(--line); }
+.setting-row>div { flex: 1; }
+.setting-row p { font-size: 12px; color: var(--subtle); margin-top: 5px; }
+.settings-preview .preview-row { display: flex; align-items: center; gap: 10px; padding: 7px 0; font-size: 13px; }
+.settings-preview img, .settings-preview .picon { width: 26px; height: 26px; border-radius: 7px; }
+.settings-preview .picon { display: flex; align-items: center; justify-content: center; color: #fff; font-weight: 700; font-size: 11px; background: var(--accent); }
+.save-footer { display: flex; gap: 10px; justify-content: flex-end; padding: 18px 0 4px; }
+select { padding: 7px 10px; border-radius: 9px; border: 1px solid var(--line); background: #fff; font: inherit; font-size: 13px; }
+
+/* 账号路由占位 */
+.route-matrix { margin-top: 14px; }
+.route-row { display: flex; align-items: center; gap: 14px; padding: 14px 18px; border-bottom: 1px solid var(--line); }
+.route-row:last-child { border-bottom: 0; }
+.route-row img, .route-row .picon { width: 30px; height: 30px; border-radius: 8px; flex-shrink: 0; }
+.route-row img[src$=".svg"] { width: 30px; height: 30px; object-fit: contain; }
+.route-matrix img { max-width: 30px; max-height: 30px; }
+img { max-width: 100%; }
+
+/* 模态 */
+.modal-mask { position: fixed; inset: 0; background: rgba(37, 37, 47, .4); display: none; align-items: center; justify-content: center; z-index: 50; }
+.modal-mask.show { display: flex; }
+.modal { background: #fff; border-radius: 16px; width: 480px; max-width: 92vw; padding: 24px; box-shadow: 0 18px 60px rgba(37,37,47,.25); }
+.modal h3 { font-size: 16px; font-weight: 700; margin-bottom: 6px; }
+.modal .desc { color: var(--subtle); font-size: 12.5px; line-height: 1.6; margin-bottom: 14px; }
+.modal .foot { display: flex; gap: 10px; justify-content: flex-end; margin-top: 18px; }
+.spin { display: inline-block; width: 13px; height: 13px; border: 2px solid var(--line); border-top-color: var(--accent); border-radius: 50%; animation: r .7s linear infinite; vertical-align: -2px; }
+@keyframes r { to { transform: rotate(360deg); } }
+#toast { position: fixed; bottom: 22px; left: 50%; transform: translateX(-50%); background: #25252f; color: #fff; padding: 11px 18px; border-radius: 10px; font-size: 13px; display: none; z-index: 99; box-shadow: 0 8px 28px rgba(0,0,0,.25); max-width: 70%; }
+</style>
+</head>
+<body>
+<div id="shell">
+  <aside class="sidebar">
+    <div class="app-logo"><div class="app-mark">路</div><div class="app-brand-copy"><span>AI路由助手</span></div></div>
+    <p class="nav-label">工作台</p>
+    <nav id="nav"></nav>
+    <div class="sidebar-footer"><span>🔒</span><span>平台凭据仅存本机</span><small style="margin-left:auto">v0.2.0</small></div>
+  </aside>
+  <main class="workspace">
+    <div class="account-toolbar">
+      <span class="subtle" id="cycle-label"></span>
+      <div class="spacer"></div>
+      <button id="btn-refresh" class="text-button">刷新</button>
+      <button id="btn-checkin-all" class="primary">一键签到</button>
+    </div>
+    <!-- 首页 -->
+    <section class="page active" id="page-overview">
+      <div class="overview-caption"><h1>首页</h1><span class="subtle" id="today-str"></span></div>
+      <div class="overview-header">
+        <div class="pills" id="range-pills">
+          <button data-range="7" class="active">周</button>
+          <button data-range="30">月</button>
+          <button data-range="365">年</button>
+        </div>
+        <div class="actions">
+          <button id="btn-quota-all">刷新余额</button>
+        </div>
+      </div>
+      <div class="surface chart-card">
+        <div class="section-heading"><h2>积分趋势</h2><span class="subtle" id="chart-sum"></span></div>
+        <div class="chart-wrap" id="overview-chart"></div>
+      </div>
+      <div class="section-heading"><h2>我的 AI 工具</h2><button class="text-button" data-goto="accounts">管理账号 →</button></div>
+      <div class="tool-grid" id="tool-grid"></div>
+    </section>
+    <!-- 账号管理 -->
+    <section class="page" id="page-accounts">
+      <div class="page-header">
+        <div><h1>账号管理</h1><p class="subtle" id="accounts-sub"></p></div>
+        <div class="actions">
+          <button id="btn-quota-all2">刷新余额</button>
+        </div>
+      </div>
+      <div class="account-platform-list" id="account-list"></div>
+    </section>
+    <!-- 签到中心 -->
+    <section class="page" id="page-checkin">
+      <div class="page-header">
+        <div><h1>签到中心</h1><p class="subtle">按账号查看领取进度；支持多个独立授权账号，逐个执行。</p></div>
+        <div class="actions"><button id="btn-checkin-all2" class="primary">一键签到</button></div>
+      </div>
+      <div class="progress-hero" id="progress-hero"></div>
+      <div class="schedule-strip"><strong id="sched-time">--:--</strong><span>计划签到时间（北京时间）</span><span class="subtle" style="margin-left:auto">所有平台统一按北京时间执行</span></div>
+      <div class="pills checkin-filters" id="checkin-filters"></div>
+      <div class="checkin-list" id="checkin-list"></div>
+    </section>
+    <!-- 积分统计 -->
+    <section class="page" id="page-statistics">
+      <div class="page-header">
+        <div><h1>积分统计</h1><p class="subtle">按登录账号切换，查看每天 / 每周 / 每月 / 每年的积分记录汇总。</p></div>
+      </div>
+      <div class="statistics-toolbar">
+        <label class="statistics-provider">
+          <span class="picon">积</span>
+          <select id="stat-account" aria-label="选择账号"></select>
+        </label>
+        <div class="pills" id="stat-period">
+          <button data-period="day" class="active">每天</button>
+          <button data-period="week">每周</button>
+          <button data-period="month">每月</button>
+          <button data-period="year">每年</button>
+        </div>
+      </div>
+      <div class="metrics" id="stat-metrics"></div>
+      <div class="statistics-panels">
+        <section class="surface chart-section"><div class="section-heading"><h3>趋势</h3><span class="legend" style="display:flex;gap:15px;color:var(--subtle);font-size:12px"><span style="display:flex;gap:6px;align-items:center"><i style="width:11px;height:11px;background:var(--accent);border-radius:3px;display:inline-block"></i>签到到账</span></span></div><div class="chart-wrap-sm" id="stat-chart"></div></section>
+        <section class="statistics-ledger"><h3>明细 <small>所选账号全部记录</small></h3><div class="table-wrap">
+          <table><thead><tr><th>时间</th><th>状态</th><th>说明</th><th style="text-align:right">积分</th></tr></thead><tbody id="ledger-body"></tbody></table>
+        </div></section>
+      </div>
+    </section>
+    <!-- 账号路由 -->
+    <section class="page" id="page-routing">
+      <div class="page-header">
+        <div><h1>账号路由</h1><p class="subtle">按规则把请求路由到指定账号（规划中，即将开放）。</p></div>
+        <div class="actions"><button disabled>新建路由</button></div>
+      </div>
+      <div class="notice">功能开发中：将支持按平台 / 权重 / 时间段把调用分配到不同账号，并自动切换失效凭据。</div>
+      <div class="surface route-matrix" id="route-matrix"></div>
+    </section>
+    <!-- 设置 -->
+    <section class="page" id="page-settings">
+      <div class="page-header"><div><h1>设置</h1><p class="subtle">按你的节奏，安排这个工作台。</p></div></div>
+      <div class="pills spaced" id="settings-tabs" style="margin-bottom:14px">
+        <button data-tab="tasks" class="active">自动任务</button>
+        <button data-tab="general">通用</button>
+        <button data-tab="data">数据与版本</button>
+      </div>
+      <section class="surface settings-panel" id="settings-body"></section>
+      <div class="save-footer">
+        <button id="settings-cancel">取消修改</button>
+        <button id="settings-save" class="primary">保存设置</button>
+      </div>
+    </section>
+  </main>
+</div>
+
+<!-- 登录模态 -->
+<div class="modal-mask" id="login-mask">
+  <div class="modal">
+    <h3 id="login-title">登录</h3>
+    <div class="desc" id="login-desc"></div>
+    <div id="login-body"></div>
+    <div class="foot">
+      <button id="login-cancel">取消</button>
+      <button id="login-open" class="primary">打开授权页面</button>
+    </div>
+  </div>
+</div>
+<div id="toast"></div>
+<script src="app.js"></script>
+</body>
+</html>

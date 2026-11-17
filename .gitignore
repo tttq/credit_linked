@@ -1,0 +1,25 @@
+# build artifacts
+/target/
+**/target/
+
+# generated tauri schemas
+src-tauri/gen/
+
+# docs (per repo policy: no md files except README)
+*.md
+!README.md
+
+# local data / logs / screenshots
+*.sqlite
+*.sqlite-*
+*.db
+_shots/
+*.log
+
+# node / os
+node_modules/
+.DS_Store
+Thumbs.db
+
+# rust
+*.pdb

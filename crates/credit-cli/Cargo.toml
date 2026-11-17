@@ -1,0 +1,15 @@
+[package]
+name = "credit-cli"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+credit-core = { path = "../credit-core" }
+tokio.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+clap = { version = "4", features = ["derive"] }
+aes.workspace = true
+cbc.workspace = true
+sha2.workspace = true
+base64.workspace = true
