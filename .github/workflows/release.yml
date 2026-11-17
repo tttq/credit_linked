@@ -50,10 +50,12 @@ jobs:
             .
 
       - name: Install Tauri CLI
-        run: cargo install tauri-cli --version "^2" --locked
+        run: cargo install tauri-cli --version 2.12.5 --locked
 
       - name: Build (credit-tauri)
         shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -o pipefail
           cargo tauri build --verbose ${{ matrix.args }} 2>&1 | tee build.log || {
