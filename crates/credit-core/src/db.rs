@@ -22,7 +22,7 @@ impl Store {
     }
 
     pub fn open_default() -> anyhow::Result<Self> {
-        // 独立目录，绝不与原版 Electron 应用（%APPDATA%/AI Credit Manager）共享
+        // 独立目录，绝不与原版 Electron 应用（%APPDATA%/credit-tauri(旧版)）共享
         let dir = dirs::data_dir()
             .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join("AppData/Roaming"))
             .join("credit-rs");

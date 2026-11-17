@@ -231,7 +231,7 @@ fn new_p256_jwk() -> Value {
 
 async fn trae_wait_task(sid: String, listener: TcpListener, login: crate::adapters::trae::TraeLogin, shared: Arc<Mutex<Option<Result<Cred, String>>>>) {
     let res: Result<Cred, String> = async {
-        let query = wait_callback(&listener, std::time::Duration::from_secs(299), "/authorize", "授权完成，请返回 AI 积分管家。").await.map_err(|e| e.to_string())?;
+        let query = wait_callback(&listener, std::time::Duration::from_secs(299), "/authorize", "授权完成，请返回 AI路由助手。").await.map_err(|e| e.to_string())?;
         let params = parse_query(&query);
         if params.get("error").map(|s| !s.is_empty()).unwrap_or(false) {
             return Err("TRAE 授权未完成或已取消，请重新发起".into());
@@ -270,7 +270,7 @@ async fn codearts_wait_task(
         // 授权页可能先发一次 307 中转请求（带 secret/redirect 无 code），真正回调带 code
         let mut query = String::new();
         for _ in 0..3 {
-            let q = wait_callback(&listener, std::time::Duration::from_secs(299), "/oauth/callback", "已收到授权，请返回 AI 积分管家。").await.map_err(|e| e.to_string())?;
+            let q = wait_callback(&listener, std::time::Duration::from_secs(299), "/oauth/callback", "已收到授权，请返回 AI路由助手。").await.map_err(|e| e.to_string())?;
             let p = parse_query(&q);
             if p.contains_key("secret") && !p.contains_key("code") {
                 continue;
