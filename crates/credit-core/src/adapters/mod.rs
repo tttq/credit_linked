@@ -7,6 +7,7 @@ pub mod minimax;
 pub mod qoder;
 pub mod codearts;
 pub mod zcode;
+pub mod zcode_local;
 
 use async_trait::async_trait;
 use serde_json::Value;

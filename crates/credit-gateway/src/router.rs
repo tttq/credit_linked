@@ -108,8 +108,13 @@ impl Router {
         let Ok(rows) = self.store.list_accounts() else { return Vec::new() };
         let full = self.store.list_accounts_full().unwrap_or_default();
         let mut creds: Vec<(Cred, bool)> = Vec::new();
+        let accepted: Vec<&str> = if platform == Platform::CodeArts {
+            vec!["codearts", "codearts-desktop"]
+        } else {
+            vec![provider]
+        };
         for (p, _uid, _name, _secret, auth) in rows {
-            if p != provider {
+            if !accepted.contains(&p.as_str()) {
                 continue;
             }
             let Ok(c) = serde_json::from_str::<Cred>(&auth) else { continue };

@@ -484,3 +484,377 @@ pub fn parse_openai_sse(stream: impl Stream<Item = Result<bytes::Bytes, reqwest:
 pub fn parse_trae_sse(stream: impl Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static) -> EventStream {
     pump_stream(SseKind::Trae, Box::pin(stream))
 }
+
+
+// ============================ ZCode（智谱） ============================
+
+/// 智谱模型清单：GET {ZCODE_CHAT_BASE}/api/paas/v4/models（OpenAI 风格 list）
+/// 端点不可用或返回非标准结构时返回静态已知清单（GLM 系列）。
+pub async fn zcode_fetch_models(cred: &Cred) -> Result<Vec<ModelInfo>, PlatformError> {
+    let mid = cred.meta.get("deviceMid").and_then(|d| d.as_str()).unwrap_or("");
+    let hs = zcode_chat_headers(&cred.token, Some(mid));
+    let url = format!("{ZCODE_CHAT_BASE}/api/paas/v4/models");
+    let mut req = http_client().get(&url);
+    for (k, v) in &hs {
+        req = req.header(k, v);
+    }
+    let mut out = Vec::new();
+    if let Ok(resp) = req.send().await {
+        if resp.status().as_u16() == 200 {
+            if let Ok(body) = resp.json::<Value>().await {
+                if let Some(list) = body.get("data").and_then(|d| d.as_array()) {
+                    for m in list {
+                        let id = m.get("id").and_then(|i| i.as_str()).unwrap_or_default().to_string();
+                        if id.is_empty() { continue; }
+                        out.push(ModelInfo {
+                            name: m.get("display_name").and_then(|n| n.as_str()).filter(|s| !s.is_empty())
+                                .or_else(|| m.get("name").and_then(|n| n.as_str()))
+                                .unwrap_or(&id).to_string(),
+                            id,
+                            context_window: m.get("context_length").and_then(|v| v.as_u64())
+                                .or_else(|| m.get("context_window").and_then(|v| v.as_u64())),
+                            max_tokens: None,
+                            credit_multiplier: None,
+                            supports_images: None,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    if out.is_empty() {
+        // 静态已知 GLM 清单（开放平台公开模型）
+        for (id, name, ctx) in [
+            ("glm-5.3", "GLM-5.3", 200_000u64),
+            ("glm-5.2", "GLM-5.2", 128_000),
+            ("glm-5.3-flash", "GLM-5.3-Flash", 200_000),
+            ("glm-5-flash", "GLM-5-Flash", 128_000),
+            ("glm-5.3-air", "GLM-5.3-Air", 200_000),
+            ("glm-4.7", "GLM-4.7", 200_000),
+        ] {
+            out.push(ModelInfo { id: id.into(), name: name.into(), context_window: Some(ctx), max_tokens: None, credit_multiplier: None, supports_images: None });
+        }
+    }
+    Ok(out)
+}
+
+/// 智谱 chat：POST open.bigmodel.cn/api/paas/v4/chat/completions（OpenAI 线格式 SSE）
+pub async fn zcode_chat_stream(cred: &Cred, body: Value) -> Result<EventStream, String> {
+    let mid = cred.meta.get("deviceMid").and_then(|d| d.as_str()).unwrap_or("");
+    let url = format!("{ZCODE_CHAT_BASE}{ZCODE_CHAT_PATH}");
+    let hs = zcode_chat_headers(&cred.token, Some(mid));
+    let mut req = http_client().post(&url).json(&body);
+    for (k, v) in &hs {
+        req = req.header(k, v);
+    }
+    let resp = send_sse(req).await?;
+    Ok(parse_openai_sse(resp.bytes_stream()))
+}
+
+// ============================ MiniMax ============================
+
+/// MiniMax 模型清单：anthropic 兼容通道无 models 端点 → 静态已知清单。
+/// OAuth token 会话验证 profile 已由 credit-core 的 verify 处理；此处直接给静态目录。
+pub async fn minimax_fetch_models(_cred: &Cred) -> Result<Vec<ModelInfo>, PlatformError> {
+    Ok([
+        ("MiniMax-M2.5", "MiniMax-M2.5", 200_000u64),
+        ("MiniMax-M2.1", "MiniMax-M2.1", 200_000),
+        ("MiniMax-M2", "MiniMax-M2", 200_000),
+        ("MiniMax-Text-01", "MiniMax-Text-01", 1_000_000),
+    ].into_iter().map(|(id, name, ctx)| ModelInfo {
+        id: id.into(), name: name.into(), context_window: Some(ctx),
+        max_tokens: None, credit_multiplier: None, supports_images: None,
+    }).collect())
+}
+
+/// MiniMax chat：POST api.minimaxi.com/anthropic/v1/messages（Anthropic 线格式 SSE）
+/// 凭据：OAuth mmoat token（部分会话可用）或 MiniMax API key。401 时报明确错误。
+pub async fn minimax_chat_stream(cred: &Cred, body: Value) -> Result<EventStream, String> {
+    let url = format!("{MINIMAX_API_BASE}{MINIMAX_ANTHROPIC_PATH}");
+    let hs = minimax_chat_headers(&cred.token);
+    let mut req = http_client().post(&url).json(&body);
+    for (k, v) in &hs {
+        req = req.header(k, v);
+    }
+    let resp = send_sse(req).await?;
+    Ok(parse_anthropic_sse(resp.bytes_stream()))
+}
+
+/// Anthropic 线格式 SSE → EventStream（复用 OpenAI 帧格式；事件解码走 anthropic 分支）
+pub fn parse_anthropic_sse(stream: impl Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static) -> EventStream {
+    Box::pin(futures_util::stream::unfold(AnthropicPump::new(stream), |mut p| async move {
+        loop {
+            if let Some(ev) = p.pop() {
+                return Some((Ok(ev), p));
+            }
+            if p.done {
+                return p.take_tail().map(|ev| (Ok(ev), p));
+            }
+            match p.stream.next().await {
+                Some(Ok(chunk)) => p.feed(&chunk),
+                Some(Err(e)) => return Some((Err(format!("stream: {e}")), p)),
+                None => {
+                    p.done = true;
+                    if let Some(ev) = p.take_tail() {
+                        return Some((Ok(ev), p));
+                    }
+                    return None;
+                }
+            }
+        }
+    }))
+}
+
+/// Anthropic SSE 泵（帧格式与 OpenAI 相同：data: 行）
+struct AnthropicPump {
+    buf: Vec<u8>,
+    queue: std::collections::VecDeque<StreamEvent>,
+    stream: std::pin::Pin<Box<dyn Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send>>,
+    done: bool,
+}
+
+impl AnthropicPump {
+    fn new(stream: impl Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static) -> Self {
+        Self { buf: Vec::new(), queue: Default::default(), stream: Box::pin(stream), done: false }
+    }
+    fn feed(&mut self, chunk: &[u8]) {
+        self.buf.extend_from_slice(chunk);
+    }
+    fn pop(&mut self) -> Option<StreamEvent> {
+        if let Some(ev) = self.queue.pop_front() {
+            return Some(ev);
+        }
+        loop {
+            let block = self.next_block()?;
+            let mut evs: Vec<StreamEvent> = Vec::new();
+            for line in block.lines() {
+                if let Some(data) = line.strip_prefix("data:") {
+                    let d = data.trim();
+                    if d.is_empty() { continue; }
+                    evs.extend(anthropic_frame_decode(d));
+                }
+            }
+            if let Some(first) = evs.into_iter().next() {
+                return Some(first);
+            }
+        }
+    }
+    fn next_block(&mut self) -> Option<String> {
+        loop {
+            let pos = find_block_end(&self.buf)?;
+            let block = String::from_utf8_lossy(&self.buf[..pos.0]).to_string();
+            self.buf.drain(..pos.1);
+            if block.trim().is_empty() { continue; }
+            return Some(block);
+        }
+    }
+    fn take_tail(&mut self) -> Option<StreamEvent> {
+        if let Some(ev) = self.queue.pop_front() {
+            return Some(ev);
+        }
+        if self.buf.is_empty() { return None; }
+        let block = String::from_utf8_lossy(&self.buf).to_string();
+        self.buf.clear();
+        for line in block.lines() {
+            if let Some(data) = line.strip_prefix("data:") {
+                let d = data.trim();
+                if !d.is_empty() {
+                    if let Some(ev) = anthropic_frame_decode(d).into_iter().next() {
+                        return Some(ev);
+                    }
+                }
+            }
+        }
+        None
+    }
+}
+
+
+// ============================ Qoder ============================
+
+/// Qoder 模型清单：云端 chat 的模型是网关自动路由（"auto"），
+/// 公开目录无 models 端点 → 静态发布网关模型。
+pub async fn qoder_fetch_models(_cred: &Cred) -> Result<Vec<ModelInfo>, PlatformError> {
+    Ok([
+        ("auto", "Qoder Auto (自动路由)", 128_000u64),
+    ].into_iter().map(|(id, name, ctx)| ModelInfo {
+        id: id.into(), name: name.into(), context_window: Some(ctx),
+        max_tokens: None, credit_multiplier: None, supports_images: None,
+    }).collect())
+}
+
+/// Qoder 签名 sidecar 常驻进程（每进程一个，stdio 协议）
+pub struct QoderSigner {
+    child: tokio::process::Child,
+    stdin: tokio::process::ChildStdin,
+    stdout: tokio::process::ChildStdout,
+}
+
+impl QoderSigner {
+    pub async fn spawn() -> Result<Self, PlatformError> {
+        let exe = sidecar_script()?;
+        let child = tokio::process::Command::new("node")
+            .arg(&exe)
+            .arg("serve")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|e| PlatformError::Local(format!("sidecar spawn: {e}")))?;
+        let mut c = child;
+        let stdin = c.stdin.take().ok_or_else(|| PlatformError::Local("sidecar stdin".into()))?;
+        let stdout = c.stdout.take().ok_or_else(|| PlatformError::Local("sidecar stdout".into()))?;
+        Ok(Self { child: c, stdin, stdout })
+    }
+
+    /// 请求签名：发 JSON 行 → 收 JSON 行
+    pub async fn sign(&mut self, req: &Value) -> Result<Value, PlatformError> {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let line = serde_json::to_string(req).map_err(|e| PlatformError::Local(e.to_string()))?;
+        self.stdin.write_all(line.as_bytes()).await
+            .map_err(|e| PlatformError::Local(format!("sidecar write: {e}")))?;
+        self.stdin.write_all(b"\n").await
+            .map_err(|e| PlatformError::Local(format!("sidecar write: {e}")))?;
+        self.stdin.flush().await
+            .map_err(|e| PlatformError::Local(format!("sidecar write: {e}")))?;
+        let mut reader = tokio::io::BufReader::new(&mut self.stdout);
+        let mut resp_line = String::new();
+        reader.read_line(&mut resp_line).await
+            .map_err(|e| PlatformError::Local(format!("sidecar read: {e}")))?;
+        let resp: Value = serde_json::from_str(resp_line.trim())
+            .map_err(|e| PlatformError::Local(format!("sidecar json: {e}")))?;
+        if resp.get("ok").and_then(|o| o.as_bool()).unwrap_or(false) {
+            Ok(resp)
+        } else {
+            Err(PlatformError::Local(format!("sidecar: {}", resp.get("error").and_then(|e| e.as_str()).unwrap_or("unknown"))))
+        }
+    }
+}
+
+fn sidecar_script() -> Result<std::path::PathBuf, PlatformError> {
+    // sidecar 目录与本 crate 同级：crates/credit-gateway/sidecar/qoder-signer.mjs
+    let candidates = [
+        std::env::var("QODER_SIGNER").ok().map(std::path::PathBuf::from),
+        std::env::current_exe().ok().and_then(|e| e.parent().map(|p| p.join("sidecar/qoder-signer.mjs"))),
+        std::env::current_dir().ok().map(|d| d.join("crates/credit-gateway/sidecar/qoder-signer.mjs")),
+    ];
+    for c in candidates.into_iter().flatten() {
+        if c.exists() {
+            return Ok(c);
+        }
+    }
+    Err(PlatformError::Local("qoder-signer.mjs not found (set QODER_SIGNER)".into()))
+}
+
+/// Qoder chat：sidecar 签名 → POST agent_chat_generation（SSE 双层信封 → OpenAI chunk）
+pub async fn qoder_chat_stream(cred: &Cred, body: Value) -> Result<EventStream, String> {
+    use tokio::io::AsyncBufReadExt;
+    // 1. 签名
+    let mut signer = QoderSigner::spawn().await.map_err(|e| e.to_string())?;
+    let signed = signer.sign(&json!({
+        "deviceToken": cred.token,
+        "endpoint": "https://gateway.qoder.com.cn",
+        "bodyJson": body.to_string(),
+        "modelKey": body.get("model").and_then(|m| m.as_str()).unwrap_or("mmodel"),
+        "modelSource": "official",
+    })).await.map_err(|e| e.to_string())?;
+    let url = signed.get("url").and_then(|u| u.as_str()).ok_or("sidecar: no url")?.to_string();
+    let body_str = signed.get("body").and_then(|b| b.as_str()).ok_or("sidecar: no body")?.to_string();
+    let headers: Value = signed.get("headers").cloned().unwrap_or(json!({}));
+    // 2. 发请求（上游响应是外层信封 SSE：data:{headers,body,statusCode}）
+    let mut req = http_client().post(&url);
+    if let Some(hs) = headers.as_object() {
+        for (k, v) in hs {
+            if let Some(sv) = v.as_str() {
+                req = req.header(k, sv);
+            }
+        }
+    }
+    let resp = req.body(body_str).send().await.map_err(|e| format!("network: {e}"))?;
+    let status = resp.status().as_u16();
+    if !(200..300).contains(&status) {
+        let text = resp.text().await.unwrap_or_default();
+        return Err(format!("upstream HTTP {status}: {}", truncate(&text, 400)));
+    }
+    // 3. 双层信封解析：外层 SSE data:{...body:"<openai chunk json>"...} → 内层 OpenAI delta
+    Ok(parse_qoder_envelope_sse(resp.bytes_stream()))
+}
+
+/// Qoder 双层信封 SSE → EventStream
+pub fn parse_qoder_envelope_sse(stream: impl Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static) -> EventStream {
+    Box::pin(futures_util::stream::unfold(QoderPump::new(stream), |mut p| async move {
+        loop {
+            if let Some(ev) = p.pop() {
+                return Some((Ok(ev), p));
+            }
+            if p.done {
+                return p.take_tail().map(|ev| (Ok(ev), p));
+            }
+            match p.stream.next().await {
+                Some(Ok(chunk)) => p.feed(&chunk),
+                Some(Err(e)) => return Some((Err(format!("stream: {e}")), p)),
+                None => {
+                    p.done = true;
+                    if let Some(ev) = p.take_tail() {
+                        return Some((Ok(ev), p));
+                    }
+                    return None;
+                }
+            }
+        }
+    }))
+}
+
+struct QoderPump {
+    buf: Vec<u8>,
+    stream: std::pin::Pin<Box<dyn Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send>>,
+    done: bool,
+}
+
+impl QoderPump {
+    fn new(stream: impl Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static) -> Self {
+        Self { buf: Vec::new(), stream: Box::pin(stream), done: false }
+    }
+    fn feed(&mut self, chunk: &[u8]) {
+        self.buf.extend_from_slice(chunk);
+    }
+    fn pop(&mut self) -> Option<StreamEvent> {
+        loop {
+            let pos = find_block_end(&self.buf)?;
+            let block = String::from_utf8_lossy(&self.buf[..pos.0]).to_string();
+            self.buf.drain(..pos.1);
+            for line in block.lines() {
+                if let Some(data) = line.strip_prefix("data:") {
+                    let d = data.trim();
+                    if d.is_empty() { continue; }
+                    if let Some(ev) = decode_qoder_envelope(d) {
+                        return Some(ev);
+                    }
+                }
+            }
+        }
+    }
+    fn take_tail(&mut self) -> Option<StreamEvent> {
+        if self.buf.is_empty() { return None; }
+        let block = String::from_utf8_lossy(&self.buf).to_string();
+        self.buf.clear();
+        for line in block.lines() {
+            if let Some(data) = line.strip_prefix("data:") {
+                if let Some(ev) = decode_qoder_envelope(data.trim()) {
+                    return Some(ev);
+                }
+            }
+        }
+        None
+    }
+}
+
+/// 外层信封 data:{headers, body:"<json>", statusCode} → 内层 OpenAI chunk → 事件
+fn decode_qoder_envelope(data: &str) -> Option<StreamEvent> {
+    let envelope: Value = serde_json::from_str(data).ok()?;
+    let inner_str = envelope.get("body").and_then(|b| b.as_str())?;
+    let inner: Value = serde_json::from_str(inner_str).ok()?;
+    // 复用 OpenAI chunk 解析（choices/delta 形状一致）
+    let events = parse_openai_chunk(&inner);
+    events.into_iter().next()
+}

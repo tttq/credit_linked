@@ -54,11 +54,15 @@ pub const TRAE_DIRECTORY_FUNCTIONS_AI: [&str; 12] = [
 /// 网关支持的"平台"（账号路由里的路由键）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Platform {
-    WorkBuddy,        // 国内版
-    WorkBuddyIntl,    // 国际版
-    Trae,             // 国内 SOLO
-    TraeEnterprise,   // 国内企业租户
-    TraeIntl,         // 国际 SG
+    WorkBuddy,        // WorkBuddy 国内版
+    WorkBuddyIntl,    // WorkBuddy 国际版
+    Trae,             // Trae 国内 SOLO
+    TraeEnterprise,   // Trae 国内企业租户
+    TraeIntl,         // Trae 国际 SG
+    Zcode,            // ZCode（智谱）— open.bigmodel.cn OpenAI 兼容
+    Minimax,          // MiniMax — anthropic 兼容通道（OAuth token 或 API key）
+    Qoder,            // Qoder — 无公开 chat 协议（签到/额度保留）
+    CodeArts,         // 华为码道 — 无公开 chat 协议（签到/额度保留）
 }
 
 impl Platform {
@@ -69,6 +73,10 @@ impl Platform {
             "trae" => Some(Platform::Trae),
             "trae-enterprise" => Some(Platform::TraeEnterprise),
             "trae-global" => Some(Platform::TraeIntl),
+            "zcode" => Some(Platform::Zcode),
+            "minimax" => Some(Platform::Minimax),
+            "qoder" => Some(Platform::Qoder),
+            "codearts" | "codearts-desktop" => Some(Platform::CodeArts),
             _ => None,
         }
     }
@@ -80,11 +88,16 @@ impl Platform {
             Platform::Trae => "trae",
             Platform::TraeEnterprise => "trae-enterprise",
             Platform::TraeIntl => "trae-global",
+            Platform::Zcode => "zcode",
+            Platform::Minimax => "minimax",
+            Platform::Qoder => "qoder",
+            Platform::CodeArts => "codearts",
         }
     }
 
-    pub fn all() -> [Platform; 5] {
-        [Platform::WorkBuddy, Platform::WorkBuddyIntl, Platform::Trae, Platform::TraeEnterprise, Platform::TraeIntl]
+    pub fn all() -> [Platform; 9] {
+        [Platform::WorkBuddy, Platform::WorkBuddyIntl, Platform::Trae, Platform::TraeEnterprise, Platform::TraeIntl,
+         Platform::Zcode, Platform::Minimax, Platform::Qoder, Platform::CodeArts]
     }
 
     pub fn display(&self) -> &'static str {
@@ -94,6 +107,10 @@ impl Platform {
             Platform::Trae => "Trae 国内版 (SOLO)",
             Platform::TraeEnterprise => "Trae 企业版",
             Platform::TraeIntl => "Trae 国际版",
+            Platform::Zcode => "ZCode (智谱)",
+            Platform::Minimax => "MiniMax",
+            Platform::Qoder => "Qoder",
+            Platform::CodeArts => "华为码道",
         }
     }
 
@@ -104,8 +121,21 @@ impl Platform {
             Platform::WorkBuddyIntl => "workbuddy-intl",
             Platform::Trae | Platform::TraeEnterprise => "trae",
             Platform::TraeIntl => "trae-intl",
+            Platform::Zcode => "zcode",
+            Platform::Minimax => "minimax",
+            Platform::Qoder => "qoder",
+            Platform::CodeArts => "codearts",
         }
     }
+
+    /// 该平台是否有可用 chat 通道（false = 只保留签到/额度，网关路由时明确报错）
+    pub fn chat_capable(&self) -> bool {
+        matches!(self,
+            Platform::WorkBuddy | Platform::WorkBuddyIntl
+            | Platform::Trae | Platform::TraeEnterprise | Platform::TraeIntl
+            | Platform::Zcode | Platform::Minimax | Platform::Qoder)
+    }
+
 }
 
 /// WorkBuddy chat base：domain 判区（*.codebuddy.ai → 该站，否则国际站）
@@ -333,3 +363,170 @@ pub fn wb_chat_body(messages: &[Value], system: &str, model: &str, max_tokens: O
     }
     body
 }
+
+// ============================ ZCode（智谱） ============================
+
+/// 智谱开放平台 OpenAI 兼容端点
+pub const ZCODE_CHAT_BASE: &str = "https://open.bigmodel.cn";
+/// 智谱 chat 路径（OpenAI 兼容）
+pub const ZCODE_CHAT_PATH: &str = "/api/paas/v4/chat/completions";
+
+/// ZCode chat 请求头：凭据即智谱 access_token；deviceMid 可选
+pub fn zcode_chat_headers(token: &str, device_mid: Option<&str>) -> Vec<(String, String)> {
+    let mut hs = vec![
+        ("Authorization".to_string(), format!("Bearer {token}")),
+        ("Content-Type".to_string(), "application/json".to_string()),
+        ("Accept".to_string(), "application/json".to_string()),
+    ];
+    if let Some(mid) = device_mid {
+        if !mid.is_empty() {
+            hs.push(("X-Device-Id".to_string(), mid.to_string()));
+        }
+    }
+    hs
+}
+
+/// 智谱 chat body（OpenAI 兼容；thinking 可选参数）
+pub fn zcode_chat_body(messages: &[Value], system: &str, model: &str, max_tokens: Option<u32>, thinking: bool) -> Value {
+    let mut msgs: Vec<Value> = Vec::new();
+    if !system.is_empty() {
+        msgs.push(json!({ "role": "system", "content": system }));
+    }
+    msgs.extend(messages.iter().cloned());
+    let mut body = json!({
+        "model": model,
+        "messages": msgs,
+        "stream": true,
+    });
+    if let Some(mt) = max_tokens {
+        body["max_tokens"] = json!(mt);
+    }
+    // 智谱 GLM-4.5+ 的思考开关
+    body["thinking"] = json!({ "type": if thinking { "enabled" } else { "disabled" } });
+    body
+}
+
+// ============================ MiniMax ============================
+
+/// MiniMax 官方 API（Anthropic 兼容 + OpenAI 兼容双通道）
+pub const MINIMAX_API_BASE: &str = "https://api.minimaxi.com";
+/// MiniMax anthropic 兼容 chat 路径
+pub const MINIMAX_ANTHROPIC_PATH: &str = "/anthropic/v1/messages";
+
+/// MiniMax chat 请求头（凭据：MMOAT OAuth token 或 API key）
+pub fn minimax_chat_headers(token: &str) -> Vec<(String, String)> {
+    vec![
+        ("Authorization".to_string(), format!("Bearer {token}")),
+        ("x-api-key".to_string(), token.to_string()),
+        ("anthropic-version".to_string(), "2023-06-01".to_string()),
+        ("Content-Type".to_string(), "application/json".to_string()),
+        ("Accept".to_string(), "application/json".to_string()),
+    ]
+}
+
+/// MiniMax Anthropic Messages body（Anthropic 格式与 OpenAI 不同：system 是顶层字段）
+pub fn minimax_chat_body(messages: &[Value], system: &str, model: &str, max_tokens: Option<u32>) -> Value {
+    // Anthropic messages 不支持 system role → 移到顶层 system
+    let msgs: Vec<Value> = messages.iter()
+        .filter(|m| m.get("role").and_then(|r| r.as_str()) != Some("system"))
+        .cloned()
+        .collect();
+    let mut body = json!({
+        "model": model,
+        "messages": msgs,
+        "max_tokens": max_tokens.unwrap_or(4096),
+        "stream": true,
+    });
+    if !system.is_empty() {
+        body["system"] = json!(system);
+    }
+    body
+}
+
+/// 解析 Anthropic SSE chunk → 事件列表（MiniMax Anthropic 兼容通道返回 Anthropic 线格式）
+pub fn parse_anthropic_chunk(v: &Value) -> Vec<crate::upstream::StreamEvent> {
+    use crate::upstream::StreamEvent;
+    let mut out = Vec::new();
+    let typ = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+    match typ {
+        "error" => {
+            let err = v.get("error").cloned().unwrap_or(Value::Null);
+            let msg = err.get("message").and_then(|m| m.as_str()).unwrap_or("upstream error").to_string();
+            out.push(StreamEvent::Error(msg, "anthropic_error".into()));
+        }
+        "content_block_delta" => {
+            let delta = v.get("delta").cloned().unwrap_or(Value::Null);
+            match delta.get("type").and_then(|t| t.as_str()).unwrap_or("") {
+                "text_delta" => {
+                    if let Some(t) = delta.get("text").and_then(|t| t.as_str()) {
+                        if !t.is_empty() {
+                            out.push(StreamEvent::Text(t.to_string()));
+                        }
+                    }
+                }
+                "thinking_delta" => {
+                    if let Some(t) = delta.get("thinking").and_then(|t| t.as_str()) {
+                        if !t.is_empty() {
+                            out.push(StreamEvent::Reasoning(t.to_string()));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        "message_delta" => {
+            // 携带 stop_reason 与 usage
+            if let Some(u) = v.get("usage") {
+                let input = u.get("input_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
+                let output = u.get("output_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
+                out.push(StreamEvent::Usage { input, output, total: Some(input + output) });
+            }
+            if let Some(sr) = v.get("delta").and_then(|d| d.get("stop_reason")).and_then(|s| s.as_str()) {
+                out.push(StreamEvent::Done { finish: sr.to_string() });
+            }
+        }
+        "message_start" => {
+            if let Some(u) = v.pointer("/message/usage") {
+                let input = u.get("input_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
+                let output = u.get("output_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
+                if input > 0 || output > 0 {
+                    out.push(StreamEvent::Usage { input, output, total: Some(input + output) });
+                }
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+/// Anthropic SSE 缓冲类型（data: 行，与 OpenAI 相同帧格式）
+pub fn anthropic_frame_decode(data: &str) -> Vec<crate::upstream::StreamEvent> {
+    if data == "[DONE]" {
+        return vec![crate::upstream::StreamEvent::Done { finish: "stop".into() }];
+    }
+    let Ok(v) = serde_json::from_str::<Value>(data) else { return Vec::new() };
+    parse_anthropic_chunk(&v)
+}
+
+/// Qoder 云端 chat body（agent_chat_generation 信封格式：model/messages/stream/session_id/request_id）
+pub fn qoder_chat_body(messages: &[Value], model: &str) -> Value {
+    let request_id = uuid::Uuid::new_v4().to_string();
+    // messages 转为 OpenAI 线格式（string content 展平）
+    let mut msgs: Vec<Value> = Vec::new();
+    for m in messages {
+        let mut mm = m.clone();
+        if mm.get("content").map(|c| c.is_string()).unwrap_or(false) {
+            let text = mm["content"].as_str().unwrap_or("").to_string();
+            mm["content"] = json!([{ "type": "text", "text": text }]);
+        }
+        msgs.push(mm);
+    }
+    json!({
+        "model": model,
+        "messages": msgs,
+        "stream": true,
+        "session_id": request_id,
+        "request_id": request_id,
+    })
+}
+

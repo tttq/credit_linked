@@ -174,7 +174,7 @@ function renderAccounts() {
       '<span class="account-platform-count subtle">' + list.length + ' 个账号</span></div>' +
       '<div class="actions">' +
       (m.login !== 'none' ? '<button data-add="' + p + '" class="small primary">＋ 添加账号</button>' : '') +
-      (['trae','workbuddy','qoder','zcode'].includes(p) ? '<button data-import="' + p + '" class="small">扫描本机</button>' : '') +
+      (['trae','workbuddy','qoder','zcode','minimax'].includes(p) ? '<button data-import="' + p + '" class="small">扫描本机</button>' : '') +
       '</div></header>' +
       list.map(a => acctRow(a, p)).join('') +
       '</section>';
@@ -348,13 +348,17 @@ $$('#stat-period button').forEach(b => b.addEventListener('click', () => {
 $('#stat-account').addEventListener('change', () => { statAccount = $('#stat-account').value || 'all'; drawStatistics(); });
 
 // ===== 账号路由 + 模型网关 =====
-// 平台清单（与 credit-gateway 的 Platform 对齐）
+// 平台清单（与 credit-gateway 的 Platform 对齐；chat 标注是否有对话通道）
 const GW_PLATFORMS = {
-  'workbuddy':        { label: 'WorkBuddy 国内版', provider: 'workbuddy' },
-  'workbuddy-intl':   { label: 'WorkBuddy 国际版', provider: 'workbuddy-intl' },
-  'trae':             { label: 'Trae 国内版 (SOLO)', provider: 'trae' },
-  'trae-enterprise':  { label: 'Trae 企业版', provider: 'trae' },
-  'trae-global':      { label: 'Trae 国际版', provider: 'trae' },
+  'workbuddy':        { label: 'WorkBuddy 国内版', provider: 'workbuddy', chat: true },
+  'workbuddy-intl':   { label: 'WorkBuddy 国际版', provider: 'workbuddy-intl', chat: true },
+  'trae':             { label: 'Trae 国内版 (SOLO)', provider: 'trae', chat: true },
+  'trae-enterprise':  { label: 'Trae 企业版', provider: 'trae', chat: true },
+  'trae-global':      { label: 'Trae 国际版', provider: 'trae', chat: true },
+  'zcode':            { label: 'ZCode (智谱)', provider: 'zcode', chat: true },
+  'minimax':          { label: 'MiniMax', provider: 'minimax', chat: true },
+  'qoder':            { label: 'Qoder', provider: 'qoder', chat: false },
+  'codearts':         { label: '华为码道', provider: 'codearts', chat: false },
 };
 let GW_STATUS = null;
 
@@ -374,7 +378,9 @@ function renderRouting() {
     return '<div class="route-row" data-platform="' + name + '">' +
       '<div style="flex:1"><strong style="font-size:13.5px">' + esc(meta.label) +
       (isCurrent ? ' <span class="tag" style="background:var(--accent-soft);color:var(--accent)">当前平台</span>' : '') +
-      '</strong><div class="subtle" style="margin-top:3px">账号池 provider：' + esc(meta.provider) + ' · 可用账号 ' + count + ' 个</div></div>' +
+      (meta.chat ? '' : ' <span class="tag" style="background:#f7ecd9;color:var(--amber)">仅签到/额度</span>') +
+      '</strong><div class="subtle" style="margin-top:3px">账号池 provider：' + esc(meta.provider) + ' · 可用账号 ' + count + ' 个' +
+      (meta.chat ? '' : ' · 无公开对话协议，网关暂不代理') + '</div></div>' +
       (isCurrent ? '' : '<button class="small" data-switch="' + name + '">切换到此平台</button>') +
       '</div>';
   }).join('');

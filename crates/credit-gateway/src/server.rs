@@ -122,6 +122,10 @@ async fn list_models(
             Platform::WorkBuddy | Platform::WorkBuddyIntl => upstream::wb_fetch_models(&cred).await,
             Platform::Trae | Platform::TraeEnterprise => upstream::trae_fetch_models(&cred, false).await,
             Platform::TraeIntl => upstream::trae_fetch_models(&cred, true).await,
+            Platform::Zcode => upstream::zcode_fetch_models(&cred).await,
+            Platform::Minimax => upstream::minimax_fetch_models(&cred).await,
+            Platform::Qoder => upstream::qoder_fetch_models(&cred).await,
+            Platform::CodeArts => continue,
         };
         let Ok(models) = models else { continue };
         for m in models {
@@ -204,6 +208,10 @@ async fn chat_completions(
         }
     }
 
+    if !platform.chat_capable() {
+        return err_response(StatusCode::NOT_IMPLEMENTED, "chat_unavailable",
+            &format!("平台 {} 暂无可用的对话通道（该平台仅支持签到与额度管理）", platform.display()));
+    }
     let creds: Vec<Cred> = match pinned_account {
         Some(c) => vec![c],
         None => st.router.accounts_for(platform),
@@ -265,6 +273,22 @@ async fn dispatch_stream(
         Platform::TraeIntl => {
             let body = crate::protocol::trae_chat_body(messages, model, max_tokens, reasoning_effort, false);
             upstream::trae_chat_stream(cred, true, false, body).await.map_err(|e| ("upstream".to_string(), e))
+        }
+        Platform::Zcode => {
+            let thinking = !matches!(reasoning_effort, Some("off") | Some("none"));
+            let body = crate::protocol::zcode_chat_body(messages, system, model, max_tokens, thinking);
+            upstream::zcode_chat_stream(cred, body).await.map_err(|e| ("upstream".to_string(), e))
+        }
+        Platform::Minimax => {
+            let body = crate::protocol::minimax_chat_body(messages, system, model, max_tokens);
+            upstream::minimax_chat_stream(cred, body).await.map_err(|e| ("upstream".to_string(), e))
+        }
+        Platform::Qoder => {
+            let body = crate::protocol::qoder_chat_body(messages, model);
+            upstream::qoder_chat_stream(cred, body).await.map_err(|e| ("upstream".to_string(), e))
+        }
+        Platform::CodeArts => {
+            Err(("chat_unavailable".to_string(), format!("平台 {} 暂无可用的对话通道", platform.display())))
         }
     }
 }

@@ -160,6 +160,20 @@ impl Service {
                     meta: json!({}),
                 }
             }
+            "zcode" => {
+                let Some(live) = crate::adapters::zcode_local::read_live_auth() else {
+                    return Err(PlatformError::Local("未发现 ZCode 登录信息（客户端未安装或未登录）".into()));
+                };
+                crate::adapters::Cred {
+                    provider: "zcode".into(),
+                    uid: live.uid,
+                    name: live.name.unwrap_or_else(|| "ZCode (智谱)".into()),
+                    token: live.access_token,
+                    refresh_token: None,
+                    expires_at: None,
+                    meta: json!({ "deviceMid": live.device_mid }),
+                }
+            }
             other => return Err(PlatformError::Local(format!("platform {other} 暂不支持本机扫描导入（minimax/codearts 走登录流程，doubao 走窗口驱动）"))),
         };
         let auth = serde_json::to_string(&cred).map_err(|e| PlatformError::Local(e.to_string()))?;
