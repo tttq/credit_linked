@@ -54,11 +54,19 @@ jobs:
 
       - name: Build (credit-tauri, log to file)
         run: |
+          set -o pipefail
           cargo tauri build ${{ matrix.args }} 2>&1 | tee build.log
       - name: Show build tail (on failure)
         if: failure()
         run: tail -n 100 build.log || true
+      - name: Upload build log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-job-${{ strategy.job-index }}
+          path: build.log
       - name: Release (tauri-action)
+        if: success()
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
