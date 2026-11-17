@@ -41,7 +41,6 @@ fn parse_minute(t: &str) -> anyhow::Result<i64> {
 }
 
 pub fn rand_seed() -> u32 {
-    use rand::RngCore;
     let mut b = [0u8; 4];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut b);
     u32::from_be_bytes(b)

@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 
 use crate::adapters::*;
 use crate::error::PlatformError;
-use crate::net::http::{business, platform_fetch};
+use crate::net::http::platform_fetch;
 use reqwest::Method;
 
 pub const DEVICE_CODE_URL: &str = "https://account.minimax.cn/oauth2/device/code";

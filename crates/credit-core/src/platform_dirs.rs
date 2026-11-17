@@ -1,44 +1,31 @@
 //! 跨平台应用数据目录探测（Windows / macOS / Linux）。
-//! 各 IDE/Electron 客户端在不同 OS 下的用户数据目录约定集中在这里。
+//! 使用运行时 target_os 判断，保证所有平台分支在任何工具链下都参与类型检查。
 
 use std::path::PathBuf;
 
+/// 当前 OS 名称（编译期常量，运行时判断）
+const OS: &str = std::env::consts::OS;
+
 /// Electron userData 根目录（不含应用名）
 pub fn electron_userdata_root() -> PathBuf {
-    #[cfg(target_os = "windows")]
-    {
-        if let Some(p) = std::env::var_os("APPDATA") {
-            return PathBuf::from(p);
-        }
-        return dirs::home_dir().unwrap_or_default().join("AppData").join("Roaming");
-    }
-    #[cfg(target_os = "macos")]
-    {
-        // Electron 默认：~/Library/Application Support
-        return dirs::home_dir().unwrap_or_default().join("Library").join("Application Support");
-    }
-    #[cfg(target_os = "linux")]
-    {
-        // Electron 默认：$XDG_CONFIG_HOME 或 ~/.config
-        if let Ok(p) = std::env::var_os("XDG_CONFIG_HOME") {
-            return PathBuf::from(p);
-        }
-        return dirs::home_dir().unwrap_or_default().join(".config");
+    match OS {
+        "windows" => std::env::var_os("APPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join("AppData").join("Roaming")),
+        "macos" => dirs::home_dir().unwrap_or_default().join("Library").join("Application Support"),
+        _ => std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".config")),
     }
 }
 
 /// Electron local 数据根（Windows LOCALAPPDATA 专用；mac/linux 与 userData 同）
 pub fn electron_local_root() -> PathBuf {
-    #[cfg(target_os = "windows")]
-    {
-        if let Some(p) = std::env::var_os("LOCALAPPDATA") {
-            return PathBuf::from(p);
-        }
-        return dirs::home_dir().unwrap_or_default().join("AppData").join("Local");
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        electron_userdata_root()
+    match OS {
+        "windows" => std::env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join("AppData").join("Local")),
+        _ => electron_userdata_root(),
     }
 }
 

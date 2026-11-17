@@ -95,7 +95,7 @@ pub fn tc_encrypt(plain_body: &[u8]) -> Option<String> {
     let k = Sha512::digest(&cat);
     let mut mac_and_body = Sha512::digest(plain_body).to_vec();
     mac_and_body.extend_from_slice(plain_body);
-    let mut enc = Aes128CbcEnc::new((&k[..16]).into(), (&k[16..32]).into());
+    let enc = Aes128CbcEnc::new((&k[..16]).into(), (&k[16..32]).into());
     let mut out = vec![0u8; mac_and_body.len() + 16];
     out[..mac_and_body.len()].copy_from_slice(&mac_and_body);
     let n = enc.encrypt_padded_mut::<Pad>(&mut out, mac_and_body.len()).ok()?.len();

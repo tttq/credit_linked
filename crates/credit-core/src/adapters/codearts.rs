@@ -12,7 +12,7 @@ use p256::{SecretKey, ecdsa::signature::Signer, ecdsa::SigningKey};
 use crate::adapters::*;
 use crate::adapters::trae::urlencoding_lite;
 use crate::error::PlatformError;
-use crate::net::http::{platform_fetch, HOSTS};
+use crate::net::http::platform_fetch;
 use reqwest::Method;
 
 pub const STS_BASE: &str = "https://sts.cn-north-4.myhuaweicloud.com";
@@ -38,7 +38,6 @@ pub fn dpop_header(private_jwk: &Value, htu: &str) -> Result<String, PlatformErr
 struct JwkDec;
 impl JwkDec {
     fn from_jwk(jwk: &Value) -> Result<SecretKey, PlatformError> {
-        use base64::Engine as _;
         let d = jwk.get("d").and_then(|x| x.as_str()).ok_or_else(|| PlatformError::Format("jwk missing d".into()))?;
         let d_bytes = b64url_decode(d)?;
         let sk = SecretKey::from_slice(&d_bytes).map_err(|e| PlatformError::Format(format!("bad jwk d: {e}")))?;
@@ -71,7 +70,7 @@ pub async fn sts_token(body_pairs: &[(&str, &str)], private_jwk: &Value) -> Resu
     let url = format!("{STS_BASE}/v1/oauth2/tokens");
     let dpop = dpop_header(private_jwk, &url)?;
     let body = body_pairs.iter().map(|(k, v)| format!("{}={}", crate::adapters::trae::urlencoding_lite(k), crate::adapters::trae::urlencoding_lite(v))).collect::<Vec<_>>().join("&");
-    let hs = vec![
+    let _hs = vec![
         ("Content-Type", "application/x-www-form-urlencoded".to_string()),
         ("DPoP", dpop.clone()),
     ];

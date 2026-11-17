@@ -6,7 +6,6 @@
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
 use base64::Engine;
-use p256::ecdsa::signature::Signer;
 use p256::SecretKey;
 use rand::RngCore;
 use serde_json::{json, Value};

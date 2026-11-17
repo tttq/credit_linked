@@ -7,7 +7,6 @@ use crate::error::PlatformError;
 use crate::net::http::platform_fetch;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
 use base64::Engine;
-use rand::RngCore;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -214,11 +213,9 @@ fn new_p256_jwk() -> Value {
     let sk = p256::SecretKey::random(&mut rand::rngs::OsRng);
     let skb: [u8; 32] = sk.to_bytes().into();
     let vk = p256::ecdsa::SigningKey::from(&sk);
-    use p256::ecdsa::signature::Verifier;
     let _ = &vk; // keep type alive
     let vk_bytes = vk.to_bytes();
     // vk.to_bytes() 是 32 字节压缩标量（sec1 非这里所需）——改用 EncodePoint
-    use p256::elliptic_curve::sec1::ToEncodedPoint;
     let pt = vk.verifying_key().to_encoded_point(false);
     let _ = vk_bytes;
     let x = B64URL.encode(pt.x().unwrap().as_slice());
@@ -229,7 +226,7 @@ fn new_p256_jwk() -> Value {
 
 // ===== Trae 后台回调任务 =====
 
-async fn trae_wait_task(sid: String, listener: TcpListener, login: crate::adapters::trae::TraeLogin, shared: Arc<Mutex<Option<Result<Cred, String>>>>) {
+async fn trae_wait_task(sid: String, listener: TcpListener, login: crate::adapters::trae::TraeLogin, _shared: Arc<Mutex<Option<Result<Cred, String>>>>) {
     let res: Result<Cred, String> = async {
         let query = wait_callback(&listener, std::time::Duration::from_secs(299), "/authorize", "授权完成，请返回 AI路由助手。").await.map_err(|e| e.to_string())?;
         let params = parse_query(&query);
@@ -264,7 +261,7 @@ async fn codearts_wait_task(
     private_jwk: Value,
     client: &'static str,
     port: u16,
-    shared: Arc<Mutex<Option<Result<Cred, String>>>>,
+    _shared: Arc<Mutex<Option<Result<Cred, String>>>>,
 ) {
     let res: Result<Cred, String> = async {
         // 授权页可能先发一次 307 中转请求（带 secret/redirect 无 code），真正回调带 code
@@ -354,7 +351,7 @@ pub async fn poll_login(session_id: &str) -> Result<PollOut, PlatformError> {
         FlowData::Mini { verifier, device_code, interval_secs } => {
             let st = crate::adapters::minimax::MiniStart { device_code, verification_uri: String::new(), interval_secs, verifier };
             match crate::adapters::minimax::poll_device_login(&st).await? {
-                crate::adapters::minimax::MiniPoll::Pending { interval_secs } => None,
+                crate::adapters::minimax::MiniPoll::Pending { interval_secs: _ } => None,
                 #[allow(unused_variables)]
                 crate::adapters::minimax::MiniPoll::Ready(at_v, tok) => {
                     let at = at_v.as_str().unwrap_or_default().to_string();
