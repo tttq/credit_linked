@@ -53,6 +53,7 @@ jobs:
         run: cargo install tauri-cli --version "^2" --locked
 
       - name: Build (credit-tauri)
+        shell: bash
         run: |
           set -o pipefail
           cargo tauri build ${{ matrix.args }} 2>&1 | tee build.log || {
