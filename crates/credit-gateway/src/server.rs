@@ -11,8 +11,10 @@
 //!   PUT/DELETE /admin/rules/:id
 //!   GET  /admin/status                 — 网关状态
 
+use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Instant;
 
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -35,6 +37,40 @@ pub struct GatewayState {
     pub router: Router,
     /// 可选 Bearer 鉴权（空 = 不鉴权，仅本机使用）
     pub api_key: String,
+    /// 速率限制：60s 滑动窗口请求时间戳（0 = 不限速）
+    pub rate_window: std::sync::Mutex<VecDeque<Instant>>,
+    /// 实际监听端口（status 展示用）
+    pub port: u16,
+}
+
+impl GatewayState {
+    /// 每分钟请求数上限（settings gatewayRpm；0 = 不限）
+    pub fn rpm_limit(&self) -> u32 {
+        self.store.get_setting("gatewayRpm", "0").ok()
+            .and_then(|v| v.parse::<u32>().ok()).unwrap_or(0)
+    }
+
+    /// 限速检查：true = 放行，false = 已超限
+    pub fn rate_allow(&self) -> bool {
+        let rpm = self.rpm_limit();
+        if rpm == 0 {
+            return true;
+        }
+        let mut w = self.rate_window.lock().unwrap();
+        let now = Instant::now();
+        while let Some(t) = w.front() {
+            if now.duration_since(*t).as_secs() >= 60 {
+                w.pop_front();
+            } else {
+                break;
+            }
+        }
+        if w.len() >= rpm as usize {
+            return false;
+        }
+        w.push_back(now);
+        true
+    }
 }
 
 impl GatewayState {
@@ -177,12 +213,26 @@ async fn chat_completions(
     if !st.check_auth(headers.get(axum::http::header::AUTHORIZATION).and_then(|v| v.to_str().ok())) {
         return openai_error_response(StatusCode::UNAUTHORIZED, "unauthorized", "missing or invalid Authorization bearer");
     }
+    // 速率限制（settings gatewayRpm，0 = 不限）
+    if !st.rate_allow() {
+        let _ = st.store.log_gateway_request(st.router.current_platform().as_str(), "", body.0.get("model").and_then(|m| m.as_str()).unwrap_or(""), false, Some(429), Some("rate limited"), None);
+        return openai_error_response(StatusCode::TOO_MANY_REQUESTS, "rate_limited",
+            &format!("rate limit exceeded: {} requests/min (settings: gatewayRpm)", st.rpm_limit()));
+    }
     let body = body.0;
     let model_field = body.get("model").and_then(|m| m.as_str()).unwrap_or("").to_string();
-    let Some((platform, model)) = resolve_model(&model_field, st.router.current_platform()) else {
+    let current = st.router.current_platform();
+    let Some((platform, model)) = resolve_model(&model_field, current) else {
         return openai_error_response(StatusCode::BAD_REQUEST, "missing_model",
             "field \"model\" is required: bare id (routed via current platform) or \"platform/model\"");
     };
+    // 默认只取当前请求平台：裸 id 固定当前平台；strict 开启时显式 平台/模型 也仅限当前平台
+    let strict = st.store.get_setting("gatewayStrict", "1").ok().map(|v| v == "1").unwrap_or(true);
+    if strict && platform != current {
+        let _ = st.store.log_gateway_request(current.as_str(), "", &model, false, Some(403), Some("platform locked"), None);
+        return openai_error_response(StatusCode::FORBIDDEN, "platform_locked",
+            &format!("gateway is locked to current platform \"{}\"; requested \"{}\" (在账号路由页关闭\"仅允许当前平台\"可放开)", current.as_str(), platform.as_str()));
+    }
     let openai_messages = body.get("messages").and_then(|m| m.as_array()).cloned().unwrap_or_default();
     if openai_messages.is_empty() {
         return openai_error_response(StatusCode::BAD_REQUEST, "missing_messages", "field \"messages\" is required");
@@ -194,11 +244,11 @@ async fn chat_completions(
     let stream = body.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
     let _ = body.get("temperature"); // 上游不接受 temperature 的通道直接忽略
 
-    // 路由规则覆盖（模型前缀命中 → 固定平台/账号）
+    // 路由规则覆盖（模型前缀命中 → 固定平台/账号）；strict 模式下规则仅能固定账号，平台始终 = 当前平台
     let mut platform = platform;
     let mut pinned_account: Option<Cred> = None;
     if let Some(rule) = st.router.match_rule(&model) {
-        if !rule.platform.is_empty() {
+        if !rule.platform.is_empty() && !strict {
             if let Some(p) = Platform::parse(&rule.platform) {
                 platform = p;
             }
@@ -226,6 +276,12 @@ async fn chat_completions(
     for cred in &creds {
         match dispatch_stream(&st, platform, cred, &model, &messages, &system, max_tokens, reasoning_effort.as_deref()).await {
             Ok(events) => {
+                // 请求日志：成功一条（流式在响应完成前先记 ok=1）
+                let _ = st.store.log_gateway_request(
+                    platform.as_str(),
+                    &format!("{}:{}", cred.provider, cred.uid),
+                    &model, true, Some(200), None, None,
+                );
                 return if stream {
                     stream_response(&model, platform.as_str(), events)
                 } else {
@@ -244,7 +300,13 @@ async fn chat_completions(
             }
         }
     }
+    // 请求日志：失败一条
     let (code, msg) = last_error.unwrap_or_else(|| ("upstream".into(), "upstream error".into()));
+    let _ = st.store.log_gateway_request(
+        platform.as_str(),
+        creds.first().map(|c| format!("{}:{}", c.provider, c.uid)).unwrap_or_default().as_str(),
+        &model, false, Some(502), Some(&msg), None,
+    );
     err_response(StatusCode::BAD_GATEWAY, &code, &msg)
 }
 
@@ -499,12 +561,17 @@ async fn gateway_status(State(st): State<Arc<GatewayState>>) -> Response {
     let current = st.router.current_platform();
     let accounts: serde_json::Map<String, Value> = Platform::all().iter()
         .map(|p| (p.as_str().to_string(), json!(st.router.accounts_for(*p).len()))).collect();
+    let (total, ok, fail) = st.store.gateway_log_stats().unwrap_or((0, 0, 0));
     Json(json!({
         "platform": current.as_str(),
         "label": current.display(),
         "accounts": accounts,
         "rules": st.router.list_rules().len(),
         "auth": !st.api_key.is_empty(),
+        "port": st.port,
+        "rpm": st.rpm_limit(),
+        "strict": st.store.get_setting("gatewayStrict", "1").ok().map(|v| v == "1").unwrap_or(true),
+        "logStats": { "total": total, "ok": ok, "fail": fail },
     }))
     .into_response()
 }

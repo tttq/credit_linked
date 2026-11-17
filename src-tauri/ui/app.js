@@ -395,18 +395,68 @@ function renderRouting() {
     '<button class="small" data-rule-del="' + esc(r.id) + '">删除</button>' +
     '</div>').join('') || '<div class="empty">暂无规则 —— 全部请求按当前平台 + 平台内默认选号</div>';
 
+  const logRows = (st.logs || []).slice(0, 30).map(l =>
+    '<div class="route-row" style="font-size:12.5px">' +
+    '<div style="flex:1;min-width:0"><strong style="font-size:12.5px">' + (l.ok ? '<span style="color:var(--green)">✓ 成功</span>' : '<span style="color:var(--red)">✗ 失败</span>') +
+    ' <code style="font-size:12px">' + esc(l.model || '(无模型)') + '</code></strong>' +
+    '<div class="subtle" style="margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(l.at) + ' · ' + esc(l.platform) +
+    (l.account ? ' · ' + esc(l.account) : '') + (l.message && !l.ok ? ' · ' + esc(l.message) : '') + '</div></div>' +
+    '</div>').join('') || '<div class="empty">暂无请求日志</div>';
+
   el.innerHTML =
     // 网关地址卡
     '<section class="surface" style="margin-bottom:14px"><div class="setting-row">' +
     '<div><h3>本地网关（OpenAI 兼容接口）</h3><p class="subtle">像本地 Ollama 一样，把下面的接口地址填进任意支持 OpenAI 的客户端。</p></div>' +
     '<div><strong style="font-family:monospace;font-size:13px">' + esc(st.baseUrl) + '/v1</strong>' +
-    '<div class="subtle" style="margin-top:4px">GET /v1/models · POST /v1/chat/completions · 端口 ' + st.port + '</div></div></div>' +
-    '<p class="notice">模型 id 用 <code>平台/模型</code>（如 <code>workbuddy/glm-5.3-flash</code>）；裸模型 id 走下方当前平台。</p></section>' +
+    '<div class="subtle" style="margin-top:4px">GET /v1/models · POST /v1/chat/completions · 端口 <b id="gw-port-now">' + st.port + '</b></div></div></div>' +
+    '<p class="notice">模型 id 用 <code>平台/模型</code>（如 <code>workbuddy/glm-5.3-flash</code>）；裸模型 id 走下方当前平台。</p>' +
+    // 端口 / 速率 / 仅当前平台 —— 自定义设置
+    '<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-top:10px;padding-top:10px;border-top:1px solid var(--line)">' +
+    '<label class="subtle">端口（改后需重启应用）<div style="display:flex;gap:6px;margin-top:4px">' +
+    '<input id="gw-port" type="number" min="1" max="65535" value="' + st.port + '" style="width:100%;padding:8px;border-radius:9px;border:1px solid var(--line);font:inherit">' +
+    '<button id="gw-port-save" class="small primary">保存</button></div></label>' +
+    '<label class="subtle">速率限制（RPM，0 = 不限）<div style="display:flex;gap:6px;margin-top:4px">' +
+    '<input id="gw-rpm" type="number" min="0" value="' + (st.rpm || 0) + '" style="width:100%;padding:8px;border-radius:9px;border:1px solid var(--line);font:inherit">' +
+    '<button id="gw-rpm-save" class="small primary">保存</button></div></label>' +
+    '<label class="subtle">仅允许当前平台<div style="margin-top:10px"><label class="switch"><input type="checkbox" id="gw-strict" ' + (st.strict !== false ? 'checked' : '') + '><span class="track"><span class="knob"></span></span></label></div>' +
+    '<div class="subtle" style="margin-top:4px">开启后显式 <code>平台/模型</code> 与规则改平台都会被 403 拒绝</div></label>' +
+    '</div></section>' +
+    // 请求日志
+    '<h3 class="spaced">请求日志（最近 ' + Math.min(st.logs?.length || 0, 30) + ' 条 · 总计 ' + (st.logStats?.total || 0) + ' · 成功 ' + (st.logStats?.ok || 0) + ' · 失败 ' + (st.logStats?.fail || 0) + '）</h3>' + logRows +
     // 当前平台
     '<h3 class="spaced">请求平台（裸模型 id 的默认路由）</h3>' + platRows +
     // 规则
     '<h3 class="spaced">路由规则（按模型前缀固定平台/账号）</h3>' + ruleRows +
     '<div class="actions" style="margin-top:10px"><button id="rule-add" class="small primary">＋ 新建规则</button></div>';
+
+  const bindGwSave = (btnId, inputId, field) => {
+    const btn = el.querySelector('#' + btnId);
+    if (!btn) return;
+    btn.addEventListener('click', async () => {
+      const raw = el.querySelector('#' + inputId)?.value;
+      const val = parseInt(raw, 10);
+      if (isNaN(val)) { toast('请输入数字', 3600); return; }
+      btn.disabled = true;
+      try {
+        const r = await invoke('gateway_set_limits', { [field]: val });
+        toast(field === 'port'
+          ? (r.needsRestart ? '端口已保存，重启应用后生效' : '端口已保存（与当前一致）')
+          : '速率限制已保存（实时生效）');
+        await refreshGateway(); renderRouting();
+      } catch (e) { toast('保存失败: ' + e, 4200); }
+      btn.disabled = false;
+    });
+  };
+  bindGwSave('gw-port-save', 'gw-port', 'port');
+  bindGwSave('gw-rpm-save', 'gw-rpm', 'rpm');
+  const strictSw = el.querySelector('#gw-strict');
+  if (strictSw) strictSw.addEventListener('change', async () => {
+    try {
+      await invoke('gateway_set_limits', { strict: strictSw.checked });
+      toast(strictSw.checked ? '已锁定当前平台' : '已允许任意平台（规则可改平台）');
+      await refreshGateway();
+    } catch (e) { toast('操作失败: ' + e, 4200); strictSw.checked = !strictSw.checked; }
+  });
 
   el.querySelectorAll('[data-switch]').forEach(b => b.addEventListener('click', async () => {
     b.disabled = true;

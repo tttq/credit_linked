@@ -278,6 +278,14 @@ async fn gateway_status() -> Result<serde_json::Value, String> {
     let port: u16 = s.store.get_setting("gatewayPort", &GATEWAY_DEFAULT_PORT.to_string())
         .ok().and_then(|v| v.parse().ok()).unwrap_or(GATEWAY_DEFAULT_PORT);
     let api_key = s.store.get_setting("gatewayApiKey", "").unwrap_or_default();
+    let rpm: i64 = s.store.get_setting("gatewayRpm", "0").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let strict = s.store.get_setting("gatewayStrict", "1").ok().map(|v| v == "1").unwrap_or(true);
+    let (total, ok, fail) = s.store.gateway_log_stats().unwrap_or((0, 0, 0));
+    let logs: Vec<serde_json::Value> = s.store.list_gateway_logs(100).unwrap_or_default().into_iter()
+        .map(|l| serde_json::json!({
+            "id": l.id, "at": l.at, "platform": l.platform, "account": l.account,
+            "model": l.model, "ok": l.ok, "status": l.status_code, "message": l.message, "tokens": l.tokens,
+        })).collect();
     Ok(serde_json::json!({
         "running": true,
         "port": port,
@@ -287,7 +295,37 @@ async fn gateway_status() -> Result<serde_json::Value, String> {
         "accounts": accounts,
         "rules": router.list_rules(),
         "auth": !api_key.is_empty(),
+        "rpm": rpm,
+        "strict": strict,
+        "logStats": { "total": total, "ok": ok, "fail": fail },
+        "logs": logs,
     }))
+}
+
+/// 网关设置：端口 / 速率（RPM）/ 仅当前平台开关。端口改动需重启应用生效。
+#[tauri::command]
+async fn gateway_set_limits(port: Option<i64>, rpm: Option<i64>, strict: Option<bool>) -> Result<serde_json::Value, String> {
+    let s = svc()?;
+    let mut needs_restart = false;
+    if let Some(p) = port {
+        if !(1..=65535).contains(&p) {
+            return Err("端口必须在 1-65535".into());
+        }
+        let old: i64 = s.store.get_setting("gatewayPort", &GATEWAY_DEFAULT_PORT.to_string())
+            .ok().and_then(|v| v.parse().ok()).unwrap_or(GATEWAY_DEFAULT_PORT as i64);
+        s.store.set_setting("gatewayPort", &p.to_string()).map_err(|e| e.to_string())?;
+        needs_restart = p != old;
+    }
+    if let Some(r) = rpm {
+        if r < 0 {
+            return Err("RPM 不能为负数".into());
+        }
+        s.store.set_setting("gatewayRpm", &r.to_string()).map_err(|e| e.to_string())?;
+    }
+    if let Some(v) = strict {
+        s.store.set_setting("gatewayStrict", if v { "1" } else { "0" }).map_err(|e| e.to_string())?;
+    }
+    Ok(serde_json::json!({ "ok": true, "needsRestart": needs_restart }))
 }
 
 #[tauri::command]
@@ -352,6 +390,8 @@ fn main() {
                     store: store.clone(),
                     router: Router::new(store),
                     api_key,
+                    rate_window: std::sync::Mutex::new(std::collections::VecDeque::new()),
+                    port,
                 });
                 let addr = SocketAddr::from(([127, 0, 0, 1], port));
                 if let Err(e) = credit_gateway::serve(state, addr).await {
@@ -367,6 +407,7 @@ fn main() {
             statistics, daily_income, settings_get, settings_set, account_list_all, open_url,
             login_open_window, login_close_window,
             gateway_status, gateway_set_platform, gateway_add_rule, gateway_update_rule, gateway_delete_rule,
+            gateway_set_limits,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

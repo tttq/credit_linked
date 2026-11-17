@@ -18,6 +18,7 @@ impl Store {
             "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=3000;",
         )?;
         Self::migrate(&conn)?;
+        Self::migrate_v2(&conn)?;
         Ok(Self { conn: Mutex::new(conn) })
     }
 
@@ -67,6 +68,30 @@ impl Store {
                 value TEXT NOT NULL
             );
             PRAGMA user_version = 1;",
+        )?;
+        Ok(())
+    }
+
+    /// v2：网关请求日志（每请求一条：成功/失败）
+    fn migrate_v2(conn: &Connection) -> anyhow::Result<()> {
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if version >= 2 {
+            return Ok(());
+        }
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS gateway_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                at TEXT NOT NULL,
+                platform TEXT NOT NULL,
+                account TEXT NOT NULL DEFAULT '',
+                model TEXT NOT NULL DEFAULT '',
+                ok INTEGER NOT NULL,
+                status_code INTEGER,
+                message TEXT,
+                tokens INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS gateway_logs_at ON gateway_logs(at DESC);
+            PRAGMA user_version = 2;",
         )?;
         Ok(())
     }
@@ -197,6 +222,81 @@ pub fn list_history(&self, limit: i64) -> anyhow::Result<Vec<HistoryRow>> {
     })?;
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
 }
+
+    /// 记录一条网关请求日志（ok: 成功/失败）
+    #[allow(clippy::too_many_arguments)]
+    pub fn log_gateway_request(
+        &self,
+        platform: &str,
+        account: &str,
+        model: &str,
+        ok: bool,
+        status_code: Option<i64>,
+        message: Option<&str>,
+        tokens: Option<i64>,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO gateway_logs (at, platform, account, model, ok, status_code, message, tokens) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            rusqlite::params![
+                crate::adapters::now_iso(),
+                platform,
+                account,
+                model,
+                ok as i64,
+                status_code,
+                message,
+                tokens
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// 最近网关请求日志（UI 展示用）
+    pub fn list_gateway_logs(&self, limit: i64) -> anyhow::Result<Vec<GatewayLogRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut st = conn.prepare(
+            "SELECT id, at, platform, account, model, ok, status_code, message, tokens FROM gateway_logs ORDER BY at DESC, id DESC LIMIT ?1",
+        )?;
+        let rows = st.query_map([limit], |r| {
+            Ok(GatewayLogRow {
+                id: r.get(0)?,
+                at: r.get(1)?,
+                platform: r.get(2)?,
+                account: r.get(3)?,
+                model: r.get(4)?,
+                ok: r.get::<_, i64>(5)? != 0,
+                status_code: r.get(6)?,
+                message: r.get(7)?,
+                tokens: r.get(8)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// 日志统计：总请求数 / 成功 / 失败
+    pub fn gateway_log_stats(&self) -> anyhow::Result<(i64, i64, i64)> {
+        let conn = self.conn.lock().unwrap();
+        let (total, ok): (i64, i64) = conn.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(ok), 0) FROM gateway_logs",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        Ok((total, ok, total - ok))
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct GatewayLogRow {
+    pub id: i64,
+    pub at: String,
+    pub platform: String,
+    pub account: String,
+    pub model: String,
+    pub ok: bool,
+    pub status_code: Option<i64>,
+    pub message: Option<String>,
+    pub tokens: Option<i64>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
