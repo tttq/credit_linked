@@ -422,7 +422,8 @@ function renderRouting() {
     '<div class="subtle" style="margin-top:4px">开启后显式 <code>平台/模型</code> 与规则改平台都会被 403 拒绝</div></label>' +
     '</div></section>' +
     // 请求日志
-    '<h3 class="spaced">请求日志（最近 ' + Math.min(st.logs?.length || 0, 30) + ' 条 · 总计 ' + (st.logStats?.total || 0) + ' · 成功 ' + (st.logStats?.ok || 0) + ' · 失败 ' + (st.logStats?.fail || 0) + '）</h3>' + logRows +
+    '<h3 class="spaced" style="display:flex;align-items:center;justify-content:space-between"><span>请求日志（最近 ' + Math.min(st.logs?.length || 0, 30) + ' 条 · 总计 ' + (st.logStats?.total || 0) + ' · 成功 ' + (st.logStats?.ok || 0) + ' · 失败 ' + (st.logStats?.fail || 0) + '）</span>' +
+    ((st.logStats?.total || 0) > 0 ? '<button id="gw-logs-clear" class="small danger-ghost">清空日志</button>' : '') + '</h3>' + logRows +
     // 当前平台
     '<h3 class="spaced">请求平台（裸模型 id 的默认路由）</h3>' + platRows +
     // 规则
@@ -456,6 +457,18 @@ function renderRouting() {
       toast(strictSw.checked ? '已锁定当前平台' : '已允许任意平台（规则可改平台）');
       await refreshGateway();
     } catch (e) { toast('操作失败: ' + e, 4200); strictSw.checked = !strictSw.checked; }
+  });
+
+  const clearBtn = el.querySelector('#gw-logs-clear');
+  if (clearBtn) clearBtn.addEventListener('click', async () => {
+    if (!confirm('确定清空全部请求日志？此操作不可恢复。')) return;
+    clearBtn.disabled = true;
+    try {
+      const r = await invoke('gateway_clear_logs');
+      toast('已清空 ' + (r.cleared || 0) + ' 条日志');
+      await refreshGateway(); renderRouting();
+    } catch (e) { toast('清空失败: ' + e, 4200); }
+    clearBtn.disabled = false;
   });
 
   el.querySelectorAll('[data-switch]').forEach(b => b.addEventListener('click', async () => {

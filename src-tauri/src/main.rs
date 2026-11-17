@@ -328,6 +328,14 @@ async fn gateway_set_limits(port: Option<i64>, rpm: Option<i64>, strict: Option<
     Ok(serde_json::json!({ "ok": true, "needsRestart": needs_restart }))
 }
 
+/// 清空全部网关请求日志
+#[tauri::command]
+async fn gateway_clear_logs() -> Result<serde_json::Value, String> {
+    let s = svc()?;
+    let n = s.store.clear_gateway_logs().map_err(|e| e.to_string())?;
+    Ok(serde_json::json!({ "ok": true, "cleared": n }))
+}
+
 #[tauri::command]
 async fn gateway_set_platform(platform: String) -> Result<serde_json::Value, String> {
     let router = gw_router()?;
@@ -407,7 +415,7 @@ fn main() {
             statistics, daily_income, settings_get, settings_set, account_list_all, open_url,
             login_open_window, login_close_window,
             gateway_status, gateway_set_platform, gateway_add_rule, gateway_update_rule, gateway_delete_rule,
-            gateway_set_limits,
+            gateway_set_limits, gateway_clear_logs,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

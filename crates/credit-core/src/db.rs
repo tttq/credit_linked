@@ -274,6 +274,13 @@ pub fn list_history(&self, limit: i64) -> anyhow::Result<Vec<HistoryRow>> {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
+    /// 清空全部网关请求日志
+    pub fn clear_gateway_logs(&self) -> anyhow::Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute("DELETE FROM gateway_logs", [])?;
+        Ok(n as i64)
+    }
+
     /// 日志统计：总请求数 / 成功 / 失败
     pub fn gateway_log_stats(&self) -> anyhow::Result<(i64, i64, i64)> {
         let conn = self.conn.lock().unwrap();
