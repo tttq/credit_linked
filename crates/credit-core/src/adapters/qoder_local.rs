@@ -7,19 +7,13 @@ use serde_json::Value;
 use crate::crypto::aes_gcm::decrypt_v10_blob;
 
 pub fn app_dir(intl: bool) -> Option<std::path::PathBuf> {
-    let base = std::env::var_os("APPDATA").map(std::path::PathBuf::from)?;
+    let base = crate::platform_dirs::electron_userdata_root();
     let candidates: &[&str] = if intl {
-        &["com.qoder.app.stable", "com.qoder.app"]
+        &["com.qoder.app.stable", "com.qoder.app", "Qoder", "qoder"]
     } else {
-        &["com.qodercn.app.stable", "com.qodercn.app"]
+        &["com.qodercn.app.stable", "com.qodercn.app", "Qoder CN", "qoder-cn"]
     };
-    for c in candidates {
-        let p = base.join(c);
-        if p.exists() {
-            return Some(p);
-        }
-    }
-    None
+    crate::platform_dirs::find_app_dir(&base, candidates)
 }
 
 /// Local State os_crypt.encrypted_key（"DPAPI" 前缀 5B）→ DPAPI → AES-256 key

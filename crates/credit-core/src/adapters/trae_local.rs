@@ -8,15 +8,16 @@ use serde_json::Value;
 
 use crate::crypto::aes_cbc::tc_decrypt;
 
-pub const APP_NAMES: [&str; 2] = ["Trae CN", "TRAE SOLO CN"];
+pub const APP_NAMES: [&str; 7] = [
+    "Trae CN", "TRAE SOLO CN",              // Windows
+    "Trae", "Trae CN", "Trae SOLO",          // macOS
+    "trae", "trae-cn",                       // Linux
+];
 pub const AUTH_KEY: &str = "iCubeAuthInfo://icube.cloudide";
 pub const DC_PREFIX: &str = "iCubeAuthInfo://icube-dc:";
 
 fn app_data_root() -> PathBuf {
-    if let Some(p) = std::env::var_os("APPDATA") {
-        return PathBuf::from(p);
-    }
-    dirs::home_dir().unwrap_or_default().join("AppData").join("Roaming")
+    crate::platform_dirs::electron_userdata_root()
 }
 
 pub fn trae_data_dir() -> Option<PathBuf> {

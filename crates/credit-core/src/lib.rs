@@ -9,3 +9,4 @@ pub mod service;
 pub mod db;
 
 pub use error::PlatformError;
+pub mod platform_dirs;

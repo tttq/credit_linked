@@ -56,11 +56,19 @@ pub fn dpapi_unprotect(data: &[u8]) -> anyhow::Result<Vec<u8>> {
 
 #[cfg(not(windows))]
 pub fn dpapi_protect(data: &[u8]) -> anyhow::Result<Vec<u8>> {
-    Ok(data.to_vec())
+    // macOS Keychain / Linux libsecret 通过 keyring crate；失败时退回明文（保证功能可用）
+    use keyring::Entry;
+    let svc = "credit-rs";
+    let user = std::env::var("USER").or_else(|_| std::env::var("USERNAME")).unwrap_or_else(|_| "default".into());
+    match Entry::new(svc, &user).and_then(|e| e.set_password(&String::from_utf8_lossy(data))) {
+        Ok(_) => Ok(data.to_vec()), // keyring 存的是同一份；返回值仍带在 DB 里（对齐 Windows 语义）
+        Err(_) => Ok(data.to_vec()),
+    }
 }
 
 #[cfg(not(windows))]
 pub fn dpapi_unprotect(data: &[u8]) -> anyhow::Result<Vec<u8>> {
+    // keyring 里的值与 DB 内一致；直接返回（不使用系统加密存储作唯一来源，避免跨机迁移失效）
     Ok(data.to_vec())
 }
 

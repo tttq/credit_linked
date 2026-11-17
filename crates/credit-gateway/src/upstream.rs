@@ -693,7 +693,8 @@ pub struct QoderSigner {
 impl QoderSigner {
     pub async fn spawn() -> Result<Self, PlatformError> {
         let exe = sidecar_script()?;
-        let child = tokio::process::Command::new("node")
+        let node_bin = find_node()?;
+        let child = tokio::process::Command::new(&node_bin)
             .arg(&exe)
             .arg("serve")
             .stdin(std::process::Stdio::piped())
@@ -738,6 +739,17 @@ impl QoderSigner {
             Err(PlatformError::Local(format!("sidecar: {}", resp.get("error").and_then(|e| e.as_str()).unwrap_or("unknown"))))
         }
     }
+}
+
+/// 探测可用的 node 可执行文件（跨平台：node / nodejs）
+fn find_node() -> Result<String, PlatformError> {
+    if let Ok(p) = std::env::var("NODE_BIN") { return Ok(p); }
+    for name in ["node", "nodejs"] {
+        if let Ok(out) = std::process::Command::new(name).arg("--version").output() {
+            if out.status.success() { return Ok(name.to_string()); }
+        }
+    }
+    Err(PlatformError::Local("node.js not found; install Node.js or set NODE_BIN".into()))
 }
 
 fn sidecar_script() -> Result<std::path::PathBuf, PlatformError> {

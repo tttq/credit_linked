@@ -20,8 +20,14 @@ rand.workspace = true
 uuid.workspace = true
 rusqlite.workspace = true
 dirs.workspace = true
-windows = { version = "0.58", features = ["Win32_Security_Cryptography", "Win32_Foundation"] }
 async-trait.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = ["Win32_Security_Cryptography", "Win32_Foundation"] }
+
+[target.'cfg(unix)'.dependencies]
+# macOS Keychain / Linux libsecret via keyring crate
+keyring = { version = "3", features = ["linux-native"] }
 
 [dev-dependencies]
 hex = "0.4"

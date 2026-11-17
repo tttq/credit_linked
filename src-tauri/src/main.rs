@@ -160,11 +160,13 @@ async fn account_list_all() -> Result<serde_json::Value, String> {
 
 #[tauri::command]
 async fn open_url(url: String) -> Result<(), String> {
-    // Windows: 用默认浏览器打开（cmd start 需要空标题占位参数）
-    std::process::Command::new("cmd")
-        .args(["/C", "start", "", &url])
-        .spawn()
-        .map_err(|e| e.to_string())?;
+    // 跨平台用系统默认浏览器打开授权页
+    #[cfg(windows)]
+    std::process::Command::new("cmd").args(["/C", "start", "", &url]).spawn().map_err(|e| e.to_string())?;
+    #[cfg(target_os = "macos")]
+    std::process::Command::new("open").arg(&url).spawn().map_err(|e| e.to_string())?;
+    #[cfg(target_os = "linux")]
+    std::process::Command::new("xdg-open").arg(&url).spawn().map_err(|e| e.to_string())?;
     Ok(())
 }
 

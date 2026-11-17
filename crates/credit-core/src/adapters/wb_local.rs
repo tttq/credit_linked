@@ -11,10 +11,10 @@ use sha2::{Digest, Sha256};
 use crate::crypto::aes_gcm::gcm_decrypt;
 
 pub fn auth_dir() -> std::path::PathBuf {
-    // Windows %LOCALAPPDATA%/CodeBuddyExtension/Data/Public/auth
-    let base = std::env::var_os("LOCALAPPDATA")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join("AppData/Local"));
+    // Windows: %LOCALAPPDATA%/CodeBuddyExtension/Data/Public/auth
+    // macOS:   ~/Library/Application Support/CodeBuddyExtension/Data/Public/auth
+    // Linux:   ~/.config/CodeBuddyExtension/Data/Public/auth
+    let base = crate::platform_dirs::electron_local_root();
     base.join("CodeBuddyExtension").join("Data").join("Public").join("auth")
 }
 
@@ -64,7 +64,7 @@ fn open_envelope(enc_obj: &Value, key: &[u8]) -> Option<Value> {
 }
 
 /// spawn 官方客户端取 atRestSecretKey（与原版逐字同脚本）。
-/// client_exe 定位交给上层（PowerShell 探测）；这里只负责 spawn+哈希。
+/// client_exe 定位交给上层；这里只负责 spawn+哈希（跨平台 ELECTRON_RUN_AS_NODE）。
 pub fn master_key_from_client(client_exe: &std::path::Path) -> anyhow::Result<[u8; 32]> {
     const SCRIPT: &str = "const b=process._linkedBinding('electron_browser_workbuddy_storage');const p=JSON.parse(b.loggerGet());process.stdout.write(p.atRestSecretKey)";
     let out = std::process::Command::new(client_exe)
