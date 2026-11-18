@@ -86,8 +86,8 @@ function renderNav() {
 }
 function showPage(p) {
   curPage = p;
-  $('.page').forEach(s => s.classList.toggle('active', s.id === 'page-' + p));
-  $('#nav button').forEach(b => b.classList.toggle('selected', b.dataset.page === p));
+  $$('.page').forEach(s => s.classList.toggle('active', s.id === 'page-' + p));
+  $$('#nav button').forEach(b => b.classList.toggle('selected', b.dataset.page === p));
   // 一键签到/刷新 仅在 签到中心 与 账号管理 显示
   const toolbar = document.querySelector('.account-toolbar');
   if (toolbar) toolbar.style.display = (p === 'checkin' || p === 'accounts') ? '' : 'none';
