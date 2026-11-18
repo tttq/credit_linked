@@ -285,31 +285,40 @@ async fn chat_completions(
             &format!("平台 {} 没有可用账号，请先在账号管理添加或扫描导入", platform.display()));
     }
 
-    // 逐账号 failover
+    // 逐账号 failover + 11128 渠道风控退避重试（风控抖动时"请重新发送"即可过，自动重试代替手动）
     let mut last_error: Option<(String, String)> = None;
-    for cred in &creds {
-        match dispatch_stream(&st, platform, cred, &model, &messages, &system, max_tokens, reasoning_effort.as_deref()).await {
-            Ok(events) => {
-                // 请求日志：成功一条（流式在响应完成前先记 ok=1）
-                let _ = st.store.log_gateway_request(
-                    platform.as_str(),
-                    &format!("{}:{}", cred.provider, cred.uid),
-                    &model, true, Some(200), None, None,
-                );
-                return if stream {
-                    stream_response(&model, platform.as_str(), events)
-                } else {
-                    blocking_response(&model, platform.as_str(), events).await
-                };
-            }
-            Err((code, msg)) => {
-                let failover_worthy = code == "auth" || code == "rate" || code == "network" || code == "upstream";
-                if failover_worthy {
-                    let _ = st.store.update_account_status(&cred.provider, &cred.uid, "failed", Some(msg.as_str()));
+    'outer: for attempt in 0..3u32 {
+        if attempt > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(1500 * attempt as u64)).await;
+        }
+        for cred in &creds {
+            match dispatch_stream(&st, platform, cred, &model, &messages, &system, max_tokens, reasoning_effort.as_deref()).await {
+                Ok(events) => {
+                    // 请求日志：成功一条（流式在响应完成前先记 ok=1）
+                    let _ = st.store.log_gateway_request(
+                        platform.as_str(),
+                        &format!("{}:{}", cred.provider, cred.uid),
+                        &model, true, Some(200), None, None,
+                    );
+                    return if stream {
+                        stream_response(&model, platform.as_str(), events)
+                    } else {
+                        blocking_response(&model, platform.as_str(), events).await
+                    };
                 }
-                last_error = Some((code, msg));
-                if !failover_worthy {
-                    break;
+                Err((code, msg)) => {
+                    let is_channel_block = msg.contains("11128") || msg.contains("Illegal API invocation");
+                    let failover_worthy = code == "auth" || code == "rate" || code == "network" || code == "upstream";
+                    if failover_worthy && !is_channel_block {
+                        // 渠道拦截不算账号故障（账号本身正常，别标 failed）
+                        let _ = st.store.update_account_status(&cred.provider, &cred.uid, "failed", Some(msg.as_str()));
+                    }
+                    last_error = Some((code, msg.clone()));
+                    if !failover_worthy {
+                        break 'outer;
+                    }
+                    // 11128：换下一个账号（本轮内 failover），全部账号都拦 → 外层退避重试
+                    continue;
                 }
             }
         }
