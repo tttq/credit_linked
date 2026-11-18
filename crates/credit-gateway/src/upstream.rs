@@ -73,6 +73,37 @@ async fn send_sse(req: reqwest::RequestBuilder) -> Result<reqwest::Response, Str
 // ============================ WorkBuddy ============================
 
 /// WorkBuddy 模型目录：GET {chat_base}/v3/config
+/// 模型清单去重收敛：同名变体只留一个；剔除实验/内部通道；客户端三档（fast/balanced/deep）必留。
+#[allow(dead_code)]
+fn dedupe_models(mut models: Vec<ModelInfo>) -> Vec<ModelInfo> {
+    // 实验通道特征：id 含这些片段的直接剔除（它们是同一底层模型的内部变体）
+    let variant_markers = ["-ctrl", "-exp", "exp1", "exp2", "preview-x", "-volc", "-lkeap", "-taiji", "-gf"];
+    models.retain(|m| !variant_markers.iter().any(|k| m.id.contains(k)));
+    // 同名去重（name 相同视为同一模型，保留 id 最短的——通常是"主干"版本）
+    let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut out: Vec<ModelInfo> = Vec::new();
+    for m in models {
+        let key = m.name.to_lowercase();
+        match seen.get(&key) {
+            Some(&idx) => {
+                if m.id.len() < out[idx].id.len() {
+                    out[idx] = m;
+                }
+            }
+            None => {
+                seen.insert(key, out.len());
+                out.push(m);
+            }
+        }
+    }
+    // 客户端三档置顶（fast/balanced/deep-model 若存在则排最前）
+    let priority = ["fast-model", "balanced-model", "deep-model"];
+    out.sort_by_key(|m| {
+        priority.iter().position(|p| m.id == *p).unwrap_or(priority.len())
+    });
+    out
+}
+
 pub async fn wb_fetch_models(cred: &Cred) -> Result<Vec<ModelInfo>, PlatformError> {
     let domain = cred.meta.get("domain").and_then(|d| d.as_str()).unwrap_or("");
     let global = wb_is_global(domain);
@@ -126,6 +157,9 @@ pub async fn wb_fetch_models(cred: &Cred) -> Result<Vec<ModelInfo>, PlatformErro
             supports_images: m.get("supportsImages").and_then(|v| v.as_bool()),
         });
     }
+    // 收敛到客户端 UI 真实可选的三档（快速/均衡/极致）—— 与 WorkBuddy 客户端展示一致
+    let want = ["fast-model", "balanced-model", "deep-model"];
+    out.retain(|m| want.contains(&m.id.as_str()));
     Ok(out)
 }
 
