@@ -90,7 +90,7 @@ function showPage(p) {
   $$('#nav button').forEach(b => b.classList.toggle('selected', b.dataset.page === p));
   // 一键签到/刷新 仅在 签到中心 与 账号管理 显示
   const toolbar = document.querySelector('.account-toolbar');
-  if (toolbar) toolbar.style.display = (p === 'checkin' || p === 'accounts') ? '' : 'none';
+  if (toolbar) toolbar.style.display = (p === 'checkin' || p === 'accounts') ? 'flex' : 'none';
   if (p === 'statistics') refreshStatistics();
   if (p === 'overview') drawOverview();
 }
@@ -906,6 +906,15 @@ $('#btn-refresh').addEventListener('click', refreshAll);
 $$('[data-goto]').forEach(b => b.addEventListener('click', () => showPage(b.dataset.goto)));
 window.addEventListener('resize', () => { charts.ov?.resize(); charts.st?.resize(); });
 window.piconFallback = piconFallback;
+
+// ===== 面板顶栏：最小化到托盘 / 关闭确认（模态在屏幕中间弹出） =====
+(function setupPanelBar() {
+  const curWin = () => { try { return _T?.window?.getCurrent?.() || _T?.window?.getCurrentWindow?.(); } catch { return null; } };
+  const min = document.getElementById('panel-min');
+  if (min) min.addEventListener('click', () => { try { curWin()?.hide?.(); } catch {} });
+  const close = document.getElementById('panel-close');
+  if (close) close.addEventListener('click', () => { document.getElementById('quit-mask').style.display = 'flex'; });
+})();
 
 // ===== 关闭确认：退至后台 / 退出程序 =====
 (function setupQuitDialog() {

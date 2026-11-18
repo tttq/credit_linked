@@ -853,6 +853,21 @@ async fn gateway_delete_rule(id: String) -> Result<(), String> {
     if router.delete_rule(&id) { Ok(()) } else { Err("规则不存在".into()) }
 }
 
+/// 把主窗口定位到主屏工作区右下角（微软电脑管家式）
+fn position_panel_bottom_right(w: &tauri::WebviewWindow) {
+    let monitor = w.current_monitor().ok().flatten();
+    if let (Some(monitor), Ok(size)) = (monitor, w.inner_size()) {
+        let (mw, mh) = (monitor.size().width as f64, monitor.size().height as f64);
+        let (mx, my) = (monitor.position().x as f64, monitor.position().y as f64);
+        let (ww, wh) = (size.width as f64, size.height as f64);
+        let scale = monitor.scale_factor();
+        let margin = 12.0 * scale;
+        let x = mx + mw - ww - margin;
+        let y = my + mh - wh - margin;
+        let _ = w.set_position(tauri::PhysicalPosition::new(x as i32, y as i32));
+    }
+}
+
 fn main() {
     // panic 日志（崩溃排查）
     std::panic::set_hook(Box::new(|info| {
@@ -906,7 +921,13 @@ fn main() {
                 }
             });
 
-            // 托盘图标：左键单击显示主窗口；菜单 = 打开 / 退出
+            // 右下角小面板（微软电脑管家式）：启动即定位到屏幕右下角并显示
+            if let Some(w) = app.get_webview_window("main") {
+                position_panel_bottom_right(&w);
+                let _ = w.show();
+            }
+
+            // 托盘图标：左键单击在屏幕右下角弹出小面板；菜单 = 打开 / 退出
             use tauri::menu::{Menu, MenuItem};
             use tauri::tray::TrayIconBuilder;
             let show_item = MenuItem::with_id(app, "show", "打开 AI路由助手", true, None::<&str>)?;
@@ -924,6 +945,7 @@ fn main() {
                     match event.id.as_ref() {
                         "show" => {
                             if let Some(w) = app.get_webview_window("main") {
+                                position_panel_bottom_right(&w);
                                 w.show().ok();
                                 w.unminimize().ok();
                                 w.set_focus().ok();
@@ -937,6 +959,7 @@ fn main() {
                     if let tauri::tray::TrayIconEvent::Click { button: tauri::tray::MouseButton::Left, button_state: tauri::tray::MouseButtonState::Up, .. } = event {
                         let app = tray.app_handle();
                         if let Some(w) = app.get_webview_window("main") {
+                            position_panel_bottom_right(&w);
                             w.show().ok();
                             w.unminimize().ok();
                             w.set_focus().ok();
