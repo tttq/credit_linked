@@ -863,11 +863,14 @@ fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .on_window_event(|window, event| {
-            // 点关闭 → 先阻止关闭，交由前端弹窗询问「退至后台 / 退出程序」
+            // 仅主窗口拦截关闭（弹「退至后台 / 退出程序」）；授权子窗口正常关闭
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                api.prevent_close();
-                use tauri::Emitter;
-                let _ = window.emit("window-close-requested", ());
+                if window.label() == "main" {
+                    api.prevent_close();
+                    use tauri::Emitter;
+                    let _ = window.emit("window-close-requested", ());
+                }
+                // 其他窗口（auth-*）不拦截，正常关闭
             }
         })
         .setup(|app| {
