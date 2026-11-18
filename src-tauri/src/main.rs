@@ -58,6 +58,26 @@ async fn quota_refresh(provider: String, uid: String) -> Result<serde_json::Valu
     serde_json::to_value(q).map_err(|e| e.to_string())
 }
 
+/// 全账号额度刷新（逐个拉取并持久化；单个失败不影响其余）
+#[tauri::command]
+async fn quota_refresh_all() -> Result<serde_json::Value, String> {
+    let s = svc()?;
+    let accounts = s.store.list_accounts().map_err(|e| e.to_string())?;
+    let mut ok = 0usize;
+    let mut fail = 0usize;
+    for (p, uid, _, _, _) in &accounts {
+        if p.starts_with("codearts") {
+            // codearts 两个通道共用同一账号额度，只刷主通道避免重复
+            if p == "codearts-desktop" { continue; }
+        }
+        match s.quota_account(p, uid).await {
+            Ok(_) => ok += 1,
+            Err(_) => fail += 1,
+        }
+    }
+    Ok(serde_json::json!({ "ok": true, "refreshed": ok, "failed": fail }))
+}
+
 #[tauri::command]
 async fn history(limit: Option<i64>) -> Result<serde_json::Value, String> {
     let s = svc()?;
@@ -376,6 +396,19 @@ static DOWNLOADS: std::sync::Mutex<Vec<serde_json::Value>> = std::sync::Mutex::n
 async fn tools_info() -> Result<serde_json::Value, String> {
     let s = svc()?;
     let install_dir = s.store.get_setting("toolsInstallDir", "").unwrap_or_default();
+    // 各平台额度汇总（来自最近一次额度查询缓存，不现场打 API）
+    let accounts = s.store.list_accounts_full().unwrap_or_default();
+    let mut quota_sum: std::collections::HashMap<&str, (f64, i64, i64)> = std::collections::HashMap::new(); // total, accounts, with_quota
+    for a in &accounts {
+        let e = quota_sum.entry(a.provider.as_str()).or_insert((0.0, 0, 0));
+        e.1 += 1;
+        if let Ok(q) = serde_json::from_str::<serde_json::Value>(&a.quota.clone().unwrap_or_default()) {
+            if let Some(r) = q.get("remaining").and_then(|x| x.as_f64()) {
+                e.0 += r;
+                e.2 += 1;
+            }
+        }
+    }
     let mut out = Vec::new();
     for p in ["trae", "workbuddy", "minimax", "qoder", "zcode", "codearts"] {
         let (url, _mode, page) = tool_urls(p);
@@ -384,11 +417,22 @@ async fn tools_info() -> Result<serde_json::Value, String> {
         if p == "minimax" {
             if let Some(u) = minimax_latest_url().await { resolved = u; direct = true; }
         }
+        let qs = quota_sum.get(p);
+        let (codearts_total, codearts_count) = if p == "codearts" {
+            let d = quota_sum.get("codearts-desktop");
+            (qs.map(|x| x.0).unwrap_or(0.0) + d.map(|x| x.0).unwrap_or(0.0),
+             qs.map(|x| x.1).unwrap_or(0) + d.map(|x| x.1).unwrap_or(0))
+        } else { (0.0, 0) };
+        let (total, count) = if p == "codearts" { (codearts_total, codearts_count) } else {
+            qs.map(|x| (x.0, x.1)).unwrap_or((0.0, 0))
+        };
         out.push(serde_json::json!({
             "platform": p,
             "direct": direct,
             "url": resolved,
             "page": page,
+            "quotaTotal": if count > 0 { serde_json::json!(total) } else { serde_json::Value::Null },
+            "accounts": count,
         }));
     }
     Ok(serde_json::json!({ "items": out, "downloads": DOWNLOADS.lock().unwrap().clone(), "installDir": install_dir }))
@@ -544,7 +588,7 @@ fn main() {
             statistics, daily_income, settings_get, settings_set, account_list_all, open_url,
             login_open_window, login_close_window,
             gateway_status, gateway_set_platform, gateway_add_rule, gateway_update_rule, gateway_delete_rule,
-            gateway_set_limits, gateway_clear_logs, tools_info, tools_download, tools_install, tools_open_page,
+            gateway_set_limits, gateway_clear_logs, tools_info, tools_download, tools_install, tools_open_page, quota_refresh_all,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

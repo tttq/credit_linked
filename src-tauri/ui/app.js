@@ -577,6 +577,16 @@ async function renderToolsTab(body) {
   if (!TOOLS) {
     try { TOOLS = await invoke('tools_info'); } catch (e) { body.innerHTML = '<div class="empty">加载失败: ' + esc(String(e)) + '</div>'; return; }
   }
+  // 后台刷新全账号额度，完成后更新额度显示（不打断用户操作）
+  invoke('quota_refresh_all').then(async () => {
+    TOOLS = null;
+    SNAP = await invoke('snapshot').catch(() => SNAP);
+    const tabsEl = document.querySelector('#settings-tabs');
+    if (tabsEl?.querySelector('[data-tab="tools"]')?.classList.contains('active')) {
+      const body2 = document.querySelector('#settings-body');
+      if (body2) renderToolsTab(body2);
+    }
+  }).catch(() => {});
   const dlDir = TOOLS.installDir || '';
   const items = TOOLS.items || [];
   const meta = { trae: 'Trae（字节跳动）', workbuddy: 'WorkBuddy / CodeBuddy（腾讯）', minimax: 'MiniMax Code', qoder: 'Qoder', zcode: 'ZCode（智谱）', codearts: '华为云码道' };
@@ -587,8 +597,9 @@ async function renderToolsTab(body) {
     items.map(it => {
       const dl = (TOOLS.downloads || []).find(d => d.platform === it.platform) || {};
       const st = dl.status === 'downloading' ? '下载中 ' + (dl.progress || 0) + '%' : dl.status === 'downloaded' ? '已下载' : '';
+      const qtxt = it.accounts > 0 ? ' · 已装 ' + it.accounts + ' 个账号' + (it.quotaTotal != null ? ' · 剩余额度 ' + fmt(it.quotaTotal) : '') : ' · 未添加账号';
       return '<div class="setting-row" data-tool="' + it.platform + '"><div><h3>' + picon(it.platform) + ' ' + (meta[it.platform] || it.platform) + '</h3>' +
-        '<p>' + (it.direct ? '支持应用内直链下载 · ' + esc(it.url.split('/').pop() || '') : '无稳定直链 → 打开官方下载页手动下载') + '</p></div>' +
+        '<p>' + (it.direct ? '支持应用内直链下载 · ' + esc(it.url.split('/').pop() || '') : '无稳定直链 → 打开官方下载页手动下载') + qtxt + '</p></div>' +
         '<div class="actions" style="display:flex;gap:6px;align-items:center">' +
         '<span class="subtle" data-status>' + st + '</span>' +
         (it.direct ? '<button data-dl="' + it.platform + '" class="small primary">一键下载安装</button>' : '<button data-page="' + it.platform + '" class="small">打开下载页</button>') +
