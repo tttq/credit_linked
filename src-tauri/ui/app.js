@@ -550,6 +550,8 @@ function renderSettings() {
       (SNAP?.accounts || []).slice(0, 8).map(a => '<div class="preview-row">' + picon(a.provider) + '<strong>' + esc(platName(a.provider)) + '</strong><span class="subtle" style="margin-left:auto">每天 ' + esc(settingsDraft.randomTime ? '随机' : settingsDraft.time) + '</span></div>').join('') +
       '<p class="notice">所有平台均按你保存的北京时间执行。开启补跑后，会检查已错过计划时间的账号。已领取账号会跳过。</p>' +
       '</div></div>';
+  } else if (tab === 'tools') {
+    renderToolsTab(body);
   } else if (tab === 'general') {
     body.innerHTML =
       '<div class="setting-row"><div><h3>基础使用统计</h3><p>仅上报随机安装标识、版本、日期与运行状态，不上传平台凭据。</p></div>' + sw('telemetry', settingsDraft.telemetry) + '</div>' +
@@ -569,6 +571,72 @@ function renderSettings() {
     settingsDraft[el.dataset.set] = el.dataset.set === 'refreshMinutes' ? Number(el.value) : el.value;
   }));
 }
+let TOOLS = null;
+async function renderToolsTab(body) {
+  body.innerHTML = '<div class="empty">加载平台信息…</div>';
+  if (!TOOLS) {
+    try { TOOLS = await invoke('tools_info'); } catch (e) { body.innerHTML = '<div class="empty">加载失败: ' + esc(String(e)) + '</div>'; return; }
+  }
+  const dlDir = TOOLS.installDir || '';
+  const items = TOOLS.items || [];
+  const meta = { trae: 'Trae（字节跳动）', workbuddy: 'WorkBuddy / CodeBuddy（腾讯）', minimax: 'MiniMax Code', qoder: 'Qoder', zcode: 'ZCode（智谱）', codearts: '华为云码道' };
+  body.innerHTML = '<div class="setting-row"><div><h3>平台工具一键安装</h3><p>下载官方安装包并静默安装。支持直链的平台自动下载；其余平台将打开官方下载页。</p></div></div>' +
+    '<div class="setting-row"><div><h3>安装包下载路径</h3><p>留空使用系统临时目录。安装程序本身默认装到系统默认位置（安装器参数可控部分有限）。</p></div>' +
+    '<div style="display:flex;gap:6px;min-width:340px"><input id="tools-dir" type="text" value="' + esc(dlDir) + '" placeholder="D:\\Tools\\Installers" style="flex:1;padding:8px 10px;border-radius:9px;border:1px solid var(--line);font:inherit">' +
+    '<button id="tools-dir-save" class="small primary">保存</button></div></div>' +
+    items.map(it => {
+      const dl = (TOOLS.downloads || []).find(d => d.platform === it.platform) || {};
+      const st = dl.status === 'downloading' ? '下载中 ' + (dl.progress || 0) + '%' : dl.status === 'downloaded' ? '已下载' : '';
+      return '<div class="setting-row" data-tool="' + it.platform + '"><div><h3>' + picon(it.platform) + ' ' + (meta[it.platform] || it.platform) + '</h3>' +
+        '<p>' + (it.direct ? '支持应用内直链下载 · ' + esc(it.url.split('/').pop() || '') : '无稳定直链 → 打开官方下载页手动下载') + '</p></div>' +
+        '<div class="actions" style="display:flex;gap:6px;align-items:center">' +
+        '<span class="subtle" data-status>' + st + '</span>' +
+        (it.direct ? '<button data-dl="' + it.platform + '" class="small primary">一键下载安装</button>' : '<button data-page="' + it.platform + '" class="small">打开下载页</button>') +
+        '</div></div>';
+    }).join('') +
+    '<p class="notice">静默安装使用官方安装器的无人值守参数（NSIS /S）。企业定制版安装路径由各平台安装器决定。</p>';
+  // 绑定
+  const dirSave = body.querySelector('#tools-dir-save');
+  if (dirSave) dirSave.addEventListener('click', async () => {
+    const v = body.querySelector('#tools-dir')?.value || '';
+    try { await invoke('settings_set', { key: 'toolsInstallDir', value: v }); TOOLS.installDir = v; toast('下载路径已保存'); }
+    catch (e) { toast('保存失败: ' + e, 4200); }
+  });
+  body.querySelectorAll('[data-dl]').forEach(b => b.addEventListener('click', async () => {
+    const p = b.dataset.dl;
+    const dir = body.querySelector('#tools-dir')?.value || '';
+    b.disabled = true; b.textContent = '下载中…';
+    try {
+      const r = await invoke('tools_download', { platform: p, installDir: dir });
+      if (r.ok) {
+        b.textContent = '安装中…';
+        const ir = await invoke('tools_install', { platform: p, file: r.file });
+        toast((meta[p] || p) + ' 安装器已启动（静默模式 ' + ir.kind + '），完成后可在开始菜单找到');
+        const row = body.querySelector('[data-tool="' + p + '"] [data-status]');
+        if (row) row.textContent = '已启动安装';
+      } else if (r.openPage) {
+        await invoke('tools_open_page', { platform: p });
+        toast('该平台暂无稳定直链，已打开官网下载页');
+      }
+    } catch (e) { toast('下载/安装失败: ' + e, 5000); }
+    b.disabled = false; b.textContent = '一键下载安装';
+  }));
+  body.querySelectorAll('[data-page]').forEach(b => b.addEventListener('click', async () => {
+    try { await invoke('tools_open_page', { platform: b.dataset.page }); toast('已打开官方下载页'); } catch (e) { toast('打开失败: ' + e); }
+  }));
+  // 下载进度事件（5% 步进）
+  try {
+    const ev = _T?.event?.listen || null;
+    if (ev) await ev('tool-download', (e) => {
+      const d = e.payload || {};
+      if (!TOOLS) TOOLS = {};
+      TOOLS.downloads = (TOOLS.downloads || []).filter(x => x.platform !== d.platform).concat([d]);
+      const row = document.querySelector('#settings-body [data-tool="' + d.platform + '"] [data-status]');
+      if (row) row.textContent = d.status === 'downloading' ? '下载中 ' + (d.progress || 0) + '%' : (d.status === 'downloaded' ? '已下载' : '');
+    });
+  } catch {}
+}
+
 function sw(key, checked) {
   return '<label class="switch"><input type="checkbox" data-setb="' + key + '" ' + (checked ? 'checked' : '') + '><span class="track"><span class="knob"></span></span></label>';
 }

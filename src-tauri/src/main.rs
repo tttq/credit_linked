@@ -9,7 +9,7 @@ use credit_gateway::protocol::Platform;
 use credit_gateway::Router;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tauri::Manager;
+use tauri::{Manager, Emitter};
 
 fn svc() -> Result<Service, String> {
     Ok(Service { store: Arc::new(Store::open_default().map_err(|e| e.to_string())?) })
@@ -336,6 +336,128 @@ async fn gateway_clear_logs() -> Result<serde_json::Value, String> {
     Ok(serde_json::json!({ "ok": true, "cleared": n }))
 }
 
+// ===== 平台工具下载安装 =====
+
+/// 平台官方安装包直链（Windows x64）与下载页。url 为空时打开 page。
+fn tool_urls(platform: &str) -> (Option<String>, &'static str, &'static str) {
+    match platform {
+        // Qoder：官方 latest 直链（NSIS 安装器，静默参数 /S）
+        "qoder" => (Some("https://download.qoder.com/qoder-work/releases/latest/QoderWork-Setup-x64.exe".into()), "静默安装参数 /S", "https://qoder.com/download"),
+        // MiniMax Code：首页 JS 里带版本号，latest 版本从 code.minimax.cn 抓；这里用官网页打开 + 抓最新版本接口由前端传入
+        "minimax" => (None, "官网下载页", "https://code.minimax.cn/"),
+        // Trae：JS 渲染无稳定直链 → 官方下载页
+        "trae" => (None, "官网下载页", "https://www.trae.cn/downloads"),
+        // WorkBuddy（腾讯 CodeBuddy）
+        "workbuddy" => (None, "官网下载页", "https://www.codebuddy.cn/"),
+        // ZCode（智谱）
+        "zcode" => (None, "官网下载页", "https://zcode.bigmodel.cn/"),
+        // CodeArts（华为）
+        "codearts" | "codearts-desktop" => (None, "官网下载页", "https://developer.huawei.com/"),
+        _ => (None, "", ""),
+    }
+}
+
+/// 从 MiniMax 官网首页解析当前最新版安装包直链（版本号随发布变化）
+async fn minimax_latest_url() -> Option<String> {
+    let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(20)).build().ok()?;
+    let body = client.get("https://code.minimax.cn/").send().await.ok()?.text().await.ok()?;
+    let re = regex_lite_minimax();
+    re.find(&body).map(|m| m.as_str().to_string())
+}
+
+fn regex_lite_minimax() -> regex::Regex {
+    regex::Regex::new(r#"https://file\.cdn\.minimax\.io/public/minimax-agent-prod/release/MiniMax%20Code%20Setup%20[^"'\s]+?x64\.exe"#).unwrap()
+}
+
+/// 下载进度快照（全局）
+static DOWNLOADS: std::sync::Mutex<Vec<serde_json::Value>> = std::sync::Mutex::new(Vec::new());
+
+#[tauri::command]
+async fn tools_info() -> Result<serde_json::Value, String> {
+    let s = svc()?;
+    let install_dir = s.store.get_setting("toolsInstallDir", "").unwrap_or_default();
+    let mut out = Vec::new();
+    for p in ["trae", "workbuddy", "minimax", "qoder", "zcode", "codearts"] {
+        let (url, _mode, page) = tool_urls(p);
+        let mut direct = url.is_some();
+        let mut resolved = url.clone().unwrap_or_default();
+        if p == "minimax" {
+            if let Some(u) = minimax_latest_url().await { resolved = u; direct = true; }
+        }
+        out.push(serde_json::json!({
+            "platform": p,
+            "direct": direct,
+            "url": resolved,
+            "page": page,
+        }));
+    }
+    Ok(serde_json::json!({ "items": out, "downloads": DOWNLOADS.lock().unwrap().clone(), "installDir": install_dir }))
+}
+
+#[tauri::command]
+async fn tools_download(app: tauri::AppHandle, platform: String, install_dir: String) -> Result<serde_json::Value, String> {
+    let (url, mode, page) = tool_urls(&platform);
+    let url = match url {
+        Some(u) => u,
+        None if platform == "minimax" => minimax_latest_url().await.ok_or("未获取到 MiniMax 最新版直链，请打开官网下载页")?,
+        None => return Ok(serde_json::json!({ "ok": false, "openPage": page, "mode": mode })),
+    };
+    let file_name = url.split('/').last().unwrap_or("installer.exe").to_string();
+    let dir = if install_dir.trim().is_empty() { std::env::temp_dir().join("credit-rs-installers").to_string_lossy().to_string() } else { install_dir };
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let path = std::path::Path::new(&dir).join(&file_name);
+    let path_str = path.to_string_lossy().to_string();
+
+    let entry = serde_json::json!({ "platform": platform, "status": "downloading", "file": path_str, "progress": 0 });
+    { let mut d = DOWNLOADS.lock().unwrap(); d.retain(|x| x["platform"] != platform); d.push(entry.clone()); }
+    let _ = app.emit("tool-download", entry.clone());
+
+    let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(1800)).build().map_err(|e| e.to_string())?;
+    let mut resp = client.get(&url).send().await.map_err(|e| e.to_string())?;
+    let total = resp.content_length().unwrap_or(0);
+    let mut file = std::fs::File::create(&path).map_err(|e| e.to_string())?;
+    use std::io::Write;
+    let mut downloaded: u64 = 0;
+    let mut last_emit = 0u64;
+    while let Some(chunk) = resp.chunk().await.map_err(|e| e.to_string())? {
+        file.write_all(&chunk).map_err(|e| e.to_string())?;
+        downloaded += chunk.len() as u64;
+        let pct = if total > 0 { (downloaded * 100 / total) as u64 } else { 0 };
+        if pct >= last_emit + 5 {
+            last_emit = pct;
+            let ev = serde_json::json!({ "platform": platform, "status": "downloading", "file": path_str, "progress": pct });
+            { let mut d = DOWNLOADS.lock().unwrap(); if let Some(e) = d.iter_mut().find(|x| x["platform"] == platform) { *e = ev.clone(); } }
+            let _ = app.emit("tool-download", ev);
+        }
+    }
+    let done = serde_json::json!({ "platform": platform, "status": "downloaded", "file": path_str, "progress": 100 });
+    { let mut d = DOWNLOADS.lock().unwrap(); if let Some(e) = d.iter_mut().find(|x| x["platform"] == platform) { *e = done.clone(); } }
+    let _ = app.emit("tool-download", done.clone());
+    Ok(serde_json::json!({ "ok": true, "file": path_str, "bytes": downloaded }))
+}
+
+/// 静默安装（NSIS: /S；Inno: /VERYSILENT /SUPPRESSMSGBOXES）—— 成功后提示用户重启工具
+#[tauri::command]
+async fn tools_install(platform: String, file: String) -> Result<serde_json::Value, String> {
+    use std::process::Command;
+    let lower = file.to_lowercase();
+    let (args, kind) = if lower.contains("setup") || lower.ends_with(".exe") {
+        (vec!["/S".to_string()], "nsis")
+    } else {
+        (vec!["/VERYSILENT".to_string(), "/SUPPRESSMSGBOXES".to_string()], "inno")
+    };
+    let status = Command::new(&file).args(&args).spawn().map_err(|e| e.to_string())?;
+    Ok(serde_json::json!({ "ok": true, "kind": kind, "pid": status.id() }))
+}
+
+/// 打开平台官方下载页（无直链的平台引导）
+#[tauri::command]
+async fn tools_open_page(platform: String) -> Result<serde_json::Value, String> {
+    let (_, _, page) = tool_urls(&platform);
+    let _ = tauri_plugin_opener::open_url(page, None::<&str>);
+    Ok(serde_json::json!({ "ok": true, "page": page }))
+}
+
 #[tauri::command]
 async fn gateway_set_platform(platform: String) -> Result<serde_json::Value, String> {
     let router = gw_router()?;
@@ -422,7 +544,7 @@ fn main() {
             statistics, daily_income, settings_get, settings_set, account_list_all, open_url,
             login_open_window, login_close_window,
             gateway_status, gateway_set_platform, gateway_add_rule, gateway_update_rule, gateway_delete_rule,
-            gateway_set_limits, gateway_clear_logs,
+            gateway_set_limits, gateway_clear_logs, tools_info, tools_download, tools_install, tools_open_page,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -12,5 +12,9 @@ tokio.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
 
+# regex 用于解析 MiniMax 官网最新版直链
+regex = "1"
+reqwest = { workspace = true, features = ["json"] }
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
