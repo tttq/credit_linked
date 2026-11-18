@@ -335,14 +335,16 @@ pub fn normalize_messages(openai_messages: &[Value]) -> (Vec<Value>, String) {
 }
 
 /// WorkBuddy chat body（对齐 prepareChatBody：强制 stream、developer→system、保证 system 领头）
-pub fn wb_chat_body(messages: &[Value], system: &str, model: &str, max_tokens: Option<u32>, reasoning_effort: Option<&str>) -> Value {
+pub fn wb_chat_body(messages: &[Value], system: &str, model: &str, max_tokens: Option<u32>, reasoning_effort: Option<&str>, uid: &str) -> Value {
     let mut msgs: Vec<Value> = Vec::new();
     if !system.is_empty() {
         msgs.push(json!({ "role": "system", "content": system }));
     }
     for m in messages {
-        // 上游要求 content 为数组形状
-        let mut mm = m.clone();
+        // 上游要求 content 为数组形状；消息白名单字段（role/content），丢弃外部客户端附加字段（name/tool_calls 等指纹噪声）
+        let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("user").to_string();
+        let content = m.get("content").cloned().unwrap_or(json!([]));
+        let mut mm = json!({ "role": role, "content": content });
         if mm.get("content").map(|c| c.is_string()).unwrap_or(false) {
             let text = mm["content"].as_str().unwrap_or("").to_string();
             mm["content"] = json!([{ "type": "text", "text": text }]);
@@ -353,7 +355,7 @@ pub fn wb_chat_body(messages: &[Value], system: &str, model: &str, max_tokens: O
         "messages": msgs,
         "model": model,
         "stream": true,
-        "user": "credit-rs",
+        "user": if uid.is_empty() { "credit-rs" } else { uid },
     });
     if let Some(mt) = max_tokens {
         body["max_tokens"] = json!(mt);

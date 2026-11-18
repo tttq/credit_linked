@@ -338,7 +338,7 @@ async fn dispatch_stream(
 ) -> Result<EventStream, (String, String)> {
     match platform {
         Platform::WorkBuddy | Platform::WorkBuddyIntl => {
-            let body = crate::protocol::wb_chat_body(messages, system, model, max_tokens, reasoning_effort);
+            let body = crate::protocol::wb_chat_body(messages, system, model, max_tokens, reasoning_effort, &cred.uid);
             upstream::wb_chat_stream(cred, body).await.map_err(|e| ("upstream".to_string(), e))
         }
         Platform::Trae | Platform::TraeEnterprise => {
