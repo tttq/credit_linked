@@ -250,7 +250,21 @@ async fn list_models(
             Platform::Zcode => upstream::zcode_fetch_models(&cred).await,
             Platform::Minimax => upstream::minimax_fetch_models(&cred).await,
             Platform::Qoder => upstream::qoder_fetch_models(&cred).await,
-            Platform::CodeArts => continue,
+            Platform::CodeArts => {
+                // STS 过期时自动 refresh（RT 轮换保存已内置）
+                use credit_core::adapters::Adapter;
+                let adapter = credit_core::adapters::codearts::CodeArtsAdapter { desktop: false };
+                let cred_fresh = match adapter.refresh(&cred).await {
+                    Ok(nc) => {
+                        if let Ok(js) = serde_json::to_string(&nc) {
+                            let _ = st.store.upsert_account(platform.as_str(), &cred.uid, &nc.name, "", &js);
+                        }
+                        nc
+                    }
+                    Err(_) => cred.clone(),
+                };
+                upstream::codearts_fetch_models(&cred_fresh, false).await
+            }
         };
         let Ok(models) = models else { continue };
         for m in models {

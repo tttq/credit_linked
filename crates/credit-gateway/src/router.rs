@@ -118,7 +118,9 @@ impl Router {
                 continue;
             }
             let Ok(c) = serde_json::from_str::<Cred>(&auth) else { continue };
-            if c.token.is_empty() {
+            // codearts 凭据在 meta（STS AK/SK），token 主字段为空是正常的
+            let codearts_family = p.starts_with("codearts");
+            if c.token.is_empty() && !codearts_family {
                 continue;
             }
             if platform == Platform::TraeEnterprise {

@@ -13,6 +13,7 @@ use credit_core::adapters::Cred;
 use credit_core::error::PlatformError;
 
 use crate::protocol::*;
+use reqwest::Method;
 
 /// 上游 chat 产出的一条流事件
 #[derive(Debug, Clone)]
@@ -860,6 +861,51 @@ fn sidecar_script() -> Result<std::path::PathBuf, PlatformError> {
     Err(PlatformError::Local("qoder-signer.mjs not found (set QODER_SIGNER)".into()))
 }
 
+/// 华为码道模型清单：GET {API_BASE}/v1/model/builtin（HWS 签名 + X-Security-Token）
+pub async fn codearts_fetch_models(cred: &Cred, desktop: bool) -> Result<Vec<ModelInfo>, PlatformError> {
+    // 官方客户端 listBuiltinModels 形态：GET /v1/model/builtin + X-Security-Token + Agent-Type: PromptCenter
+    let sts = cred.meta.get("security_token").and_then(|t| t.as_str()).unwrap_or("");
+    let ak = cred.meta.get("access_key_id").and_then(|a| a.as_str()).unwrap_or("");
+    let sk = cred.meta.get("secret_access_key").and_then(|a| a.as_str()).unwrap_or("");
+    let base = "https://snap-access.cn-north-4.myhuaweicloud.com";
+    let url = format!("{base}/v1/model/builtin");
+    let extra_headers: Vec<(String, String)> = vec![
+        ("X-Security-Token".into(), sts.to_string()),
+        ("Agent-Type".into(), "PromptCenter".into()),
+        ("X-Language".into(), "zh-cn".into()),
+    ];
+    let body_str = "";
+    // 用 credit-core 的 sign_codearts 构造 HWS 签名头
+    let host = "snap-access.cn-north-4.myhuaweicloud.com";
+    let (auth, signed) = credit_core::adapters::codearts::sign_codearts(ak, sk, "GET", host, "/v1/model/builtin", "", &extra_headers, body_str, Some(sts));
+    let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).build().unwrap();
+    let mut req = client.get(&url);
+    for (k, v) in &signed { req = req.header(k, v); }
+    req = req.header("Authorization", &auth);
+    let resp = req.send().await.map_err(|e| PlatformError::Network(e.to_string()))?;
+    let status = resp.status().as_u16();
+    let v: Value = resp.json().await.map_err(|e| PlatformError::Format(e.to_string()))?;
+    if status != 200 {
+        return Err(PlatformError::Format(format!("builtin HTTP {status}: {}", serde_json::to_string(&v).unwrap_or_default().chars().take(200).collect::<String>())));
+    }
+    let mut out = Vec::new();
+    // 官方响应：{"builtinModels": [{model_id, model_name, context_window, max_tokens, supports_images, ...}], "count": N}
+    let arr = v.get("builtinModels").and_then(|m| m.as_array()).cloned().unwrap_or_default();
+    for m in &arr {
+        let id = m.get("model_id").and_then(|x| x.as_str()).unwrap_or("").to_string();
+        if id.is_empty() { continue; }
+        let name = m.get("model_name").and_then(|x| x.as_str()).unwrap_or(&id).to_string();
+        out.push(ModelInfo {
+            id, name,
+            context_window: m.get("context_window").and_then(|x| x.as_u64()),
+            max_tokens: m.get("max_tokens").and_then(|x| x.as_u64()),
+            credit_multiplier: None,
+            supports_images: m.get("supports_images").and_then(|x| x.as_bool()),
+        });
+    }
+    let _ = std::fs::write("E:/auto_change/_shots/ca_gw_models.txt", format!("models={} arr={}", out.len(), arr.len()));
+    Ok(out)
+}
 /// Qoder chat：sidecar 签名 → POST agent_chat_generation（SSE 双层信封 → OpenAI chunk）
 pub async fn qoder_chat_stream(cred: &Cred, body: Value) -> Result<EventStream, String> {
     use tokio::io::AsyncBufReadExt;
