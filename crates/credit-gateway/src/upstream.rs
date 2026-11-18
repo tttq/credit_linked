@@ -74,7 +74,6 @@ async fn send_sse(req: reqwest::RequestBuilder) -> Result<reqwest::Response, Str
 
 /// WorkBuddy 模型目录：GET {chat_base}/v3/config
 /// 模型清单去重收敛：同名变体只留一个；剔除实验/内部通道；客户端三档（fast/balanced/deep）必留。
-#[allow(dead_code)]
 fn dedupe_models(mut models: Vec<ModelInfo>) -> Vec<ModelInfo> {
     // 实验通道特征：id 含这些片段的直接剔除（它们是同一底层模型的内部变体）
     let variant_markers = ["-ctrl", "-exp", "exp1", "exp2", "preview-x", "-volc", "-lkeap", "-taiji", "-gf"];
@@ -157,9 +156,8 @@ pub async fn wb_fetch_models(cred: &Cred) -> Result<Vec<ModelInfo>, PlatformErro
             supports_images: m.get("supportsImages").and_then(|v| v.as_bool()),
         });
     }
-    // 收敛到客户端 UI 真实可选的三档（快速/均衡/极致）—— 与 WorkBuddy 客户端展示一致
-    let want = ["fast-model", "balanced-model", "deep-model"];
-    out.retain(|m| want.contains(&m.id.as_str()));
+    // 去重收敛：剔除实验/内部通道变体，同名模型只留主干版本（三档置顶）
+    out = dedupe_models(out);
     Ok(out)
 }
 
