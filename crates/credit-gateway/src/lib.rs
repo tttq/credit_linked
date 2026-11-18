@@ -11,5 +11,5 @@ pub mod server;
 pub mod upstream;
 
 pub use router::{RouteRule, Router};
-pub use server::{serve, GatewayState};
+pub use server::{device_salt_init, serve, GatewayState};
 pub use upstream::ModelInfo;

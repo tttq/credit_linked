@@ -695,6 +695,8 @@ fn main() {
                     api_key,
                     rate_window: std::sync::Mutex::new(std::collections::VecDeque::new()),
                     port,
+                    device_salt: std::sync::Mutex::new(credit_gateway::server::device_salt_init()),
+                    device_token: std::sync::Mutex::new(None),
                 });
                 let addr = SocketAddr::from(([127, 0, 0, 1], port));
                 if let Err(e) = credit_gateway::serve(state, addr).await {

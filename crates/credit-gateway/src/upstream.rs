@@ -162,12 +162,12 @@ pub async fn wb_fetch_models(cred: &Cred) -> Result<Vec<ModelInfo>, PlatformErro
 }
 
 /// WorkBuddy chat：POST {chat_base}/v2/chat/completions（OpenAI 线格式 SSE）
-pub async fn wb_chat_stream(cred: &Cred, body: Value) -> Result<EventStream, String> {
+pub async fn wb_chat_stream(cred: &Cred, body: Value, device: Option<(&str, &str, &str)>) -> Result<EventStream, String> {
     let domain = cred.meta.get("domain").and_then(|d| d.as_str()).unwrap_or("");
     let base = if wb_is_global(domain) { wb_chat_base(domain) } else { WB_CN_CHAT_BASE };
     let url = format!("{base}/v2/chat/completions");
     let enterprise = cred.meta.get("enterpriseId").and_then(|e| e.as_str());
-    let hs = wb_chat_headers(&cred.token, &cred.uid, domain, enterprise);
+    let hs = wb_chat_headers(&cred.token, &cred.uid, domain, enterprise, device);
     let mut req = http_client().post(&url).json(&body);
     for (k, v) in &hs {
         req = req.header(k, v);

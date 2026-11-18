@@ -155,7 +155,7 @@ pub fn wb_is_global(domain: &str) -> bool {
 }
 
 /// WorkBuddy chat 请求头（对齐 chatHeaders；设备指纹头由凭据 meta 提供可选项）
-pub fn wb_chat_headers(token: &str, uid: &str, domain: &str, enterprise_id: Option<&str>) -> Vec<(String, String)> {
+pub fn wb_chat_headers(token: &str, uid: &str, domain: &str, enterprise_id: Option<&str>, device: Option<(&str, &str, &str)>) -> Vec<(String, String)> {
     // 逐字对齐官方客户端 VlmUpstream/applyGatewayHeaders（asar 逆向）
     let mut hs = vec![
         ("Authorization".to_string(), format!("Bearer {token}")),
@@ -191,6 +191,18 @@ pub fn wb_chat_headers(token: &str, uid: &str, domain: &str, enterprise_id: Opti
     hs.push(("X-B3-SpanId".to_string(), span_id));
     hs.push(("X-B3-Sampled".to_string(), "1".to_string()));
     hs.push(("X-Trace-ID".to_string(), trace_id));
+    // 设备身份（Turing 真实 token + 盐派生 machine/session，对齐官方客户端）
+    if let Some((dev_token, machine, session)) = device {
+        if !dev_token.is_empty() {
+            hs.push(("X-Device-Token".to_string(), dev_token.to_string()));
+        }
+        if !machine.is_empty() {
+            hs.push(("X-Machine-ID".to_string(), machine.to_string()));
+        }
+        if !session.is_empty() {
+            hs.push(("X-Session-ID".to_string(), session.to_string()));
+        }
+    }
     // 用户/企业/域
     if uid.is_empty() {
         hs.push(("X-No-User-Id".to_string(), "1".to_string()));

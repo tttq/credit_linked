@@ -41,6 +41,10 @@ pub struct GatewayState {
     pub rate_window: std::sync::Mutex<VecDeque<Instant>>,
     /// 实际监听端口（status 展示用）
     pub port: u16,
+    /// WorkBuddy 设备盐（64hex；.workbuddy-device.json 或生成）
+    pub device_salt: std::sync::Mutex<String>,
+    /// Turing 设备 token 缓存 (token, 拉取时间)
+    pub device_token: std::sync::Mutex<Option<(String, std::time::Instant)>>,
 }
 
 impl GatewayState {
@@ -83,6 +87,83 @@ impl GatewayState {
             .map(|k| k == self.api_key)
             .unwrap_or(false)
     }
+}
+
+/// Turing 设备 token：跑 dsh-connect-workbuddy 的 worker.cjs（加载本机桌面端 SDK 真机签名）
+fn fetch_device_token() -> Option<String> {
+    use std::process::Command;
+    let local = std::env::var("LOCALAPPDATA").unwrap_or_default();
+    let sdk_dirs = [
+        "D:/ProgramFiles/software/WorkBuddy/resources/app.asar.unpacked/native/turing-sdk".to_string(),
+        format!("{local}/Programs/WorkBuddy/resources/app.asar.unpacked/native/turing-sdk"),
+        "C:/Program Files/WorkBuddy/resources/app.asar.unpacked/native/turing-sdk".to_string(),
+    ];
+    let home = std::env::var("USERPROFILE").unwrap_or_default();
+    let worker_candidates = [
+        format!("{home}/.dsh/profiles/web/node_modules/dsh-connect-workbuddy/native/turing-sdk/worker.cjs"),
+        "C:/Users/11833/.dsh/profiles/web/node_modules/dsh-connect-workbuddy/native/turing-sdk/worker.cjs".to_string(),
+    ];
+    let worker_path = worker_candidates.into_iter().find(|c| std::path::Path::new(c).exists())?;
+    for sdk in sdk_dirs {
+        if !std::path::Path::new(&sdk).exists() { continue; }
+        let out = Command::new("node")
+            .arg(&worker_path)
+            .arg("token")
+            .env("TURING_SDK_DIR", &sdk)
+            .env("TURING_CHANNEL_ID", "109144")
+            .env("TURING_PRODUCT_NAME", "WorkBuddy")
+            .env("TURING_PRODUCT_VERSION", "5.11.3")
+            .env("TURING_TIMEOUT_MS", "20000")
+            .output()
+            .ok()?;
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+        if v.get("ok").and_then(|o| o.as_bool()).unwrap_or(false) {
+            return v.get("token").and_then(|t| t.as_str()).map(|s| s.to_string());
+        }
+    }
+    None
+}
+
+/// 设备盐初始化：读 DSH 盐文件（与 dsh-connect-workbuddy 同一约定），无则生成并落盘
+pub fn device_salt_init() -> String {
+    let home = std::env::var("USERPROFILE").unwrap_or_default();
+    let path = format!("{home}/.dsh/.workbuddy-device.json");
+    if let Ok(v) = std::fs::read_to_string(&path) {
+        if let Ok(doc) = serde_json::from_str::<serde_json::Value>(&v) {
+            if let Some(sv) = doc.get("salt").and_then(|x| x.as_str()) {
+                return sv.to_string();
+            }
+        }
+    }
+    // 生成 64hex 盐（randomUUID x2 拼 64 hex）
+    let salt = format!("{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple());
+    let salt = &salt[..64.min(salt.len())];
+    let _ = std::fs::create_dir_all(format!("{home}/.dsh"));
+    let _ = std::fs::write(&path, serde_json::json!({"version": 1, "salt": salt, "createdAt": credit_core::adapters::now_iso()}).to_string());
+    salt.to_string()
+}
+
+/// WorkBuddy 设备三元组：(device_token, machine_id, session_id)。盐派生 + token 缓存刷新。
+fn wb_device_identity(st: &Arc<GatewayState>, uid: &str) -> (String, String, String) {
+    use sha2::{Digest, Sha256};
+    let salt = st.device_salt.lock().unwrap().clone();
+    let machine = if salt.is_empty() || uid.is_empty() { String::new() } else {
+        Sha256::digest(format!("dsh-connect-workbuddy/device/v1\0{salt}\0machine\0{uid}")).iter().map(|b| format!("{b:02x}")).collect::<String>().chars().take(36).collect()
+    };
+    let session = if salt.is_empty() || uid.is_empty() { String::new() } else {
+        Sha256::digest(format!("dsh-connect-workbuddy/device/v1\0{salt}\0session\0{uid}")).iter().map(|b| format!("{b:02x}")).collect::<String>().chars().take(36).collect()
+    };
+    let mut tok_cache = st.device_token.lock().unwrap();
+    let dev_token = match tok_cache.as_ref() {
+        Some((t, at)) if at.elapsed() < std::time::Duration::from_secs(300) => t.clone(),
+        _ => {
+            let fresh = fetch_device_token();
+            if let Some(t) = &fresh { *tok_cache = Some((t.clone(), std::time::Instant::now())); }
+            fresh.unwrap_or_default()
+        }
+    };
+    drop(tok_cache);
+    (dev_token, machine, session)
 }
 
 fn err_response(status: StatusCode, code: &str, message: &str) -> Response {
@@ -336,7 +417,7 @@ async fn chat_completions(
 /// 单账号派发：返回上游事件流（错误 → (code, msg) 供 failover）
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_stream(
-    _st: &Arc<GatewayState>,
+    st: &Arc<GatewayState>,
     platform: Platform,
     cred: &Cred,
     model: &str,
@@ -348,7 +429,10 @@ async fn dispatch_stream(
     match platform {
         Platform::WorkBuddy | Platform::WorkBuddyIntl => {
             let body = crate::protocol::wb_chat_body(messages, system, model, max_tokens, reasoning_effort, &cred.uid);
-            upstream::wb_chat_stream(cred, body).await.map_err(|e| ("upstream".to_string(), e))
+            // 设备身份（同步派生 + token 缓存刷新，避免跨 await 持锁）
+            let (dev_token, machine, session) = wb_device_identity(st, &cred.uid);
+            let device = if dev_token.is_empty() && machine.is_empty() { None } else { Some((dev_token.as_str(), machine.as_str(), session.as_str())) };
+            upstream::wb_chat_stream(cred, body, device).await.map_err(|e| ("upstream".to_string(), e))
         }
         Platform::Trae | Platform::TraeEnterprise => {
             let enterprise = Router::is_enterprise_cred(cred);
