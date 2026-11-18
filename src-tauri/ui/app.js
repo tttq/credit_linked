@@ -94,18 +94,25 @@ function showPage(p) {
 
 // ===== 数据 =====
 async function refreshAll() {
+  renderNav(); // 菜单永远渲染，不依赖数据
+  const step = async (name, fn) => { try { await fn(); } catch (e) { console.error('[refresh:' + name + ']', e); } };
   try {
     SNAP = await invoke('snapshot');
     SETTINGS = await invoke('settings_get');
     $('#cycle-label').textContent = '今日周期 ' + SNAP.cycle;
     $('#today-str').textContent = new Date().toLocaleDateString('zh-CN', { weekday: 'long', month: 'long', day: 'numeric' });
     $('#sched-time').textContent = SETTINGS.randomTime ? '随机' : SETTINGS.time;
-    await refreshGateway();
-  renderNav(); renderOverview(); renderAccounts(); renderCheckin(); refreshStatistics(); renderSettings(); renderRouting();
-    if (curPage === 'overview') drawOverview();
-    backfillQuotas();
-    applyRefreshInterval();
-  } catch (e) { toast('加载失败: ' + e, 4200); }
+  } catch (e) { console.error('[refresh:snapshot]', e); toast('数据加载失败: ' + e, 4200); }
+  await step('gateway', async () => { await refreshGateway(); });
+  await step('overview', () => { renderOverview(); });
+  await step('accounts', () => { renderAccounts(); });
+  await step('checkin', () => { renderCheckin(); });
+  await step('statistics', () => { refreshStatistics(); });
+  await step('settings', () => { renderSettings(); });
+  await step('routing', () => { renderRouting(); });
+  if (curPage === 'overview') { try { drawOverview(); } catch (e) { console.error('[refresh:chart]', e); } }
+  try { backfillQuotas(); } catch (e) { console.error('[refresh:backfill]', e); }
+  try { applyRefreshInterval(); } catch (e) { console.error('[refresh:interval]', e); }
 }
 
 // ===== 首页 =====
@@ -377,14 +384,11 @@ function bindGwSave(btnId, inputId, field) {
   btn.addEventListener('click', async () => {
     btn.disabled = true;
     try {
-      const val = field === 'port' ? Number(input.value) : Number(input.value);
+      const val = Number(input.value);
       if (field === 'port' && !(val >= 1 && val <= 65535)) { toast('端口需在 1-65535 之间', 4200); return; }
       const r = await invoke('gateway_set_limits', { [field]: val });
-      if (field === 'port') {
-        toast(r.needsRestart ? '端口已保存 —— 重启应用后生效' : '端口已保存');
-      } else {
-        toast('速率限制已保存（实时生效）');
-      }
+      if (field === 'port') toast(r.needsRestart ? '端口已保存 —— 重启应用后生效' : '端口已保存');
+      else toast('速率限制已保存（实时生效）');
       await refreshGateway();
     } catch (e) { toast('保存失败: ' + e, 4200); }
     btn.disabled = false;
@@ -563,3 +567,298 @@ function renderRouting() {
     sendBtn.disabled = false;
   });
 }
+function showRuleModal() {
+  const accs = SNAP?.accounts || [];
+  const accOptions = accs.map(a => '<option value="' + esc(a.provider + ':' + a.uid) + '">' + esc(platName(a.provider) + ' · ' + (a.name || a.uid.slice(0, 10))) + '</option>').join('');
+  const platOptions = Object.entries(GW_PLATFORMS).map(([k, v]) => '<option value="' + k + '">' + esc(v.label) + '</option>').join('');
+  const mask = document.createElement('div');
+  mask.className = 'modal-mask'; mask.style.display = 'flex';
+  mask.innerHTML = '<div class="modal"><h3>新建路由规则</h3>' +
+    '<div class="desc">模型前缀命中的请求固定路由到指定平台/账号；留空表示跟随当前平台。</div>' +
+    '<div style="display:grid;gap:10px;margin:12px 0">' +
+    '<label class="subtle">模型前缀（* 匹配全部）<input id="rule-model" placeholder="如 workbuddy/glm-5.3-flash 或 *" style="width:100%;padding:8px;border-radius:9px;border:1px solid var(--line);font:inherit"></label>' +
+    '<label class="subtle">目标平台<select id="rule-platform" style="width:100%;padding:8px;border-radius:9px;border:1px solid var(--line);font:inherit"><option value="">跟随当前平台</option>' + platOptions + '</select></label>' +
+    '<label class="subtle">指定账号（可选）<select id="rule-account" style="width:100%;padding:8px;border-radius:9px;border:1px solid var(--line);font:inherit"><option value="">平台内默认选号</option>' + accOptions + '</select></label>' +
+    '</div><div class="foot"><button id="rule-cancel">取消</button><button id="rule-save" class="primary">保存</button></div></div>';
+  document.body.appendChild(mask);
+  mask.querySelector('#rule-cancel').addEventListener('click', () => mask.remove());
+  mask.querySelector('#rule-save').addEventListener('click', async () => {
+    const modelPattern = mask.querySelector('#rule-model').value.trim() || '*';
+    const platform = mask.querySelector('#rule-platform').value;
+    const account = mask.querySelector('#rule-account').value;
+    try {
+      await invoke('gateway_add_rule', { modelPattern, platform, account, weight: 1, enabled: true });
+      toast('规则已保存');
+      mask.remove();
+      await refreshGateway(); renderRouting();
+    } catch (e) { toast('保存失败: ' + e, 4200); }
+  });
+}
+
+// ===== 设置 =====
+let settingsDraft = null;
+function renderSettings() {
+  settingsDraft = { ...SETTINGS };
+  const body = $('#settings-body');
+  const tab = document.querySelector('#settings-tabs button.active')?.dataset.tab || 'tasks';
+  if (tab === 'tasks') {
+    body.innerHTML = '<div class="task-settings"><div>' +
+      '<div class="setting-row"><div><h3>自动签到</h3><p>每个平台仅为已启用自动签到的账号执行任务。</p></div>' + sw('auto', settingsDraft.auto) + '</div>' +
+      '<div class="setting-row"><div><h3>错过时间后补跑</h3><p>启动、唤醒或修改时间后检查当前周期。</p></div>' + sw('catchup', settingsDraft.catchup) + '</div>' +
+      '<div class="setting-row"><div><h3>余额刷新间隔</h3><p>仅查询额度，不消耗模型调用。</p></div>' +
+      '<select data-set="refreshMinutes"><option value="30"' + (settingsDraft.refreshMinutes === 30 ? ' selected' : '') + '>30分钟</option>' +
+      '<option value="60"' + (settingsDraft.refreshMinutes === 60 ? ' selected' : '') + '>60分钟</option>' +
+      '<option value="120"' + (settingsDraft.refreshMinutes === 120 ? ' selected' : '') + '>120分钟</option></select></div>' +
+      '<div class="setting-row"><div><h3>计划时间</h3><p>每天执行的北京时间（随机模式忽略）。</p></div>' +
+      '<input type="time" data-set="time" value="' + esc(settingsDraft.time) + '" style="padding:7px 10px;border-radius:9px;border:1px solid var(--line);font:inherit">' +
+      '<label class="switch" title="随机时间"><input type="checkbox" data-setb="randomTime" ' + (settingsDraft.randomTime ? 'checked' : '') + '><span class="track"><span class="knob"></span></span></label></div>' +
+      '</div><div class="settings-preview"><h3 class="spaced" style="margin-bottom:6px">执行预览 · 保存后生效</h3>' +
+      '<p class="subtle">当前已保存时间：' + esc(SETTINGS.randomTime ? '随机' : SETTINGS.time) + '。</p>' +
+      (SNAP?.accounts || []).slice(0, 8).map(a => '<div class="preview-row">' + picon(a.provider) + '<strong>' + esc(platName(a.provider)) + '</strong><span class="subtle" style="margin-left:auto">每天 ' + esc(settingsDraft.randomTime ? '随机' : settingsDraft.time) + '</span></div>').join('') +
+      '<p class="notice">所有平台均按你保存的北京时间执行。开启补跑后，会检查已错过计划时间的账号。已领取账号会跳过。</p>' +
+      '</div></div>';
+  } else if (tab === 'tools') {
+    renderToolsTab(body);
+  } else if (tab === 'general') {
+    body.innerHTML =
+      '<div class="setting-row"><div><h3>基础使用统计</h3><p>仅上报随机安装标识、版本、日期与运行状态，不上传平台凭据。</p></div>' + sw('telemetry', settingsDraft.telemetry) + '</div>' +
+      '<p class="notice">平台账号、凭据及积分历史保存在本机，不上传任何凭据。</p>';
+  } else {
+    body.innerHTML =
+      '<div class="setting-row"><div><h3>AI路由助手 v0.2.0</h3><p>Rust + Tauri 实现 · 数据库：credit.sqlite（本机）</p></div><span class="tag">本地版</span></div>' +
+      '<div class="setting-row"><div><h3>数据目录</h3><p>%APPDATA%/credit-rs/credit.sqlite · 平台凭据经系统密钥加密</p></div>' +
+      '<button data-open-db class="small">打开目录</button></div>' +
+      '<p class="notice">数据库升级前会备份；导出记录不包含凭据。</p>';
+    body.querySelector('[data-open-db]').addEventListener('click', async () => {
+      try { await invoke('account_list_all'); toast('账号数据记录 ' + (SNAP?.accounts?.length || 0) + ' 条'); } catch {}
+    });
+  }
+  body.querySelectorAll('input[data-setb], input[data-sw]').forEach(wireSetting);
+  body.querySelectorAll('[data-set]').forEach(el => el.addEventListener('change', () => {
+    settingsDraft[el.dataset.set] = el.dataset.set === 'refreshMinutes' ? Number(el.value) : el.value;
+  }));
+}
+let TOOLS = null;
+let TOOLS_QUOTA_REFRESHED = false; // 防止 quota 刷新 → 重绘 → 再刷新 的死循环
+async function renderToolsTab(body) {
+  body.innerHTML = '<div class="empty">加载平台信息…</div>';
+  if (!TOOLS) {
+    try { TOOLS = await invoke('tools_info'); } catch (e) { body.innerHTML = '<div class="empty">加载失败: ' + esc(String(e)) + '</div>'; return; }
+  }
+  // 每次进入页面只后台刷一次额度，完成后仅更新卡片额度文字（不重绘整个列表，避免打断操作）
+  if (!TOOLS_QUOTA_REFRESHED) {
+    TOOLS_QUOTA_REFRESHED = true;
+    invoke('quota_refresh_all').then(async () => {
+      try {
+        TOOLS = await invoke('tools_info');
+        SNAP = await invoke('snapshot').catch(() => SNAP);
+        const tabsEl = document.querySelector('#settings-tabs');
+        if (tabsEl?.querySelector('[data-tab="tools"]')?.classList.contains('active')) {
+          const body2 = document.querySelector('#settings-body');
+          if (body2) { const keep = TOOLS; TOOLS = null; renderToolsTab(body2); TOOLS = keep; }
+        }
+      } catch {}
+    }).catch(() => {});
+  }
+  const dlDir = TOOLS.installDir || '';
+  const items = TOOLS.items || [];
+  const meta = { trae: 'Trae（字节跳动）', workbuddy: 'WorkBuddy / CodeBuddy（腾讯）', minimax: 'MiniMax Code', qoder: 'Qoder', zcode: 'ZCode（智谱）', codearts: '华为云码道' };
+  body.innerHTML = '<div class="setting-row"><div><h3>平台工具一键安装</h3><p>下载官方安装包并静默安装。支持直链的平台自动下载；其余平台将打开官方下载页。</p></div></div>' +
+    '<div class="setting-row"><div><h3>安装包下载路径</h3><p>留空使用系统临时目录。安装程序本身默认装到系统默认位置（安装器参数可控部分有限）。</p></div>' +
+    '<div style="display:flex;gap:6px;min-width:340px"><input id="tools-dir" type="text" value="' + esc(dlDir) + '" placeholder="D:\\Tools\\Installers" style="flex:1;padding:8px 10px;border-radius:9px;border:1px solid var(--line);font:inherit">' +
+    '<button id="tools-dir-save" class="small primary">保存</button></div></div>' +
+    items.map(it => {
+      const dl = (TOOLS.downloads || []).find(d => d.platform === it.platform) || {};
+      const stMap = { downloading: '下载中 ' + (dl.progress || 0) + '%', downloaded: '下载完成', installing: '安装中…', installed: '✓ 已安装', install_timeout: '安装器已退出（请手动确认）' };
+      const st = stMap[dl.status] || '';
+      const qtxt = it.accounts > 0 ? ' · 已装 ' + it.accounts + ' 个账号' + (it.quotaTotal != null ? ' · 剩余额度 ' + fmt(it.quotaTotal) : '') : ' · 未添加账号';
+      return '<div class="setting-row" data-tool="' + it.platform + '"><div><h3>' + picon(it.platform) + ' ' + (meta[it.platform] || it.platform) + '</h3>' +
+        '<p>' + (it.direct ? '支持应用内直链下载 · ' + esc(it.url.split('/').pop() || '') : '无稳定直链 → 打开官方下载页手动下载') + qtxt + '</p></div>' +
+        '<div class="actions" style="display:flex;gap:6px;align-items:center">' +
+        '<span data-status style="font-size:11.5px;font-weight:600;' + (it.installed ? 'color:var(--green,#16a34a)' : 'color:var(--subtle,#7f7d91)') + '">' + (it.installed ? '✓ 已安装 ' : '') + st + '</span>' +
+        (it.direct ? '<button data-dl="' + it.platform + '" class="small ' + (it.installed ? '' : 'primary') + '">' + (it.installed ? '重新安装' : '一键下载安装') + '</button>' : '<button data-page="' + it.platform + '" class="small">打开下载页</button>') +
+        '</div></div>';
+    }).join('') +
+    '<p class="notice">静默安装使用官方安装器的无人值守参数（NSIS /S）。企业定制版安装路径由各平台安装器决定。</p>';
+  // 绑定
+  const dirSave = body.querySelector('#tools-dir-save');
+  if (dirSave) dirSave.addEventListener('click', async () => {
+    const v = body.querySelector('#tools-dir')?.value || '';
+    try { await invoke('settings_set', { key: 'toolsInstallDir', value: v }); TOOLS.installDir = v; toast('下载路径已保存'); }
+    catch (e) { toast('保存失败: ' + e, 4200); }
+  });
+  body.querySelectorAll('[data-dl]').forEach(b => b.addEventListener('click', async () => {
+    const p = b.dataset.dl;
+    const dir = body.querySelector('#tools-dir')?.value || '';
+    b.disabled = true; b.textContent = '处理中…';
+    try {
+      const r = await invoke('tools_download', { platform: p, installDir: dir });
+      if (r.ok) {
+        await invoke('tools_install', { platform: p, file: r.file });
+        toast((meta[p] || p) + ' 静默安装已启动，完成后状态会更新为「已安装」');
+      } else if (r.openPage) {
+        await invoke('tools_open_page', { platform: p });
+        toast('该平台暂无稳定直链，已打开官网下载页');
+      }
+    } catch (e) { toast('下载/安装失败: ' + e, 5000); }
+    b.disabled = false; b.textContent = '一键下载安装';
+  }));
+  body.querySelectorAll('[data-page]').forEach(b => b.addEventListener('click', async () => {
+    try { await invoke('tools_open_page', { platform: b.dataset.page }); toast('已打开官方下载页'); } catch (e) { toast('打开失败: ' + e); }
+  }));
+  // 下载进度事件（5% 步进）
+  try {
+    const ev = _T?.event?.listen || null;
+    if (ev) await ev('tool-download', (e) => {
+      const d = e.payload || {};
+      if (!TOOLS) TOOLS = {};
+      TOOLS.downloads = (TOOLS.downloads || []).filter(x => x.platform !== d.platform).concat([d]);
+      const row = document.querySelector('#settings-body [data-tool="' + d.platform + '"] [data-status]');
+      if (row) {
+        const stMap2 = { downloading: '下载中 ' + (d.progress || 0) + '%', downloaded: '下载完成', installing: '安装中…', installed: '✓ 已安装', install_timeout: '安装器已退出（请手动确认）' };
+        row.textContent = stMap2[d.status] || '';
+        if (d.status === 'installed' || d.status === 'install_timeout') toast((d.platform === 'qoder' ? 'Qoder' : d.platform) + ' 安装流程结束');
+      }
+    });
+  } catch {}
+}
+
+function sw(key, checked) {
+  return '<label class="switch"><input type="checkbox" data-setb="' + key + '" ' + (checked ? 'checked' : '') + '><span class="track"><span class="knob"></span></span></label>';
+}
+function wireSetting(el) {
+  el.addEventListener('change', () => { settingsDraft[el.dataset.setb] = el.checked; });
+}
+$$('#settings-tabs button').forEach(b => b.addEventListener('click', () => {
+  $$('#settings-tabs button').forEach(x => x.classList.toggle('active', x === b));
+  renderSettings();
+}));
+$('#settings-cancel').addEventListener('click', () => { renderSettings(); toast('已还原未保存修改'); });
+$('#settings-save').addEventListener('click', async () => {
+  try {
+    for (const [k, v] of Object.entries(settingsDraft)) {
+      if (SETTINGS[k] !== v) await invoke('settings_set', { key: k, value: String(v) });
+    }
+    toast('设置已保存，任务按新计划安排');
+    applyRefreshInterval();
+    await refreshAll();
+    // 补跑：开启 catchup 且今日计划时间已过 → 后台调度器 60s 内接管（Rust auto_tick）
+  } catch (e) { toast('保存失败: ' + e, 4200); }
+});
+
+// ===== 登录模态 =====
+async function startLogin(p) {
+  const meta = PLAT[p] || {};
+  $('#login-title').textContent = '登录 ' + platName(p);
+  $('#login-desc').textContent = meta.desc || '';
+  $('#login-body').innerHTML = '<div style="padding:18px 0"><span class="spin"></span> 正在发起授权…</div>';
+  $('#login-mask').classList.add('show');
+  clearInterval(loginTimer);
+  try {
+    const r = await invoke('login_start', { provider: p });
+    $('#login-body').innerHTML =
+      '<div style="font-size:12.5px;color:var(--subtle);margin-bottom:10px">授权链接已生成（5 分钟内有效）：</div>' +
+      '<div style="word-break:break-all;font-size:12px;background:var(--bg);border-radius:8px;padding:10px;max-height:120px;overflow:auto">' + esc(r.url) + '</div>' +
+      '<div id="login-status" style="margin-top:12px;font-size:13px"><span class="spin"></span> 等待授权完成…</div>';
+    // 应用内授权子窗口（不是系统浏览器）：iframe 会被平台 X-Frame-Options 拒绝，Tauri 子窗口不受限
+    await invoke('login_open_window', { sessionId: r.sessionId, url: r.url, provider: p });
+    curLoginSid = r.sessionId;
+    $('#login-open').textContent = '刷新授权窗口';
+    $('#login-open').onclick = async () => {
+      await invoke('login_open_window', { sessionId: r.sessionId, url: r.url, provider: p });
+    };
+    loginTimer = setInterval(async () => {
+      try {
+        const s = await invoke('login_poll', { sessionId: r.sessionId });
+        if (s.status === 'ready') {
+          clearInterval(loginTimer);
+          invoke('login_close_window', { sessionId: r.sessionId }).catch(() => {});
+          curLoginSid = null;
+          $('#login-body').innerHTML = '<div style="color:var(--green);font-weight:600;padding:16px 0">✔ 登录成功：' + esc(s.account?.name || '') + ' · 正在获取额度…</div>';
+          toast('登录成功：' + (s.account?.name || '') + '，正在获取额度');
+          // 登录后立即获取：余额 + 状态
+          try { await invoke('quota_refresh', { provider: s.account.provider, uid: s.account.uid }); } catch {}
+          await refreshAll();
+          $('#login-mask').classList.remove('show');
+          showPage('accounts');
+        } else if (s.status === 'expired') {
+          clearInterval(loginTimer);
+          $('#login-status').innerHTML = '<span style="color:var(--amber)">授权已超时，请重新发起</span>';
+        }
+      } catch (e) {
+        clearInterval(loginTimer);
+        $('#login-status').innerHTML = '<span style="color:var(--red)">' + esc(String(e)) + '</span>';
+      }
+    }, 3000);
+  } catch (e) {
+    $('#login-body').innerHTML = '<div style="color:var(--red);padding:12px 0">' + esc(String(e)) + '</div>';
+  }
+}
+$('#login-cancel').addEventListener('click', () => {
+    clearInterval(loginTimer);
+    invoke('login_cancel').catch(() => {});
+    if (curLoginSid) { invoke('login_close_window', { sessionId: curLoginSid }).catch(() => {}); curLoginSid = null; }
+    $('#login-open').textContent = '打开授权页面';
+    $('#login-mask').classList.remove('show');
+  });
+
+// ===== 顶部 =====
+async function checkinAll(btn) {
+  btn.disabled = true; const old = btn.textContent; btn.innerHTML = '<span class="spin"></span> 签到中…';
+  try {
+    const r = await invoke('checkin', { provider: '', uid: '', all: true });
+    const ok = r.results.filter(x => x.status === 'success').length;
+    const al = r.results.filter(x => x.status === 'already').length;
+    const bad = r.results.filter(x => x.status === 'failed').length;
+    toast('签到完成：成功 ' + ok + ' · 已领 ' + al + ' · 失败 ' + bad);
+    await refreshAll();
+  } catch (e) { toast('签到失败: ' + e); }
+  btn.disabled = false; btn.textContent = old;
+}
+$('#btn-checkin-all').addEventListener('click', (e) => checkinAll(e.currentTarget));
+$('#btn-checkin-all2').addEventListener('click', (e) => checkinAll(e.currentTarget));
+async function quotaAll(btn) {
+  btn.disabled = true; const old = btn.textContent; btn.textContent = '刷新中…';
+  try {
+    const accs = SNAP?.accounts || [];
+    for (const a of accs) { try { await invoke('quota_refresh', { provider: a.provider, uid: a.uid }); } catch {} }
+    toast('余额已刷新');
+    await refreshAll();
+  } catch (e) { toast('刷新失败: ' + e); }
+  btn.disabled = false; btn.textContent = old;
+}
+$('#btn-quota-all').addEventListener('click', (e) => quotaAll(e.currentTarget));
+$('#btn-quota-all2').addEventListener('click', (e) => quotaAll(e.currentTarget));
+$('#btn-refresh').addEventListener('click', refreshAll);
+$$('[data-goto]').forEach(b => b.addEventListener('click', () => showPage(b.dataset.goto)));
+window.addEventListener('resize', () => { charts.ov?.resize(); charts.st?.resize(); });
+window.piconFallback = piconFallback;
+
+// ===== 关闭确认：退至后台 / 退出程序 =====
+(function setupQuitDialog() {
+  const mask = document.getElementById('quit-mask');
+  if (!mask) return;
+  const show = () => { mask.style.display = 'flex'; };
+  const hide = () => { mask.style.display = 'none'; };
+  mask.querySelector('#quit-cancel').addEventListener('click', hide);
+  mask.querySelector('#quit-to-tray').addEventListener('click', () => {
+    hide();
+    try { _T?.window?.getCurrent?.()?.hide?.(); } catch { try { _T?.window?.getCurrentWindow?.()?.hide?.(); } catch {} }
+  });
+  mask.querySelector('#quit-exit').addEventListener('click', async () => {
+    hide();
+    try { await invoke('quit_app'); } catch {}
+  });
+  try {
+    const listen = _T?.event?.listen;
+    if (listen) listen('window-close-requested', show);
+  } catch {}
+})();
+
+refreshAll();
+function applyRefreshInterval() {
+  if (window.__refreshTimer) clearInterval(window.__refreshTimer);
+  const mins = (SETTINGS && SETTINGS.refreshMinutes) || 60;
+  window.__refreshTimer = setInterval(() => { if (SNAP) refreshAll(); }, Math.max(1, mins) * 60 * 1000);
+}
+window.__refreshTimer = setInterval(() => { if (SNAP) refreshAll(); }, 60000);
