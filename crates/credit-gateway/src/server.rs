@@ -102,6 +102,11 @@ fn openai_error_response(status: StatusCode, code: &str, message: &str) -> Respo
 }
 
 pub fn build_router(state: Arc<GatewayState>) -> AxumRouter {
+    // 允许任意来源（本地 WebView / 第三方客户端跨端口调用）
+    let cors = tower_http::cors::CorsLayer::new()
+        .allow_origin(tower_http::cors::Any)
+        .allow_methods(tower_http::cors::Any)
+        .allow_headers(tower_http::cors::Any);
     AxumRouter::new()
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
@@ -111,6 +116,7 @@ pub fn build_router(state: Arc<GatewayState>) -> AxumRouter {
         .route("/admin/rules/:id", delete(delete_rule).put(update_rule))
         .route("/admin/status", get(gateway_status))
         .route("/healthz", get(healthz))
+        .layer(cors)
         .with_state(state)
 }
 
