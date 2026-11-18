@@ -187,19 +187,27 @@ async fn install_update(file: String) -> Result<serde_json::Value, String> {
     if !std::path::Path::new(&file).exists() {
         return Err("安装包不存在".into());
     }
-    let app_exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    // 用 cmd 延迟启动安装器（等本进程退出后执行）
-    let script = format!(
-        "timeout /t 2 /nobreak >nul & start installer {} /S",
-        file.replace('"', "")
-    );
-    let _ = std::process::Command::new("cmd")
-        .args(["/C", &script])
-        .creation_flags(0x08000000) // CREATE_NO_WINDOW
-        .spawn();
+    // Windows：cmd 延迟启动安装器（等本进程退出后执行）；其他平台无更新安装器
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let script = format!(
+            "timeout /t 2 /nobreak >nul & start installer {} /S",
+            file.replace('"', "")
+        );
+        let _ = std::process::Command::new("cmd")
+            .args(["/C", &script])
+            .creation_flags(0x08000000) // CREATE_NO_WINDOW
+            .spawn();
+    }
+    #[cfg(not(windows))]
+    let _ = &file;
     // 退出当前应用
-    if let Some(p) = app_exe.parent() {
-        let _ = std::fs::remove_file(p.join("credit-tauri.update-pending"));
+    #[cfg(windows)]
+    {
+        if let Some(p) = std::env::current_exe().ok().and_then(|e| e.parent().map(|p| p.to_path_buf())) {
+            let _ = std::fs::remove_file(p.join("credit-tauri.update-pending"));
+        }
     }
     std::process::exit(0);
     #[allow(unreachable_code)]
