@@ -166,7 +166,7 @@ pub fn hex_lower(b: &[u8]) -> String {
 
 fn channel(desktop: bool) -> &'static str { if desktop { "DESKTOP" } else { "IDE" } }
 
-async fn ops_request(c: &Cred, desktop: bool, method: Method, path: &str, query: &str, body: Value, identity: bool) -> Result<Value, PlatformError> {
+pub async fn ops_request(c: &Cred, desktop: bool, method: Method, path: &str, query: &str, body: Value, identity: bool) -> Result<Value, PlatformError> {
     let base = if identity { STS_BASE } else { API_BASE };
     let url = format!("{base}{path}");
     let ak = c.meta.get("access_key_id").and_then(|a| a.as_str()).unwrap_or_default();
@@ -244,12 +244,16 @@ impl Adapter for CodeArtsAdapter {
     async fn state(&self, c: &Cred) -> Result<CheckinState, PlatformError> {
         let q = format!("channel={}", channel(self.desktop));
         let v = ops_request(c, self.desktop, Method::GET, "/v1/ops/delivery", &q, Value::Null, false).await?;
-        let items = v.get("items").and_then(|i| i.as_array()).cloned().unwrap_or_default();
+        let items = v.pointer("/data/items").or_else(|| v.get("items")).and_then(|i| i.as_array()).cloned().unwrap_or_default();
         // vendor daily(): USER_LOGIN + campaignId + (triggerMode 空或 MANUAL_CLAIM) + 时间窗内
         let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64 * 1000;
         let daily: Vec<Value> = items.into_iter().filter(|x| {
             let typ = x.get("type").and_then(|t| t.as_str()).unwrap_or("");
-            let cid = x.get("campaignId").and_then(|t| t.as_str()).unwrap_or("");
+            let cid = match x.get("campaignId") {
+                Some(Value::String(s)) => s.clone(),
+                Some(Value::Number(n)) => n.to_string(),
+                _ => String::new(),
+            };
             if typ != "USER_LOGIN" || cid.is_empty() { return false; }
             let tm = x.pointer("/extra/triggerMode").and_then(|t| t.as_str()).unwrap_or("");
             if !tm.is_empty() && tm != "MANUAL_CLAIM" { return false; }
@@ -278,16 +282,25 @@ impl Adapter for CodeArtsAdapter {
         let day = crate::adapters::day_cn();
         let mut amount: Option<f64> = None;
         for it in &items {
-            let cid = it.get("campaignId").and_then(|t| t.as_str()).unwrap_or_default();
+            let cid = match it.get("campaignId") {
+                Some(Value::String(s)) => s.clone(),
+                Some(Value::Number(n)) => n.to_string(),
+                _ => String::new(),
+            };
+            if cid.is_empty() { continue; }
             let body = json!({
                 "campaignId": cid,
                 "channel": channel(self.desktop),
-                "idempotentKey": idempotent_key(&c.uid, &day, cid),
+                "idempotentKey": idempotent_key(&c.uid, &day, &cid),
             });
             let d = ops_request(c, self.desktop, Method::POST, "/v1/ops/claim", "", body, false).await?;
-            amount = Some(amount.unwrap_or(0.0)
-                + d.get("amount").and_then(|a| a.as_f64()).unwrap_or(0.0)
-                + d.get("benefitAmount").and_then(|a| a.as_f64()).unwrap_or(0.0));
+            let amt = d.pointer("/data/amount").and_then(|a| a.as_f64())
+                .or_else(|| d.pointer("/data/benefitAmount").and_then(|a| a.as_f64()))
+                .or_else(|| d.get("amount").and_then(|a| a.as_f64()))
+                .or_else(|| d.get("benefitAmount").and_then(|a| a.as_f64()))
+                .or_else(|| it.get("benefitAmount").and_then(|a| a.as_f64()))
+                .unwrap_or(0.0);
+            amount = Some(amount.unwrap_or(0.0) + amt);
             // confirm
             let confirm_body = if self.desktop {
                 let bid = d.get("id").or_else(|| d.get("userBenefitId")).cloned().unwrap_or(Value::Null);
