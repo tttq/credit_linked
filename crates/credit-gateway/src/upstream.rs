@@ -601,11 +601,13 @@ pub async fn zcode_chat_stream(cred: &Cred, body: Value) -> Result<EventStream, 
 /// MiniMax 模型清单：anthropic 兼容通道无 models 端点 → 静态已知清单。
 /// OAuth token 会话验证 profile 已由 credit-core 的 verify 处理；此处直接给静态目录。
 pub async fn minimax_fetch_models(_cred: &Cred) -> Result<Vec<ModelInfo>, PlatformError> {
+    // 对齐官方客户端 first-run 目录（asar 逆向 minimax-model-catalog.js；M2.x 已 retired）
     Ok([
-        ("MiniMax-M2.5", "MiniMax-M2.5", 200_000u64),
-        ("MiniMax-M2.1", "MiniMax-M2.1", 200_000),
-        ("MiniMax-M2", "MiniMax-M2", 200_000),
-        ("MiniMax-Text-01", "MiniMax-Text-01", 1_000_000),
+        ("MiniMax-M3.1-Flash", "M3.1-Flash", 512_000u64),
+        ("MiniMax-M3", "MiniMax-M3", 512_000),
+        // 兼容历史：部分账号仍可调 M2.5/M2.7
+        ("MiniMax-M2.5", "MiniMax-M2.5", 200_000),
+        ("MiniMax-M2.7", "MiniMax-M2.7", 200_000),
     ].into_iter().map(|(id, name, ctx)| ModelInfo {
         id: id.into(), name: name.into(), context_window: Some(ctx),
         max_tokens: None, credit_multiplier: None, supports_images: None,
