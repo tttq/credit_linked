@@ -50,12 +50,12 @@ function platMeta(p) { return PLAT[p] || { color: '#456' }; }
 function picon(p, cls) {
   const m = platMeta(p);
   const iconFile = { trae: 'trae.png', workbuddy: 'workbuddy.jpg', minimax: 'minimax.png', qoder: 'qoder.png', codearts: 'codearts.svg', 'codearts-desktop': 'codearts-desktop.png', doubao: 'doubao.ico', zcode: null }[p];
-  if (iconFile) return '<img class="' + (cls || '') + '" src="platforms/' + iconFile + '" onerror="this.outerHTML=piconFallback(\'' + p + '\',\'' + (cls || '') + '\')">';
+  if (iconFile) return '<img class="picon ' + (cls || '') + '" style="width:26px;height:26px;border-radius:7px;object-fit:cover;flex:0 0 auto" src="platforms/' + iconFile + '" onerror="this.outerHTML=piconFallback(\'' + p + '\',\'' + (cls || '') + '\')">';
   return piconFallback(p, cls);
 }
 function piconFallback(p, cls) {
   const m = platMeta(p);
-  return '<span class="picon ' + (cls || '') + '" style="background:' + m.color + '">' + esc(m.name ? m.name[0] : '?') + '</span>';
+  return '<span class="picon ' + (cls || '') + '" style="background:' + m.color + ';width:26px;height:26px;border-radius:7px;display:inline-flex;align-items:center;justify-content:center;color:#fff;font-weight:700;font-size:12px;flex:0 0 auto">' + esc(m.name ? m.name[0] : '?') + '</span>';
 }
 function stInfo(s) {
   const m = { success: ['st-ok','已领取'], already: ['st-ok','今日已领'], failed: ['st-bad','失败'],

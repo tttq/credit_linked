@@ -581,6 +581,48 @@ fn main() {
                     eprintln!("gateway serve: {e}");
                 }
             });
+
+            // 托盘图标：左键单击显示主窗口；菜单 = 打开 / 退出
+            use tauri::menu::{Menu, MenuItem};
+            use tauri::tray::TrayIconBuilder;
+            let show_item = MenuItem::with_id(app, "show", "打开 AI路由助手", true, None::<&str>)?;
+            let quit_item = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
+            let menu = Menu::with_items(app, &[&show_item, &quit_item])?;
+            // 图标：优先窗口图标（windows 上为嵌入 ico），失败则显式解析 icon.ico
+            let tray_icon = app.default_window_icon().cloned()
+                .or_else(|| tauri::image::Image::from_bytes(include_bytes!("../icons/icon.ico")).ok())
+                .or_else(|| tauri::image::Image::from_bytes(include_bytes!("../icons/icon.png")).ok());
+            let mut builder = TrayIconBuilder::with_id("main-tray")
+                .tooltip("AI路由助手 — 网关与自动签到运行中")
+                .menu(&menu)
+                .show_menu_on_left_click(false)
+                .on_menu_event(|app, event| {
+                    match event.id.as_ref() {
+                        "show" => {
+                            if let Some(w) = app.get_webview_window("main") {
+                                w.show().ok();
+                                w.unminimize().ok();
+                                w.set_focus().ok();
+                            }
+                        }
+                        "quit" => { app.exit(0); }
+                        _ => {}
+                    }
+                })
+                .on_tray_icon_event(|tray, event| {
+                    if let tauri::tray::TrayIconEvent::Click { button: tauri::tray::MouseButton::Left, button_state: tauri::tray::MouseButtonState::Up, .. } = event {
+                        let app = tray.app_handle();
+                        if let Some(w) = app.get_webview_window("main") {
+                            w.show().ok();
+                            w.unminimize().ok();
+                            w.set_focus().ok();
+                        }
+                    }
+                });
+            if let Some(icon) = tray_icon {
+                builder = builder.icon(icon);
+            }
+            builder.build(app)?;
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
