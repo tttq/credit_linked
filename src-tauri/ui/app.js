@@ -539,7 +539,7 @@ function renderRouting() {
     statusEl.textContent = '请求中…';
     resultEl.style.display = 'block';
     resultEl.style.color = 'var(--subtle,#7f7d91)';
-    resultEl.textContent = '等待平台响应…';
+    resultEl.textContent = '等待平台响应…（均衡/极致档为深度推理模型，响应可能需要 1-2 分钟）';
     const t0 = Date.now();
     try {
       const resp = await fetch(st.baseUrl + '/v1/chat/completions', {
