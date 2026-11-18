@@ -159,10 +159,12 @@ $$('#range-pills button').forEach(b => b.addEventListener('click', () => {
 // ===== 账号管理 =====
 function renderAccounts() {
   const accs = SNAP.accounts || [];
-  const plats = [...new Set(accs.map(a => a.provider))];
-  $('#accounts-sub').textContent = '已连接 ' + plats.length + ' 个平台 · ' + accs.length + ' 个账号';
+  // 固定平台清单：已添加平台在前，未添加平台也渲染（保证删除后添加入口不消失）
+  const ALL_PLATS = Object.keys(PLAT).filter(p => p !== 'doubao');
+  const added = [...new Set(accs.map(a => a.provider))];
+  const plats = [...added, ...ALL_PLATS.filter(p => !added.includes(p))];
+  $('#accounts-sub').textContent = '已连接 ' + added.length + ' 个平台 · ' + accs.length + ' 个账号';
   const el = $('#account-list');
-  if (!accs.length) { el.innerHTML = '<div class="empty">还没有账号 —— 点右上角各平台「添加账号」</div>'; return; }
   el.innerHTML = plats.map(p => {
     const list = accs.filter(a => a.provider === p);
     const m = platMeta(p);
@@ -176,7 +178,7 @@ function renderAccounts() {
       (m.login !== 'none' ? '<button data-add="' + p + '" class="small primary">＋ 添加账号</button>' : '') +
       (['trae','workbuddy','qoder','zcode','minimax'].includes(p) ? '<button data-import="' + p + '" class="small">扫描本机</button>' : '') +
       '</div></header>' +
-      list.map(a => acctRow(a, p)).join('') +
+      (list.length ? list.map(a => acctRow(a, p)).join('') : '<div class="empty" style="padding:14px">尚未添加账号 —— 点右上角「添加账号」开始</div>') +
       '</section>';
   }).join('');
   el.querySelectorAll('[data-add]').forEach(b => b.addEventListener('click', () => startLogin(b.dataset.add)));
