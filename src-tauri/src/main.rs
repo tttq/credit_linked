@@ -10,6 +10,8 @@ use credit_gateway::Router;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tauri::{Manager, Emitter};
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 
 fn svc() -> Result<Service, String> {
     Ok(Service { store: Arc::new(Store::open_default().map_err(|e| e.to_string())?) })
@@ -79,6 +81,131 @@ async fn quota_refresh_all() -> Result<serde_json::Value, String> {
 }
 
 /// 用户确认退出：直接结束进程
+// ===== 自动更新 =====
+
+const UPDATE_REPO: &str = "tttq/credit_linked";
+
+/// 查询 GitHub Releases 最新版本，与当前版本比较
+#[tauri::command]
+async fn check_update() -> Result<serde_json::Value, String> {
+    let current = env!("CARGO_PKG_VERSION");
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .user_agent("credit-rs-updater")
+        .build().map_err(|e| e.to_string())?;
+    let url = format!("https://api.github.com/repos/{}/releases/latest", UPDATE_REPO);
+    let resp = client.get(&url).send().await.map_err(|e| format!("网络请求失败: {e}"))?;
+    if resp.status().as_u16() == 404 {
+        return Ok(serde_json::json!({ "updateAvailable": false, "reason": "no releases" }));
+    }
+    let v: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    let tag = v.get("tag_name").and_then(|t| t.as_str()).unwrap_or("").trim_start_matches('v').to_string();
+    let html_url = v.get("html_url").and_then(|u| u.as_str()).unwrap_or("").to_string();
+    let notes = v.get("body").and_then(|b| b.as_str()).unwrap_or("").chars().take(500).collect::<String>();
+    // 版本比较（语义化：逐段数值比较）
+    let parse = |s: &str| -> Vec<u64> { s.split('.').map(|x| x.parse().unwrap_or(0)).collect() };
+    let cur = parse(current);
+    let latest = parse(&tag);
+    let update_available = {
+        let mut less = false;
+        for i in 0..cur.len().max(latest.len()) {
+            let a = cur.get(i).copied().unwrap_or(0);
+            let b = latest.get(i).copied().unwrap_or(0);
+            if a != b { less = a < b; break; }
+        }
+        less
+    };
+    // 找 Windows x64 安装包 asset（nsis setup.exe）
+    let mut asset_url = String::new();
+    let mut asset_name = String::new();
+    if let Some(assets) = v.get("assets").and_then(|a| a.as_array()) {
+        for a in assets {
+            let name = a.get("name").and_then(|n| n.as_str()).unwrap_or("");
+            let url = a.get("browser_download_url").and_then(|u| u.as_str()).unwrap_or("");
+            if (name.contains("x64") || name.contains("x86_64")) && (name.ends_with(".exe") || name.ends_with(".msi")) && name.contains("setup") {
+                asset_url = url.to_string();
+                asset_name = name.to_string();
+                break;
+            }
+        }
+        if asset_url.is_empty() {
+            for a in assets {
+                let name = a.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                let url = a.get("browser_download_url").and_then(|u| u.as_str()).unwrap_or("");
+                if name.ends_with(".exe") && (name.contains("x64") || name.contains("x86_64")) {
+                    asset_url = url.to_string();
+                    asset_name = name.to_string();
+                    break;
+                }
+            }
+        }
+    }
+    Ok(serde_json::json!({
+        "updateAvailable": update_available,
+        "currentVersion": current,
+        "latestVersion": tag,
+        "releaseUrl": html_url,
+        "notes": notes,
+        "assetUrl": asset_url,
+        "assetName": asset_name,
+    }))
+}
+
+/// 下载更新安装包到临时目录（前端显示进度；完成后用户手动点「重启安装」）
+#[tauri::command]
+async fn download_update(app: tauri::AppHandle, url: String) -> Result<serde_json::Value, String> {
+    let file_name = url.split('/').last().unwrap_or("update-setup.exe").to_string();
+    let dir = std::env::temp_dir().join("credit-rs-update");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let path = dir.join(&file_name);
+    let path_str = path.to_string_lossy().to_string();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(1800))
+        .user_agent("credit-rs-updater")
+        .build().map_err(|e| e.to_string())?;
+    let mut resp = client.get(&url).send().await.map_err(|e| e.to_string())?;
+    let total = resp.content_length().unwrap_or(0);
+    let mut file = std::fs::File::create(&path).map_err(|e| e.to_string())?;
+    use std::io::Write;
+    let mut downloaded: u64 = 0;
+    let mut last_emit = 0u64;
+    while let Some(chunk) = resp.chunk().await.map_err(|e| e.to_string())? {
+        file.write_all(&chunk).map_err(|e| e.to_string())?;
+        downloaded += chunk.len() as u64;
+        let pct = if total > 0 { (downloaded * 100 / total) as u64 } else { 0 };
+        if pct >= last_emit + 5 {
+            last_emit = pct;
+            let _ = app.emit("update-download", serde_json::json!({ "progress": pct, "downloaded": downloaded, "total": total }));
+        }
+    }
+    Ok(serde_json::json!({ "ok": true, "file": path_str, "bytes": downloaded }))
+}
+
+/// 重启并安装：退出应用 + 启动安装包（NSIS /S 静默）
+#[tauri::command]
+async fn install_update(file: String) -> Result<serde_json::Value, String> {
+    if !std::path::Path::new(&file).exists() {
+        return Err("安装包不存在".into());
+    }
+    let app_exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    // 用 cmd 延迟启动安装器（等本进程退出后执行）
+    let script = format!(
+        "timeout /t 2 /nobreak >nul & start installer {} /S",
+        file.replace('"', "")
+    );
+    let _ = std::process::Command::new("cmd")
+        .args(["/C", &script])
+        .creation_flags(0x08000000) // CREATE_NO_WINDOW
+        .spawn();
+    // 退出当前应用
+    if let Some(p) = app_exe.parent() {
+        let _ = std::fs::remove_file(p.join("credit-tauri.update-pending"));
+    }
+    std::process::exit(0);
+    #[allow(unreachable_code)]
+    Ok(serde_json::json!({ "ok": true }))
+}
+
 #[tauri::command]
 async fn quit_app(app: tauri::AppHandle) -> Result<(), String> {
     app.exit(0);
@@ -623,6 +750,64 @@ async fn tools_open_page(platform: String) -> Result<serde_json::Value, String> 
     Ok(serde_json::json!({ "ok": true, "page": page }))
 }
 
+/// 平台客户端进程名与候选启动路径（与 tool_installed 相同来源）
+fn client_process_info(platform: &str) -> (&'static str, Vec<String>) {
+    let local = std::env::var("LOCALAPPDATA").unwrap_or_default();
+    let up = std::env::var("USERPROFILE").unwrap_or_default();
+    match platform {
+        "qoder" => ("Qoder CN", vec![
+            "D:\\ProgramFiles\\develop\\Qoder CN\\Qoder CN.exe".into(),
+            format!("{local}\\Programs\\Qoder\\Qoder.exe"),
+        ]),
+        "minimax" => ("MiniMax Code", vec![
+            "D:\\ProgramFiles\\develop\\MiniMax Code\\MiniMax Code.exe".into(),
+            format!("{local}\\Programs\\MiniMax Code\\MiniMax Code.exe"),
+        ]),
+        "trae" => ("Trae CN", vec![
+            "D:\\ProgramFiles\\develop\\Trae CN\\Trae CN.exe".into(),
+            format!("{local}\\Programs\\Trae\\Trae.exe"),
+        ]),
+        "workbuddy" => ("WorkBuddy", vec![
+            "D:\\ProgramFiles\\software\\WorkBuddy\\WorkBuddy.exe".into(),
+        ]),
+        "zcode" => ("ZCode", vec![
+            "D:\\ProgramFiles\\develop\\ZCode\\ZCode.exe".into(),
+        ]),
+        "codearts" | "codearts-desktop" => ("CodeArts", vec![
+            "D:\\ProgramFiles\\software\\CodeArts\\CodeArts.exe".into(),
+        ]),
+        _ => ("", vec![]),
+    }
+}
+
+/// 检查平台客户端是否运行；未运行则启动它。返回 (was_running, launched)
+#[tauri::command]
+async fn platform_ensure_running(platform: String) -> Result<serde_json::Value, String> {
+    use std::process::Command;
+    let (proc_name, exe_paths) = client_process_info(&platform);
+    if proc_name.is_empty() {
+        return Ok(serde_json::json!({ "ok": false, "reason": "unknown platform" }));
+    }
+    // 进程检测（tasklist 按映像名）
+    let running = Command::new("tasklist")
+        .args(["/FI", &format!("IMAGENAME eq {}", exe_paths.first().map(|p| p.rsplit('\\').next().unwrap_or(&proc_name)).unwrap_or(&proc_name)), "/FO", "CSV", "/NH"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains(proc_name))
+        .unwrap_or(false);
+    if running {
+        return Ok(serde_json::json!({ "ok": true, "running": true, "launched": false }));
+    }
+    // 找一个存在的 exe 启动
+    let exe = exe_paths.iter().find(|p| std::path::Path::new(p).exists());
+    match exe {
+        Some(p) => {
+            Command::new(p).spawn().map_err(|e| format!("启动失败: {e}"))?;
+            Ok(serde_json::json!({ "ok": true, "running": false, "launched": true, "exe": p }))
+        }
+        None => Ok(serde_json::json!({ "ok": false, "reason": "client exe not found", "running": false, "launched": false })),
+    }
+}
+
 #[tauri::command]
 async fn gateway_set_platform(platform: String) -> Result<serde_json::Value, String> {
     let router = gw_router()?;
@@ -754,7 +939,7 @@ fn main() {
             statistics, daily_income, settings_get, settings_set, account_list_all, open_url,
             login_open_window, login_close_window,
             gateway_status, gateway_set_platform, gateway_add_rule, gateway_update_rule, gateway_delete_rule,
-            gateway_set_limits, gateway_clear_logs, tools_info, tools_download, tools_install, tools_open_page, quota_refresh_all, quit_app,
+            gateway_set_limits, gateway_clear_logs, tools_info, tools_download, tools_install, tools_open_page, quota_refresh_all, quit_app, platform_ensure_running, check_update, download_update, install_update,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

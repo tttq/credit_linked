@@ -86,8 +86,11 @@ function renderNav() {
 }
 function showPage(p) {
   curPage = p;
-  $$('.page').forEach(s => s.classList.toggle('active', s.id === 'page-' + p));
-  $$('#nav button').forEach(b => b.classList.toggle('selected', b.dataset.page === p));
+  $('.page').forEach(s => s.classList.toggle('active', s.id === 'page-' + p));
+  $('#nav button').forEach(b => b.classList.toggle('selected', b.dataset.page === p));
+  // 一键签到/刷新 仅在 签到中心 与 账号管理 显示
+  const toolbar = document.querySelector('.account-toolbar');
+  if (toolbar) toolbar.style.display = (p === 'checkin' || p === 'accounts') ? '' : 'none';
   if (p === 'statistics') refreshStatistics();
   if (p === 'overview') drawOverview();
 }
@@ -478,6 +481,9 @@ function renderRouting() {
     const p = platSelect.value;
     platSelect.disabled = true;
     try {
+      // 切换前检查客户端是否运行，未运行自动启动
+      const er = await invoke('platform_ensure_running', { platform: p }).catch(() => null);
+      if (er && er.launched) toast((GW_PLATFORMS[p]?.label || p) + ' 客户端未运行 —— 已自动启动');
       await invoke('gateway_set_platform', { platform: p });
       toast('已切换请求平台：' + (GW_PLATFORMS[p]?.label || p));
       await refreshGateway(); renderRouting();
@@ -629,13 +635,76 @@ function renderSettings() {
       '<p class="notice">平台账号、凭据及积分历史保存在本机，不上传任何凭据。</p>';
   } else {
     body.innerHTML =
-      '<div class="setting-row"><div><h3>AI路由助手 v0.2.0</h3><p>Rust + Tauri 实现 · 数据库：credit.sqlite（本机）</p></div><span class="tag">本地版</span></div>' +
+      '<div class="setting-row"><div><h3>AI路由助手 <span id="ver-current">…</span></h3><p>Rust + Tauri 实现 · 数据库：credit.sqlite（本机）</p></div><span class="tag">本地版</span></div>' +
+      '<div class="setting-row"><div><h3>软件更新</h3><p id="upd-status">检查 GitHub Releases 最新版本…</p></div>' +
+      '<div class="actions" style="display:flex;gap:6px;align-items:center">' +
+      '<span class="subtle" id="upd-progress"></span>' +
+      '<button id="upd-check" class="small">重新检查</button>' +
+      '<button id="upd-download" class="small primary" style="display:none">下载更新</button>' +
+      '<button id="upd-install" class="small primary" style="display:none">重启并安装</button>' +
+      '</div></div>' +
       '<div class="setting-row"><div><h3>数据目录</h3><p>%APPDATA%/credit-rs/credit.sqlite · 平台凭据经系统密钥加密</p></div>' +
       '<button data-open-db class="small">打开目录</button></div>' +
-      '<p class="notice">数据库升级前会备份；导出记录不包含凭据。</p>';
+      '<p class="notice">数据库升级前会备份；导出记录不包含凭据。更新包下载后需手动点击「重启并安装」（静默安装）。</p>';
     body.querySelector('[data-open-db]').addEventListener('click', async () => {
       try { await invoke('account_list_all'); toast('账号数据记录 ' + (SNAP?.accounts?.length || 0) + ' 条'); } catch {}
     });
+    // ===== 自动更新流程 =====
+    (async () => {
+      const statusEl = body.querySelector('#upd-status');
+      const dlBtn = body.querySelector('#upd-download');
+      const instBtn = body.querySelector('#upd-install');
+      const progEl = body.querySelector('#upd-progress');
+      let updateInfo = null;
+      const run = async () => {
+        try {
+          statusEl.textContent = '检查更新中…';
+          updateInfo = await invoke('check_update');
+          body.querySelector('#ver-current').textContent = 'v' + updateInfo.currentVersion;
+          if (updateInfo.updateAvailable) {
+            statusEl.innerHTML = '发现新版本 <b>v' + esc(updateInfo.latestVersion) + '</b>（当前 v' + esc(updateInfo.currentVersion) + '）';
+            if (updateInfo.assetUrl) {
+              dlBtn.style.display = '';
+            } else {
+              statusEl.innerHTML += ' · <a href="' + esc(updateInfo.releaseUrl) + '" target="_blank" style="color:var(--accent)">前往 Release 页下载</a>';
+            }
+          } else {
+            statusEl.textContent = '已是最新版本 v' + updateInfo.currentVersion;
+          }
+        } catch (e) { statusEl.textContent = '检查失败: ' + e; }
+      };
+      run();
+      body.querySelector('#upd-check')?.addEventListener('click', run);
+      dlBtn?.addEventListener('click', async () => {
+        if (!updateInfo?.assetUrl) return;
+        dlBtn.disabled = true; dlBtn.textContent = '下载中…';
+        progEl.textContent = '';
+        try {
+          const r = await invoke('download_update', { url: updateInfo.assetUrl });
+          window.__updFile = r.file;
+          instBtn.style.display = '';
+          dlBtn.style.display = 'none';
+          toast('下载完成（' + Math.round(r.bytes / 1024 / 1024) + ' MB）— 点击「重启并安装」');
+        } catch (e) { toast('下载失败: ' + e, 5000); }
+        dlBtn.disabled = false; dlBtn.textContent = '下载更新';
+      });
+      instBtn?.addEventListener('click', async () => {
+        const file = (await invoke('check_update').then(i => null).catch(() => null), null) || (window.__updFile || '');
+        // 文件路径从下载结果拿（暂存全局）
+        instBtn.disabled = true;
+        try {
+          await invoke('install_update', { file: window.__updFile || '' });
+        } catch (e) { toast('安装失败: ' + e, 5000); instBtn.disabled = false; }
+      });
+      // 下载进度事件
+      try {
+        const listen = _T?.event?.listen;
+        if (listen) await listen('update-download', (e) => {
+          const d = e.payload || {};
+          progEl.textContent = d.progress + '%（' + Math.round((d.downloaded || 0) / 1024 / 1024) + ' MB）';
+        });
+      } catch {}
+    })();
   }
   body.querySelectorAll('input[data-setb], input[data-sw]').forEach(wireSetting);
   body.querySelectorAll('[data-set]').forEach(el => el.addEventListener('change', () => {
@@ -859,6 +928,7 @@ window.piconFallback = piconFallback;
   } catch {}
 })();
 
+document.querySelector('.account-toolbar').style.display = 'none'; // 默认首页隐藏
 refreshAll();
 function applyRefreshInterval() {
   if (window.__refreshTimer) clearInterval(window.__refreshTimer);
