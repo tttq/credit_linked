@@ -369,16 +369,25 @@ async fn chat_completions(
         for cred in &creds {
             match dispatch_stream(&st, platform, cred, &model, &messages, &system, max_tokens, reasoning_effort.as_deref()).await {
                 Ok(events) => {
-                    // 请求日志：成功一条（流式在响应完成前先记 ok=1）
-                    let _ = st.store.log_gateway_request(
-                        platform.as_str(),
-                        &format!("{}:{}", cred.provider, cred.uid),
-                        &model, true, Some(200), None, None,
-                    );
                     return if stream {
+                        // 流式：拿到流即记成功（客户端边收边用）
+                        let _ = st.store.log_gateway_request(
+                            platform.as_str(),
+                            &format!("{}:{}", cred.provider, cred.uid),
+                            &model, true, Some(200), None, None,
+                        );
                         stream_response(&model, platform.as_str(), events)
                     } else {
-                        blocking_response(&model, platform.as_str(), events).await
+                        // 非流式：聚合完成后再按实际内容记录（空流记失败，避免"假成功"）
+                        let (resp, has_content) = blocking_response(&model, platform.as_str(), events).await;
+                        let _ = st.store.log_gateway_request(
+                            platform.as_str(),
+                            &format!("{}:{}", cred.provider, cred.uid),
+                            &model, has_content, Some(if has_content { 200 } else { 502 }),
+                            if has_content { None } else { Some("empty stream (no finish_reason/content)") },
+                            None,
+                        );
+                        resp
                     };
                 }
                 Err((code, msg)) => {
@@ -530,12 +539,12 @@ fn normalize_finish(finish: &str) -> String {
     }
 }
 
-/// 非流式：聚合全部事件产出 chat.completion
+/// 非流式：聚合全部事件产出 chat.completion（返回 (响应, 是否有实际内容)）
 async fn blocking_response(
     model: &str,
     platform: &str,
     events: EventStream,
-) -> Response {
+) -> (axum::response::Response, bool) {
     let mut text = String::new();
     let mut reasoning = String::new();
     let mut usage: Option<(u64, u64, Option<u64>)> = None;
@@ -552,10 +561,14 @@ async fn blocking_response(
             Err(e) => failure = Some(e),
         }
     }
+    let mut empty_stream = false;
     if let Some(msg) = failure {
         if text.is_empty() {
-            return err_response(StatusCode::BAD_GATEWAY, "upstream", &msg);
+            return (err_response(StatusCode::BAD_GATEWAY, "upstream", &msg), false);
         }
+    }
+    if text.is_empty() && reasoning.is_empty() {
+        empty_stream = true;
     }
     let created = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -566,7 +579,7 @@ async fn blocking_response(
     if !reasoning.is_empty() {
         message["reasoning_content"] = json!(reasoning);
     }
-    Json(json!({
+    let resp = Json(json!({
         "id": format!("chatcmpl-{}", uuid::Uuid::new_v4().simple()),
         "object": "chat.completion",
         "created": created,
@@ -583,7 +596,8 @@ async fn blocking_response(
             "total_tokens": total.unwrap_or(input + output),
         },
     }))
-    .into_response()
+    .into_response();
+    (resp, !empty_stream)
 }
 
 // ---------- 管理面 ----------

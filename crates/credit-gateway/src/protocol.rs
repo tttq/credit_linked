@@ -542,6 +542,20 @@ pub fn parse_anthropic_chunk(v: &Value) -> Vec<crate::upstream::StreamEvent> {
                 out.push(StreamEvent::Done { finish: sr.to_string() });
             }
         }
+        "message_stop" => {
+            // MiniMax mavis 通道以 message_stop 结束且可能不带 message_delta/stop_reason
+            out.push(StreamEvent::Done { finish: "stop".into() });
+        }
+        "message_start" => {
+            if let Some(u) = v.pointer("/message/usage") {
+                let input = u.get("input_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
+                let output = u.get("output_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
+                if input > 0 || output > 0 {
+                    out.push(StreamEvent::Usage { input, output, total: Some(input + output) });
+                }
+            }
+        }
+        "ping" => {}
         "message_start" => {
             if let Some(u) = v.pointer("/message/usage") {
                 let input = u.get("input_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
