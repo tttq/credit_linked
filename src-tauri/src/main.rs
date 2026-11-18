@@ -322,6 +322,7 @@ async fn gateway_status() -> Result<serde_json::Value, String> {
         "accounts": accounts,
         "rules": router.list_rules(),
         "auth": !api_key.is_empty(),
+        "apiKey": api_key,
         "rpm": rpm,
         "strict": strict,
         "logStats": { "total": total, "ok": ok, "fail": fail },
