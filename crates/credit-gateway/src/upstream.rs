@@ -722,8 +722,28 @@ impl AnthropicPump {
 /// Qoder 模型清单：云端 chat 的模型是网关自动路由（"auto"），
 /// 公开目录无 models 端点 → 静态发布网关模型。
 pub async fn qoder_fetch_models(_cred: &Cred) -> Result<Vec<ModelInfo>, PlatformError> {
+    // 对齐官方客户端 UI 模型选择器（dynamic-text/qoder-cn.json 逆向，20 个）
     Ok([
-        ("auto", "Qoder Auto (自动路由)", 128_000u64),
+        ("auto", "Auto", 128_000u64),
+        ("fast", "Fast", 128_000),
+        ("efficient", "Efficient", 128_000),
+        ("lite", "Lite", 128_000),
+        ("performance", "Performance", 128_000),
+        ("ultimate", "Ultimate", 128_000),
+        ("cmodel", "Cantus", 128_000),
+        ("dfmodel", "DeepSeek-Flash", 128_000),
+        ("dmodel", "DeepSeek-V4-Pro", 128_000),
+        ("gfmodel", "GLM-5.3-Flash", 128_000),
+        ("gm51model", "GLM-5.2", 128_000),
+        ("gmodel", "GLM-5.3", 128_000),
+        ("kmodel", "Kimi-K2.8-Preview", 128_000),
+        ("kmodel_latest", "Kimi-K3.1-Pro", 128_000),
+        ("mmodel", "MiniMax-M3.1-Flash", 128_000),
+        ("q37fmodel", "Qwen3.7-Flash", 128_000),
+        ("qfmodel", "Qwen3.8-Flash", 128_000),
+        ("qmodel", "Qwen3.7-Plus", 128_000),
+        ("qmodel_38max", "Qwen3.8-Max", 128_000),
+        ("qmodel_latest", "Qwen3.7-Max", 128_000),
     ].into_iter().map(|(id, name, ctx)| ModelInfo {
         id: id.into(), name: name.into(), context_window: Some(ctx),
         max_tokens: None, credit_multiplier: None, supports_images: None,
