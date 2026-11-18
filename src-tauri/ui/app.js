@@ -515,7 +515,8 @@ function renderRouting() {
     statusEl.textContent = '获取模型中…';
     try {
       const r = await fetch(st.baseUrl + '/v1/models').then(x => x.json());
-      const models = (r.data || []).map(m => m.id);
+      // 只展示当前平台的模型（裸 id 直接可用）
+      const models = (r.data || []).filter(m => (m.platform || m.id.split('/')[0]) === st.platform).map(m => m.raw_model || m.id);
       if (!models.length) {
         modelSel.innerHTML = '<option value="">（当前平台无可用模型 —— 检查账号）</option>';
         statusEl.textContent = '';
@@ -554,9 +555,12 @@ function renderRouting() {
         statusEl.textContent = '';
       } else {
         const content = data.choices?.[0]?.message?.content || JSON.stringify(data).slice(0, 500);
-        const usage = data.usage ? ' · tokens ' + (data.usage.total_tokens ?? '?') : '';
+        const u = data.usage || {};
+        const comp = u.completion_tokens ?? 0;
+        const speed = comp > 0 && Number(secs) > 0 ? (comp / Number(secs)).toFixed(1) + ' tok/s' : '—';
+        const usage = u.total_tokens != null ? ' · tokens 输入 ' + (u.prompt_tokens ?? 0) + ' + 输出 ' + comp + ' = ' + u.total_tokens + ' · 输出速度 ' + speed : '';
         resultEl.style.color = 'var(--ink,#25252f)';
-        resultEl.textContent = '✓ 成功（' + secs + 's' + usage + '）：\n\n' + content;
+        resultEl.textContent = '✓ ' + model + '（' + secs + 's' + usage + '）：\n\n' + content;
         statusEl.textContent = '';
       }
     } catch (e) {
