@@ -374,18 +374,7 @@ function renderRouting() {
   const el = $('#route-matrix');
   if (!GW_STATUS) { el.innerHTML = '<div class="empty">网关状态读取失败</div>'; return; }
   const st = GW_STATUS;
-  const platRows = Object.entries(GW_PLATFORMS).map(([name, meta]) => {
-    const count = (st.accounts || {})[name] || 0;
-    const isCurrent = st.platform === name;
-    return '<div class="route-row" data-platform="' + name + '">' +
-      '<div style="flex:1"><strong style="font-size:13.5px">' + esc(meta.label) +
-      (isCurrent ? ' <span class="tag" style="background:var(--accent-soft);color:var(--accent)">当前平台</span>' : '') +
-      (meta.chat ? '' : ' <span class="tag" style="background:#f7ecd9;color:var(--amber)">仅签到/额度</span>') +
-      '</strong><div class="subtle" style="margin-top:3px">账号池 provider：' + esc(meta.provider) + ' · 可用账号 ' + count + ' 个' +
-      (meta.chat ? '' : ' · 无公开对话协议，网关暂不代理') + '</div></div>' +
-      (isCurrent ? '' : '<button class="small" data-switch="' + name + '">切换到此平台</button>') +
-      '</div>';
-  }).join('');
+  // 平台切换改为顶部下拉 + 快捷按钮（platRows 已移除）
   const ruleRows = (st.rules || []).map(r =>
     '<div class="route-row" data-rule="' + esc(r.id) + '">' +
     '<div style="flex:1"><strong style="font-size:13.5px">模型前缀 ' + esc(r.model_pattern) + '</strong>' +
@@ -426,8 +415,20 @@ function renderRouting() {
     // 请求日志
     '<h3 class="spaced" style="display:flex;align-items:center;justify-content:space-between"><span>请求日志（最近 ' + Math.min(st.logs?.length || 0, 30) + ' 条 · 总计 ' + (st.logStats?.total || 0) + ' · 成功 ' + (st.logStats?.ok || 0) + ' · 失败 ' + (st.logStats?.fail || 0) + '）</span>' +
     ((st.logStats?.total || 0) > 0 ? '<button id="gw-logs-clear" class="small danger-ghost">清空日志</button>' : '') + '</h3>' + logRows +
-    // 当前平台
-    '<h3 class="spaced">请求平台（裸模型 id 的默认路由）</h3>' + platRows +
+    // 当前平台 —— 下拉切换 + 当前平台摘要
+    '<h3 class="spaced" style="display:flex;align-items:center;justify-content:space-between"><span>请求平台（裸模型 id 的默认路由）</span>' +
+    '<label class="subtle" style="display:flex;align-items:center;gap:8px;font-size:12px">快速切换<select id="route-plat-select" style="padding:7px 10px;border-radius:9px;border:1px solid var(--line);font:inherit;min-width:180px">' +
+    Object.entries(GW_PLATFORMS).map(([name, meta]) => '<option value="' + name + '"' + (st.platform === name ? ' selected' : '') + '>' + esc(meta.label) + (meta.chat ? '' : '（仅签到）') + '</option>').join('') +
+    '</select></label></h3>' +
+    '<section class="surface" style="margin-bottom:14px;padding:14px 16px">' +
+    '<div style="display:flex;align-items:center;gap:12px">' + picon(st.platform) +
+    '<div style="flex:1"><strong style="font-size:14px">' + esc(GW_PLATFORMS[st.platform]?.label || st.platform) + '</strong>' +
+    '<div class="subtle" style="margin-top:3px">账号池 provider：' + esc(GW_PLATFORMS[st.platform]?.provider || st.platform) + ' · 可用账号 ' + ((st.accounts || {})[st.platform] || 0) + ' 个' +
+    (GW_PLATFORMS[st.platform]?.chat ? '' : ' · 无公开对话协议，网关暂不代理') + '</div></div>' +
+    '<span class="tag" style="background:var(--accent-soft);color:var(--accent)">当前平台</span></div></section>' +
+    '<div class="subtle" style="margin:0 0 8px;font-size:12px">查看其他平台的账号池：' +
+    Object.entries(GW_PLATFORMS).filter(([name]) => name !== st.platform).map(([name, meta]) =>
+      '<button class="small" data-switch="' + name + '" style="margin:2px 4px 2px 0">' + esc(meta.label) + ' · ' + ((st.accounts || {})[name] || 0) + ' 账号</button>').join('') + '</div>' +
     // 规则
     '<h3 class="spaced">路由规则（按模型前缀固定平台/账号）</h3>' + ruleRows +
     '<div class="actions" style="margin-top:10px"><button id="rule-add" class="small primary">＋ 新建规则</button></div>';
@@ -473,6 +474,16 @@ function renderRouting() {
     clearBtn.disabled = false;
   });
 
+  const platSelect = el.querySelector('#route-plat-select');
+  if (platSelect) platSelect.addEventListener('change', async () => {
+    const p = platSelect.value;
+    platSelect.disabled = true;
+    try {
+      await invoke('gateway_set_platform', { platform: p });
+      toast('已切换请求平台：' + (GW_PLATFORMS[p]?.label || p));
+      await refreshGateway(); renderRouting();
+    } catch (e) { toast('切换失败: ' + e, 4200); renderRouting(); }
+  });
   el.querySelectorAll('[data-switch]').forEach(b => b.addEventListener('click', async () => {
     b.disabled = true;
     try {
@@ -572,21 +583,27 @@ function renderSettings() {
   }));
 }
 let TOOLS = null;
+let TOOLS_QUOTA_REFRESHED = false; // 防止 quota 刷新 → 重绘 → 再刷新 的死循环
 async function renderToolsTab(body) {
   body.innerHTML = '<div class="empty">加载平台信息…</div>';
   if (!TOOLS) {
     try { TOOLS = await invoke('tools_info'); } catch (e) { body.innerHTML = '<div class="empty">加载失败: ' + esc(String(e)) + '</div>'; return; }
   }
-  // 后台刷新全账号额度，完成后更新额度显示（不打断用户操作）
-  invoke('quota_refresh_all').then(async () => {
-    TOOLS = null;
-    SNAP = await invoke('snapshot').catch(() => SNAP);
-    const tabsEl = document.querySelector('#settings-tabs');
-    if (tabsEl?.querySelector('[data-tab="tools"]')?.classList.contains('active')) {
-      const body2 = document.querySelector('#settings-body');
-      if (body2) renderToolsTab(body2);
-    }
-  }).catch(() => {});
+  // 每次进入页面只后台刷一次额度，完成后仅更新卡片额度文字（不重绘整个列表，避免打断操作）
+  if (!TOOLS_QUOTA_REFRESHED) {
+    TOOLS_QUOTA_REFRESHED = true;
+    invoke('quota_refresh_all').then(async () => {
+      try {
+        TOOLS = await invoke('tools_info');
+        SNAP = await invoke('snapshot').catch(() => SNAP);
+        const tabsEl = document.querySelector('#settings-tabs');
+        if (tabsEl?.querySelector('[data-tab="tools"]')?.classList.contains('active')) {
+          const body2 = document.querySelector('#settings-body');
+          if (body2) { const keep = TOOLS; TOOLS = null; renderToolsTab(body2); TOOLS = keep; }
+        }
+      } catch {}
+    }).catch(() => {});
+  }
   const dlDir = TOOLS.installDir || '';
   const items = TOOLS.items || [];
   const meta = { trae: 'Trae（字节跳动）', workbuddy: 'WorkBuddy / CodeBuddy（腾讯）', minimax: 'MiniMax Code', qoder: 'Qoder', zcode: 'ZCode（智谱）', codearts: '华为云码道' };
@@ -602,8 +619,8 @@ async function renderToolsTab(body) {
       return '<div class="setting-row" data-tool="' + it.platform + '"><div><h3>' + picon(it.platform) + ' ' + (meta[it.platform] || it.platform) + '</h3>' +
         '<p>' + (it.direct ? '支持应用内直链下载 · ' + esc(it.url.split('/').pop() || '') : '无稳定直链 → 打开官方下载页手动下载') + qtxt + '</p></div>' +
         '<div class="actions" style="display:flex;gap:6px;align-items:center">' +
-        '<span class="subtle" data-status>' + st + '</span>' +
-        (it.direct ? '<button data-dl="' + it.platform + '" class="small primary">一键下载安装</button>' : '<button data-page="' + it.platform + '" class="small">打开下载页</button>') +
+        '<span class="subtle" data-status>' + (it.installed ? '✓ 本机已安装 ' : '') + st + '</span>' +
+        (it.direct ? '<button data-dl="' + it.platform + '" class="small ' + (it.installed ? '' : 'primary') + '">' + (it.installed ? '重新安装' : '一键下载安装') + '</button>' : '<button data-page="' + it.platform + '" class="small">打开下载页</button>') +
         '</div></div>';
     }).join('') +
     '<p class="notice">静默安装使用官方安装器的无人值守参数（NSIS /S）。企业定制版安装路径由各平台安装器决定。</p>';

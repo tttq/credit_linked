@@ -358,6 +358,56 @@ async fn gateway_clear_logs() -> Result<serde_json::Value, String> {
 
 // ===== 平台工具下载安装 =====
 
+/// 检测平台客户端本机是否已安装（常见安装路径 + 客户端凭据探测）
+fn tool_installed(platform: &str) -> bool {
+    let local = std::env::var("LOCALAPPDATA").unwrap_or_default();
+    let userprofile = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).unwrap_or_default();
+    // 下面所有路径用 '/'（Windows API 接受正斜杠），避免转义地狱
+    // 卸载器/主程序常见位置（含用户自定义安装盘符的常见目录）
+    let candidates: Vec<String> = match platform {
+        "qoder" => vec![
+            format!("{local}/Programs/Qoder/Qoder.exe"),
+            format!("{local}/Programs/QoderWork/Qoder.exe"),
+            format!("{local}/Programs/Qoder CN/Qoder CN.exe"),
+            "D:/ProgramFiles/develop/Qoder CN/Qoder CN.exe".into(),
+            "C:/Program Files/Qoder/Qoder.exe".into(),
+        ],
+        "minimax" => vec![
+            format!("{local}/Programs/minimax-code/MiniMax Code.exe"),
+            format!("{local}/Programs/MiniMax Code/MiniMax Code.exe"),
+            "D:/ProgramFiles/develop/MiniMax Code/MiniMax Code.exe".into(),
+            format!("{local}/minimax-code/MiniMax Code.exe"),
+        ],
+        "trae" => vec![
+            format!("{local}/Programs/Trae/Trae.exe"),
+            format!("{local}/Programs/Trae CN/Trae CN.exe"),
+            "D:/ProgramFiles/develop/Trae CN/Trae CN.exe".into(),
+            "C:/Program Files/Trae/Trae.exe".into(),
+        ],
+        "workbuddy" => vec![
+            format!("{local}/Programs/CodeBuddy/CodeBuddy.exe"),
+            "C:/Program Files/CodeBuddy/CodeBuddy.exe".into(),
+        ],
+        "zcode" => vec![
+            format!("{local}/Programs/ZCode/ZCode.exe"),
+            "D:/ProgramFiles/develop/ZCode/ZCode.exe".into(),
+            "C:/Program Files/ZCode/ZCode.exe".into(),
+        ],
+        _ => vec![],
+    };
+    // 本机客户端凭据存在也算已安装（minimax ~/.minimax）
+    if platform == "minimax" && std::path::Path::new(&userprofile).join(".minimax/auth/prod/cn/mcode-public/auth.json").exists() {
+        return true;
+    }
+    // 卸载器存在也代表已安装（安装器都会装 Uninstall *.exe）
+    let uninstallers: Vec<String> = match platform {
+        "qoder" => vec!["D:/ProgramFiles/develop/Qoder CN/Uninstall Qoder CN.exe".into()],
+        "minimax" => vec!["D:/ProgramFiles/develop/MiniMax Code/Uninstall MiniMax Code.exe".into()],
+        _ => vec![],
+    };
+    candidates.iter().chain(uninstallers.iter()).any(|c| std::path::Path::new(c).exists())
+}
+
 /// 平台官方安装包直链（Windows x64）与下载页。url 为空时打开 page。
 fn tool_urls(platform: &str) -> (Option<String>, &'static str, &'static str) {
     match platform {
@@ -433,6 +483,7 @@ async fn tools_info() -> Result<serde_json::Value, String> {
             "page": page,
             "quotaTotal": if count > 0 { serde_json::json!(total) } else { serde_json::Value::Null },
             "accounts": count,
+            "installed": tool_installed(p),
         }));
     }
     Ok(serde_json::json!({ "items": out, "downloads": DOWNLOADS.lock().unwrap().clone(), "installDir": install_dir }))
