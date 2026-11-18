@@ -19,8 +19,8 @@
 
 use serde_json::{json, Value};
 
-/// WorkBuddy chat 通道 UA（上游按 CLI agent 身份计费限频，逐字对齐）
-pub const WB_CHAT_UA: &str = "CLI/2.63.2 CodeBuddy/2.63.2";
+/// WorkBuddy chat 通道 UA（官方 VlmUpstream 格式：WorkBuddy/{ver} WorkBuddy/{ver} [CLI/{cliVer}]）
+pub const WB_CHAT_UA: &str = "WorkBuddy/5.11.3 WorkBuddy/5.11.3 CLI/2.63.2";
 /// WorkBuddy 产品配置通道 UA（/v3/config 逐字对齐官方客户端）
 pub const WB_PRODUCT_UA: &str = "WorkBuddy/5.8.3 WorkBuddy/5.8.3 CLI/2.161.0";
 
@@ -156,17 +156,42 @@ pub fn wb_is_global(domain: &str) -> bool {
 
 /// WorkBuddy chat 请求头（对齐 chatHeaders；设备指纹头由凭据 meta 提供可选项）
 pub fn wb_chat_headers(token: &str, uid: &str, domain: &str, enterprise_id: Option<&str>) -> Vec<(String, String)> {
+    // 逐字对齐官方客户端 VlmUpstream/applyGatewayHeaders（asar 逆向）
     let mut hs = vec![
         ("Authorization".to_string(), format!("Bearer {token}")),
         ("Content-Type".to_string(), "application/json".to_string()),
-        ("Accept".to_string(), "text/event-stream".to_string()),
+        ("Accept".to_string(), "application/json".to_string()),
+        ("x-requested-with".to_string(), "XMLHttpRequest".to_string()),
         ("User-Agent".to_string(), WB_CHAT_UA.to_string()),
-        ("X-Product".to_string(), "WorkBuddy".to_string()),
-        ("X-IDE-Name".to_string(), "WorkBuddy".to_string()),
+        ("X-Product".to_string(), "SaaS".to_string()),
         ("X-IDE-Type".to_string(), "WorkBuddy".to_string()),
+        ("X-IDE-Name".to_string(), "WorkBuddy".to_string()),
+        ("X-IDE-Version".to_string(), "5.11.3".to_string()),
+        ("X-Private-Data".to_string(), "true".to_string()),
+        ("X-Agent-Intent".to_string(), "craft".to_string()),
         ("X-Agent-Purpose".to_string(), "conversation".to_string()),
+        ("x-codebuddy-request".to_string(), "1".to_string()),
+        ("Accept-Encoding".to_string(), "identity".to_string()),
         ("Accept-Language".to_string(), if wb_is_global(domain) { "en-US".to_string() } else { "zh-CN".to_string() }),
+        // 会话标识（官方每会话固定 / 每消息随机）
+        ("X-Conversation-ID".to_string(), uuid::Uuid::new_v4().to_string()),
+        ("X-Conversation-Request-ID".to_string(), uuid::Uuid::new_v4().to_string()),
+        ("acp-connection-id".to_string(), uuid::Uuid::new_v4().to_string()),
+        ("X-Conversation-Message-ID".to_string(), uuid::Uuid::new_v4().to_string()),
+        ("X-Request-ID".to_string(), uuid::Uuid::new_v4().to_string()),
     ];
+    // trace 链路头（官方 applyTraceHeaders：W3C traceparent + b3 多头）
+    let trace_id: String = uuid::Uuid::new_v4().simple().to_string();
+    let span_id: String = uuid::Uuid::new_v4().simple().to_string()[..16].to_string();
+    let parent_id: String = uuid::Uuid::new_v4().simple().to_string()[..16].to_string();
+    hs.push(("traceparent".to_string(), format!("00-{trace_id}-{span_id}-01")));
+    hs.push(("b3".to_string(), format!("{trace_id}-{span_id}-1-{parent_id}")));
+    hs.push(("X-B3-TraceId".to_string(), trace_id.clone()));
+    hs.push(("X-B3-ParentSpanId".to_string(), parent_id.clone()));
+    hs.push(("X-B3-SpanId".to_string(), span_id));
+    hs.push(("X-B3-Sampled".to_string(), "1".to_string()));
+    hs.push(("X-Trace-ID".to_string(), trace_id));
+    // 用户/企业/域
     if uid.is_empty() {
         hs.push(("X-No-User-Id".to_string(), "1".to_string()));
     } else {
