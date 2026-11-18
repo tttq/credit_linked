@@ -192,8 +192,13 @@ impl Adapter for MiniMaxAdapter {
         let v = api_post(c, "/matrix/api/v1/commerce/get_membership_info", Some(json!({}))).await?;
         let status = v.get("base_resp").and_then(|b| b.get("status_code")).and_then(|s| s.as_i64());
         if status != Some(0) { return Err(PlatformError::business_of(&v)); }
-        let remaining = v.pointer("/op_credit_summary/total_remaining_amount").and_then(|r| r.as_f64())
-            .or_else(|| v.get("total_remains_credit").and_then(|r| r.as_f64()));
+        // op_credit_summary.total_remaining_amount 可能是字符串（"799.884"）或数字
+        let remaining = v.pointer("/op_credit_summary/total_remaining_amount").and_then(|r| match r {
+            serde_json::Value::Number(n) => n.as_f64(),
+            serde_json::Value::String(s) => s.parse::<f64>().ok(),
+            _ => None,
+        })
+        .or_else(|| v.get("total_remains_credit").and_then(|r| r.as_f64()));
         Ok(Quota { remaining, parts: Value::Null, sampled_at: now_iso() })
     }
 
