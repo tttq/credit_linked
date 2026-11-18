@@ -37,9 +37,20 @@ pub fn adapter_for(provider: &str) -> Option<Box<dyn Adapter>> {
 }
 
 impl Service {
-    /// 遇 Auth（401/过期）时尝试 refresh 并持久化新凭据（refresh_token 一次性轮换，必须立即落库）
+    /// 遇 Auth（401/过期）时尝试恢复凭据：minimax 优先读本机客户端最新 auth.json（本地客户端持续轮换 token），否则走 refresh 链。
     pub async fn refreshed_cred(&self, provider: &str, uid: &str, cred: &Cred) -> Result<Cred, PlatformError> {
         let adapter = adapter_for(provider).ok_or_else(|| PlatformError::Local(format!("no adapter for {provider}")))?;
+        if provider == "minimax" {
+            if let Some(live) = crate::adapters::minimax_local::read_live_auth() {
+                let mut nc = crate::adapters::minimax_local::to_cred(live);
+                nc.uid = uid.to_string();
+                nc.name = cred.name.clone();
+                if let Ok(auth) = serde_json::to_string(&nc) {
+                    let _ = self.store.upsert_account(provider, uid, &nc.name, "", &auth);
+                }
+                return Ok(nc);
+            }
+        }
         let nc = adapter.refresh(cred).await?;
         if let Ok(auth) = serde_json::to_string(&nc) {
             let _ = self.store.upsert_account(provider, uid, &nc.name, "", &auth);

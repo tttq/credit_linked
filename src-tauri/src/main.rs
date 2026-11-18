@@ -451,6 +451,8 @@ async fn tools_download(app: tauri::AppHandle, platform: String, install_dir: St
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let path = std::path::Path::new(&dir).join(&file_name);
     let path_str = path.to_string_lossy().to_string();
+    // 旧安装包先删（避免被运行中的安装器锁定导致写入失败）
+    if path.exists() { let _ = std::fs::remove_file(&path); }
 
     let entry = serde_json::json!({ "platform": platform, "status": "downloading", "file": path_str, "progress": 0 });
     { let mut d = DOWNLOADS.lock().unwrap(); d.retain(|x| x["platform"] != platform); d.push(entry.clone()); }

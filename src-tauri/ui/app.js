@@ -596,7 +596,8 @@ async function renderToolsTab(body) {
     '<button id="tools-dir-save" class="small primary">保存</button></div></div>' +
     items.map(it => {
       const dl = (TOOLS.downloads || []).find(d => d.platform === it.platform) || {};
-      const st = dl.status === 'downloading' ? '下载中 ' + (dl.progress || 0) + '%' : dl.status === 'downloaded' ? '已下载' : '';
+      const stMap = { downloading: '下载中 ' + (dl.progress || 0) + '%', downloaded: '下载完成', installing: '安装中…', installed: '✓ 已安装', install_timeout: '安装器已退出（请手动确认）' };
+      const st = stMap[dl.status] || '';
       const qtxt = it.accounts > 0 ? ' · 已装 ' + it.accounts + ' 个账号' + (it.quotaTotal != null ? ' · 剩余额度 ' + fmt(it.quotaTotal) : '') : ' · 未添加账号';
       return '<div class="setting-row" data-tool="' + it.platform + '"><div><h3>' + picon(it.platform) + ' ' + (meta[it.platform] || it.platform) + '</h3>' +
         '<p>' + (it.direct ? '支持应用内直链下载 · ' + esc(it.url.split('/').pop() || '') : '无稳定直链 → 打开官方下载页手动下载') + qtxt + '</p></div>' +
@@ -616,15 +617,12 @@ async function renderToolsTab(body) {
   body.querySelectorAll('[data-dl]').forEach(b => b.addEventListener('click', async () => {
     const p = b.dataset.dl;
     const dir = body.querySelector('#tools-dir')?.value || '';
-    b.disabled = true; b.textContent = '下载中…';
+    b.disabled = true; b.textContent = '处理中…';
     try {
       const r = await invoke('tools_download', { platform: p, installDir: dir });
       if (r.ok) {
-        b.textContent = '安装中…';
-        const ir = await invoke('tools_install', { platform: p, file: r.file });
-        toast((meta[p] || p) + ' 安装器已启动（静默模式 ' + ir.kind + '），完成后可在开始菜单找到');
-        const row = body.querySelector('[data-tool="' + p + '"] [data-status]');
-        if (row) row.textContent = '已启动安装';
+        await invoke('tools_install', { platform: p, file: r.file });
+        toast((meta[p] || p) + ' 静默安装已启动，完成后状态会更新为「已安装」');
       } else if (r.openPage) {
         await invoke('tools_open_page', { platform: p });
         toast('该平台暂无稳定直链，已打开官网下载页');
@@ -643,7 +641,11 @@ async function renderToolsTab(body) {
       if (!TOOLS) TOOLS = {};
       TOOLS.downloads = (TOOLS.downloads || []).filter(x => x.platform !== d.platform).concat([d]);
       const row = document.querySelector('#settings-body [data-tool="' + d.platform + '"] [data-status]');
-      if (row) row.textContent = d.status === 'downloading' ? '下载中 ' + (d.progress || 0) + '%' : (d.status === 'downloaded' ? '已下载' : '');
+      if (row) {
+        const stMap2 = { downloading: '下载中 ' + (d.progress || 0) + '%', downloaded: '下载完成', installing: '安装中…', installed: '✓ 已安装', install_timeout: '安装器已退出（请手动确认）' };
+        row.textContent = stMap2[d.status] || '';
+        if (d.status === 'installed' || d.status === 'install_timeout') toast((d.platform === 'qoder' ? 'Qoder' : d.platform) + ' 安装流程结束');
+      }
     });
   } catch {}
 }
