@@ -785,6 +785,28 @@ $$('[data-goto]').forEach(b => b.addEventListener('click', () => showPage(b.data
 window.addEventListener('resize', () => { charts.ov?.resize(); charts.st?.resize(); });
 window.piconFallback = piconFallback;
 
+// ===== 关闭确认：退至后台 / 退出程序 =====
+(function setupQuitDialog() {
+  const mask = document.getElementById('quit-mask');
+  if (!mask) return;
+  const show = () => { mask.style.display = 'flex'; };
+  const hide = () => { mask.style.display = 'none'; };
+  mask.querySelector('#quit-cancel').addEventListener('click', hide);
+  mask.querySelector('#quit-to-tray').addEventListener('click', () => {
+    hide();
+    try { _T?.window?.getCurrent?.()?.hide?.(); } catch { try { _T?.window?.getCurrentWindow?.()?.hide?.(); } catch {} }
+  });
+  mask.querySelector('#quit-exit').addEventListener('click', async () => {
+    hide();
+    try { await invoke('quit_app'); } catch {}
+  });
+  // Rust 端拦截关闭 → 发事件 → 弹窗
+  try {
+    const listen = _T?.event?.listen;
+    if (listen) listen('window-close-requested', show);
+  } catch {}
+})();
+
 refreshAll();
 function applyRefreshInterval() {
   if (window.__refreshTimer) clearInterval(window.__refreshTimer);

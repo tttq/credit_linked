@@ -78,6 +78,13 @@ async fn quota_refresh_all() -> Result<serde_json::Value, String> {
     Ok(serde_json::json!({ "ok": true, "refreshed": ok, "failed": fail }))
 }
 
+/// 用户确认退出：直接结束进程
+#[tauri::command]
+async fn quit_app(app: tauri::AppHandle) -> Result<(), String> {
+    app.exit(0);
+    Ok(())
+}
+
 #[tauri::command]
 async fn history(limit: Option<i64>) -> Result<serde_json::Value, String> {
     let s = svc()?;
@@ -656,10 +663,11 @@ fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .on_window_event(|window, event| {
-            // 点关闭 → 隐藏到托盘常驻（不退出进程）
+            // 点关闭 → 先阻止关闭，交由前端弹窗询问「退至后台 / 退出程序」
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                window.hide().ok();
                 api.prevent_close();
+                use tauri::Emitter;
+                let _ = window.emit("window-close-requested", ());
             }
         })
         .setup(|app| {
@@ -743,7 +751,7 @@ fn main() {
             statistics, daily_income, settings_get, settings_set, account_list_all, open_url,
             login_open_window, login_close_window,
             gateway_status, gateway_set_platform, gateway_add_rule, gateway_update_rule, gateway_delete_rule,
-            gateway_set_limits, gateway_clear_logs, tools_info, tools_download, tools_install, tools_open_page, quota_refresh_all,
+            gateway_set_limits, gateway_clear_logs, tools_info, tools_download, tools_install, tools_open_page, quota_refresh_all, quit_app,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

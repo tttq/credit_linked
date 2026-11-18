@@ -332,6 +332,17 @@ img { max-width: 100%; }
     </div>
   </div>
 </div>
+<div class="modal-mask" id="quit-mask" style="display:none">
+  <div class="modal">
+    <h3>关闭 AI路由助手</h3>
+    <div class="desc">选择窗口关闭行为：最小化到托盘可保持网关与自动签到继续运行。</div>
+    <div class="foot" style="display:flex;gap:10px;justify-content:flex-end;flex-wrap:wrap">
+      <button id="quit-cancel">取消</button>
+      <button id="quit-to-tray">退至后台</button>
+      <button id="quit-exit" class="primary">退出程序</button>
+    </div>
+  </div>
+</div>
 <div id="toast"></div>
 <script src="app.js"></script>
 </body>
