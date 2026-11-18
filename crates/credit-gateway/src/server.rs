@@ -239,14 +239,8 @@ async fn list_models(
     }
     let mut data = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    // strict（仅允许当前平台）时：模型目录也只取当前平台
-    let strict = st.store.get_setting("gatewayStrict", "1").ok().map(|v| v == "1").unwrap_or(true);
-    let current = st.router.current_platform();
-    let targets: Vec<Platform> = if strict {
-        vec![current]
-    } else {
-        Platform::all().to_vec()
-    };
+    // 模型目录始终返回全部平台（外部客户端可见全选）；strict 的跨平台限制在 chat 时校验
+    let targets: Vec<Platform> = Platform::all().to_vec();
     for platform in targets {
         let Some(cred) = st.router.accounts_for(platform).into_iter().next() else { continue };
         let models = match platform {

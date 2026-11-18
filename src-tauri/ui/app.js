@@ -515,15 +515,18 @@ function renderRouting() {
     statusEl.textContent = '获取模型中…';
     try {
       const r = await fetch(st.baseUrl + '/v1/models').then(x => x.json());
-      // 只展示当前平台的模型（裸 id 直接可用）
-      const models = (r.data || []).filter(m => (m.platform || m.id.split('/')[0]) === st.platform).map(m => m.raw_model || m.id);
+      // 全平台模型（当前平台的裸 id 排前，其余用 平台/模型 全名）
+      const all = r.data || [];
+      const cur = all.filter(m => (m.platform || m.id.split('/')[0]) === st.platform).map(m => m.raw_model || m.id);
+      const others = all.filter(m => (m.platform || m.id.split('/')[0]) !== st.platform).map(m => m.id);
+      const models = [...cur, ...others];
       if (!models.length) {
-        modelSel.innerHTML = '<option value="">（当前平台无可用模型 —— 检查账号）</option>';
+        modelSel.innerHTML = '<option value="">（无可用模型 —— 检查各平台账号）</option>';
         statusEl.textContent = '';
         return;
       }
       modelSel.innerHTML = models.map(m => '<option value="' + esc(m) + '">' + esc(m) + '</option>').join('');
-      statusEl.textContent = models.length + ' 个模型';
+      statusEl.textContent = models.length + ' 个模型（当前平台 ' + cur.length + '）';
     } catch (e) { statusEl.textContent = '获取失败: ' + e; }
   };
   el.querySelector('#gw-test-refresh')?.addEventListener('click', fetchModels);

@@ -198,11 +198,24 @@ pub async fn trae_fetch_models(cred: &Cred, intl: bool) -> Result<Vec<ModelInfo>
     if status != 200 {
         return Err(PlatformError::Format(format!("remote models HTTP {status}")));
     }
+    // 兼容两种结构：旧 = data.list[] 直接模型行；新 = data.list[].function → models[]（按功能分组）
     let list = body.pointer("/data/list").and_then(|l| l.as_array()).cloned().unwrap_or_default();
+    let mut rows: Vec<Value> = Vec::new();
+    let mut grouped = false;
+    for entry in &list {
+        if let Some(models) = entry.get("models").and_then(|m| m.as_array()) {
+            grouped = true;
+            rows.extend(models.iter().cloned());
+        }
+    }
+    if !grouped {
+        rows = list;
+    }
     let mut out = Vec::new();
-    for row in list {
+    let mut seen = std::collections::HashSet::new();
+    for row in rows {
         let id = row.get("name").and_then(|n| n.as_str()).unwrap_or_default().to_string();
-        if id.is_empty() {
+        if id.is_empty() || !seen.insert(id.clone()) {
             continue;
         }
         let context = row.get("context_window_tokens").cloned().unwrap_or(Value::Null);
