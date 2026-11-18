@@ -359,11 +359,71 @@ async fn gateway_clear_logs() -> Result<serde_json::Value, String> {
 // ===== 平台工具下载安装 =====
 
 /// 检测平台客户端本机是否已安装（常见安装路径 + 客户端凭据探测）
+/// 通过注册表 Uninstall 键查询本机安装的软件名列表（一次查询，缓存 5 分钟）
+fn registry_installed_names() -> Vec<String> {
+    static CACHE: std::sync::OnceLock<(std::sync::Mutex<Option<(std::time::Instant, Vec<String>)>>, )> = std::sync::OnceLock::new();
+    let cache = &CACHE.get().unwrap().0;
+    if let Ok(g) = cache.lock() {
+        if let Some((at, v)) = &*g {
+            if at.elapsed() < std::time::Duration::from_secs(300) {
+                return v.clone();
+            }
+        }
+    }
+    let names: Vec<String> = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-Command", "$ks=@('HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*','HKLM:\\Software\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*','HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*'); Get-ItemProperty $ks -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName } | ForEach-Object { $_.DisplayName }"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).lines().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
+        .unwrap_or_default();
+    if let Ok(mut g) = cache.lock() {
+        *g = Some((std::time::Instant::now(), names.clone()));
+    }
+    names
+}
+
+/// 卸载器目录里找主程序（Uninstall 旁通常就是主 exe）
+fn installed_by_uninstaller(platform: &str, names: &[String]) -> bool {
+    // 注册表 DisplayName 前缀匹配
+    let hit = match platform {
+        "qoder" => names.iter().any(|n| n.to_lowercase().starts_with("qoder")),
+        "minimax" => names.iter().any(|n| n.to_lowercase().starts_with("minimax")),
+        "trae" => names.iter().any(|n| n.to_lowercase().starts_with("trae")),
+        "workbuddy" => names.iter().any(|n| n.to_lowercase().starts_with("workbuddy") || n.to_lowercase().starts_with("codebuddy")),
+        "zcode" => names.iter().any(|n| n.to_lowercase().starts_with("zcode")),
+        "codearts" | "codearts-desktop" => names.iter().any(|n| n.to_lowercase().starts_with("codearts") || n.contains("码道")),
+        _ => false,
+    };
+    if hit { return true; }
+    // 注册表 InstallLocation 不可用时兜底：扫描常见自定义安装根目录的卸载器
+    let roots = ["C:/Program Files", "C:/Program Files (x86)", "D:/ProgramFiles/develop", "D:/ProgramFiles/software", "D:/Program Files"];
+    let uninstaller_names: &[&str] = match platform {
+        "qoder" => &["Uninstall Qoder CN.exe", "Uninstall Qoder.exe"],
+        "minimax" => &["Uninstall MiniMax Code.exe"],
+        "trae" => &["Uninstall Trae CN.exe", "Uninstall Trae.exe"],
+        "workbuddy" => &["Uninstall WorkBuddy.exe", "Uninstall CodeBuddy.exe"],
+        "zcode" => &["Uninstall ZCode.exe"],
+        "codearts" | "codearts-desktop" => &["Uninstall CodeArts.exe"],
+        _ => &[],
+    };
+    roots.iter().any(|root| std::fs::read_dir(root).map(|rd| {
+        for entry in rd.filter_map(|e| e.ok()) {
+            if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) { continue; }
+            for un in uninstaller_names {
+                if entry.path().join(un).exists() { return true; }
+            }
+        }
+        false
+    }).unwrap_or(false))
+}
+
 fn tool_installed(platform: &str) -> bool {
     let local = std::env::var("LOCALAPPDATA").unwrap_or_default();
     let userprofile = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).unwrap_or_default();
+    // 注册表卸载信息最可靠（覆盖任意自定义安装位置）
+    let reg = registry_installed_names();
+    if installed_by_uninstaller(platform, &reg) { return true; }
     // 下面所有路径用 '/'（Windows API 接受正斜杠），避免转义地狱
-    // 卸载器/主程序常见位置（含用户自定义安装盘符的常见目录）
+    // 卸载器/主程序常见位置（兜底）
     let candidates: Vec<String> = match platform {
         "qoder" => vec![
             format!("{local}/Programs/Qoder/Qoder.exe"),

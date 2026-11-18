@@ -619,7 +619,7 @@ async function renderToolsTab(body) {
       return '<div class="setting-row" data-tool="' + it.platform + '"><div><h3>' + picon(it.platform) + ' ' + (meta[it.platform] || it.platform) + '</h3>' +
         '<p>' + (it.direct ? '支持应用内直链下载 · ' + esc(it.url.split('/').pop() || '') : '无稳定直链 → 打开官方下载页手动下载') + qtxt + '</p></div>' +
         '<div class="actions" style="display:flex;gap:6px;align-items:center">' +
-        '<span class="subtle" data-status>' + (it.installed ? '✓ 本机已安装 ' : '') + st + '</span>' +
+        '<span data-status style="font-size:11.5px;font-weight:600;' + (it.installed ? 'color:var(--green,#16a34a)' : 'color:var(--subtle,#7f7d91)') + '">' + (it.installed ? '✓ 已安装 ' : '') + st + '</span>' +
         (it.direct ? '<button data-dl="' + it.platform + '" class="small ' + (it.installed ? '' : 'primary') + '">' + (it.installed ? '重新安装' : '一键下载安装') + '</button>' : '<button data-page="' + it.platform + '" class="small">打开下载页</button>') +
         '</div></div>';
     }).join('') +
