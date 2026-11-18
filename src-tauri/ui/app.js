@@ -515,8 +515,8 @@ function renderRouting() {
     statusEl.textContent = '获取模型中…';
     try {
       const r = await fetch(st.baseUrl + '/v1/models').then(x => x.json());
-      // 只显示当前平台的可用模型（裸 id，直接走当前平台）
-      const models = (r.data || []).filter(m => (m.platform || m.id.split('/')[0]) === st.platform).map(m => m.raw_model || m.id);
+      // 当前平台模型（/v1/models 已按当前平台过滤，id 即裸模型 id）
+      const models = (r.data || []).map(m => m.raw_model || m.id);
       if (!models.length) {
         modelSel.innerHTML = '<option value="">（当前平台无可用模型 —— 检查账号）</option>';
         statusEl.textContent = '';

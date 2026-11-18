@@ -239,8 +239,8 @@ async fn list_models(
     }
     let mut data = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    // 模型目录始终返回全部平台（外部客户端可见全选）；strict 的跨平台限制在 chat 时校验
-    let targets: Vec<Platform> = Platform::all().to_vec();
+    // 模型目录只返回当前请求平台的模型（跟随「请求平台」切换；模型 id 为裸 id）
+    let targets: Vec<Platform> = vec![st.router.current_platform()];
     for platform in targets {
         let Some(cred) = st.router.accounts_for(platform).into_iter().next() else { continue };
         let models = match platform {
@@ -254,7 +254,7 @@ async fn list_models(
         };
         let Ok(models) = models else { continue };
         for m in models {
-            let key = format!("{}/{}", platform.as_str(), m.id);
+            let key = m.id.clone();
             if !seen.insert(key.clone()) {
                 continue;
             }
