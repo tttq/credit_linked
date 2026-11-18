@@ -370,110 +370,124 @@ async function refreshGateway() {
   } catch (e) { GW_STATUS = null; }
 }
 
+function bindGwSave(btnId, inputId, field) {
+  const btn = document.getElementById(btnId);
+  const input = document.getElementById(inputId);
+  if (!btn || !input) return;
+  btn.addEventListener('click', async () => {
+    btn.disabled = true;
+    try {
+      const val = field === 'port' ? Number(input.value) : Number(input.value);
+      if (field === 'port' && !(val >= 1 && val <= 65535)) { toast('端口需在 1-65535 之间', 4200); return; }
+      const r = await invoke('gateway_set_limits', { [field]: val });
+      if (field === 'port') {
+        toast(r.needsRestart ? '端口已保存 —— 重启应用后生效' : '端口已保存');
+      } else {
+        toast('速率限制已保存（实时生效）');
+      }
+      await refreshGateway();
+    } catch (e) { toast('保存失败: ' + e, 4200); }
+    btn.disabled = false;
+  });
+}
+
 function renderRouting() {
   const el = $('#route-matrix');
   if (!GW_STATUS) { el.innerHTML = '<div class="empty">网关状态读取失败</div>'; return; }
   const st = GW_STATUS;
-  // 平台切换改为顶部下拉 + 快捷按钮（platRows 已移除）
   const ruleRows = (st.rules || []).map(r =>
     '<div class="route-row" data-rule="' + esc(r.id) + '">' +
-    '<div style="flex:1"><strong style="font-size:13.5px">模型前缀 ' + esc(r.model_pattern) + '</strong>' +
-    '<div class="subtle" style="margin-top:3px">' +
-    (r.platform ? '平台 → ' + esc(GW_PLATFORMS[r.platform]?.label || r.platform) : '平台 → 跟随当前') +
-    (r.account ? ' · 账号 → ' + esc(r.account) : ' · 账号 → 平台默认') +
-    (r.enabled ? '' : ' · 已停用') + '</div></div>' +
+    '<div style="flex:1;min-width:0"><strong style="font-size:13px"><code style="background:var(--accent-soft);color:var(--accent);padding:1px 6px;border-radius:5px;font-size:12px">' + esc(r.model_pattern) + '</code></strong>' +
+    '<div class="subtle" style="margin-top:4px">' +
+    (r.platform ? '平台 → <b>' + esc(GW_PLATFORMS[r.platform]?.label || r.platform) + '</b>' : '平台 → 跟随当前') +
+    (r.account ? ' · 账号 → <b>' + esc(r.account) + '</b>' : ' · 账号 → 平台默认') +
+    (r.enabled ? '' : ' · <span style="color:var(--red)">已停用</span>') + '</div></div>' +
     '<button class="small" data-rule-toggle="' + esc(r.id) + '" data-enabled="' + (r.enabled ? '1' : '0') + '">' + (r.enabled ? '停用' : '启用') + '</button>' +
-    '<button class="small" data-rule-del="' + esc(r.id) + '">删除</button>' +
-    '</div>').join('') || '<div class="empty">暂无规则 —— 全部请求按当前平台 + 平台内默认选号</div>';
+    '<button class="small danger-ghost" data-rule-del="' + esc(r.id) + '">删除</button>' +
+    '</div>').join('') || '<div class="empty" style="padding:16px">暂无规则 —— 全部请求按当前平台 + 平台内默认选号</div>';
 
   const logRows = (st.logs || []).slice(0, 30).map(l =>
     '<div class="route-row" style="font-size:12.5px">' +
-    '<div style="flex:1;min-width:0"><strong style="font-size:12.5px">' + (l.ok ? '<span style="color:var(--green)">✓ 成功</span>' : '<span style="color:var(--red)">✗ 失败</span>') +
-    ' <code style="font-size:12px">' + esc(l.model || '(无模型)') + '</code></strong>' +
+    '<div style="flex:1;min-width:0;display:flex;align-items:center;gap:8px">' +
+    '<span style="font-weight:700;flex:0 0 auto">' + (l.ok ? '<span style="color:var(--green,#16a34a)">✓</span>' : '<span style="color:var(--red,#dc2626)">✗</span>') + '</span>' +
+    '<div style="min-width:0"><strong style="font-size:12.5px"><code style="font-size:12px">' + esc(l.model || '(无模型)') + '</code></strong>' +
     '<div class="subtle" style="margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(l.at) + ' · ' + esc(l.platform) +
-    (l.account ? ' · ' + esc(l.account) : '') + (l.message && !l.ok ? ' · ' + esc(l.message) : '') + '</div></div>' +
-    '</div>').join('') || '<div class="empty">暂无请求日志</div>';
+    (l.account ? ' · ' + esc(l.account) : '') + (l.message && !l.ok ? ' · <span style="color:var(--red,#dc2626)">' + esc(l.message) + '</span>' : '') + '</div></div></div>' +
+    '</div>').join('') || '<div class="empty" style="padding:16px">暂无请求日志</div>';
+  const logStats = st.logStats || { total: 0, ok: 0, fail: 0 };
+
+  const platOptions = Object.entries(GW_PLATFORMS).map(([name, meta]) =>
+    '<option value="' + name + '"' + (st.platform === name ? ' selected' : '') + '>' + esc(meta.label) + (meta.chat ? '' : '（仅签到）') + '</option>').join('');
+  const otherPlats = Object.entries(GW_PLATFORMS).filter(([name]) => name !== st.platform);
+  const curMeta = GW_PLATFORMS[st.platform] || {};
 
   el.innerHTML =
-    // 网关地址卡
-    '<section class="surface" style="margin-bottom:14px"><div class="setting-row">' +
-    '<div><h3>本地网关（OpenAI 兼容接口）</h3><p class="subtle">像本地 Ollama 一样，把下面的接口地址填进任意支持 OpenAI 的客户端。</p></div>' +
-    '<div><strong style="font-family:monospace;font-size:13px">' + esc(st.baseUrl) + '/v1</strong>' +
-    '<div class="subtle" style="margin-top:4px">GET /v1/models · POST /v1/chat/completions · 端口 <b id="gw-port-now">' + st.port + '</b></div></div></div>' +
-    '<p class="notice">模型 id 用 <code>平台/模型</code>（如 <code>workbuddy/glm-5.3-flash</code>）；裸模型 id 走下方当前平台。</p>' +
-    // 端口 / 速率 / 仅当前平台 —— 自定义设置
-    '<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-top:10px;padding-top:10px;border-top:1px solid var(--line)">' +
-    '<label class="subtle">端口（改后需重启应用）<div style="display:flex;gap:6px;margin-top:4px">' +
+    // ===== 网关卡 =====
+    '<section class="surface" style="margin-bottom:14px;padding:18px 20px">' +
+    '<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">' +
+    '<div style="flex:1;min-width:260px"><h3 style="font-size:14px">本地网关 · OpenAI 兼容接口</h3>' +
+    '<div style="display:flex;align-items:center;gap:8px;margin-top:8px;flex-wrap:wrap">' +
+    '<code style="background:var(--accent-soft);color:var(--accent);padding:8px 14px;border-radius:9px;font-size:13.5px;font-weight:600">' + esc(st.baseUrl) + '/v1</code>' +
+    '<button class="small" id="gw-copy-url">复制</button>' +
+    '<span class="subtle" style="font-size:11.5px">GET /v1/models · POST /v1/chat/completions</span></div>' +
+    '<p class="subtle" style="font-size:11.5px;margin-top:8px">模型 id 用 <code>平台/模型</code>；裸模型 id 走当前平台（' + esc(curMeta.label || st.platform) + '）。</p></div></div>' +
+    '<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;margin-top:14px;padding-top:14px;border-top:1px solid var(--line)">' +
+    '<label class="subtle" style="font-size:12px">端口（改后需重启应用）<div style="display:flex;gap:6px;margin-top:5px">' +
     '<input id="gw-port" type="number" min="1" max="65535" value="' + st.port + '" style="width:100%;padding:8px;border-radius:9px;border:1px solid var(--line);font:inherit">' +
     '<button id="gw-port-save" class="small primary">保存</button></div></label>' +
-    '<label class="subtle">速率限制（RPM，0 = 不限）<div style="display:flex;gap:6px;margin-top:4px">' +
+    '<label class="subtle" style="font-size:12px">速率限制（RPM，0 = 不限）<div style="display:flex;gap:6px;margin-top:5px">' +
     '<input id="gw-rpm" type="number" min="0" value="' + (st.rpm || 0) + '" style="width:100%;padding:8px;border-radius:9px;border:1px solid var(--line);font:inherit">' +
     '<button id="gw-rpm-save" class="small primary">保存</button></div></label>' +
-    '<label class="subtle">仅允许当前平台<div style="margin-top:10px"><label class="switch"><input type="checkbox" id="gw-strict" ' + (st.strict !== false ? 'checked' : '') + '><span class="track"><span class="knob"></span></span></label></div>' +
-    '<div class="subtle" style="margin-top:4px">开启后显式 <code>平台/模型</code> 与规则改平台都会被 403 拒绝</div></label>' +
+    '<label class="subtle" style="font-size:12px">仅允许当前平台<div style="margin-top:8px"><label class="switch"><input type="checkbox" id="gw-strict" ' + (st.strict !== false ? 'checked' : '') + '><span class="track"><span class="knob"></span></span></label></div>' +
+    '<div class="subtle" style="margin-top:4px;font-size:11px">开启后跨平台请求将被 403 拒绝</div></label>' +
     '</div></section>' +
-    // 请求日志
-    '<h3 class="spaced" style="display:flex;align-items:center;justify-content:space-between"><span>请求日志（最近 ' + Math.min(st.logs?.length || 0, 30) + ' 条 · 总计 ' + (st.logStats?.total || 0) + ' · 成功 ' + (st.logStats?.ok || 0) + ' · 失败 ' + (st.logStats?.fail || 0) + '）</span>' +
-    ((st.logStats?.total || 0) > 0 ? '<button id="gw-logs-clear" class="small danger-ghost">清空日志</button>' : '') + '</h3>' + logRows +
-    // 当前平台 —— 下拉切换 + 当前平台摘要
-    '<h3 class="spaced" style="display:flex;align-items:center;justify-content:space-between"><span>请求平台（裸模型 id 的默认路由）</span>' +
-    '<label class="subtle" style="display:flex;align-items:center;gap:8px;font-size:12px">快速切换<select id="route-plat-select" style="padding:7px 10px;border-radius:9px;border:1px solid var(--line);font:inherit;min-width:180px">' +
-    Object.entries(GW_PLATFORMS).map(([name, meta]) => '<option value="' + name + '"' + (st.platform === name ? ' selected' : '') + '>' + esc(meta.label) + (meta.chat ? '' : '（仅签到）') + '</option>').join('') +
-    '</select></label></h3>' +
-    '<section class="surface" style="margin-bottom:14px;padding:14px 16px">' +
-    '<div style="display:flex;align-items:center;gap:12px">' + picon(st.platform) +
-    '<div style="flex:1"><strong style="font-size:14px">' + esc(GW_PLATFORMS[st.platform]?.label || st.platform) + '</strong>' +
-    '<div class="subtle" style="margin-top:3px">账号池 provider：' + esc(GW_PLATFORMS[st.platform]?.provider || st.platform) + ' · 可用账号 ' + ((st.accounts || {})[st.platform] || 0) + ' 个' +
-    (GW_PLATFORMS[st.platform]?.chat ? '' : ' · 无公开对话协议，网关暂不代理') + '</div></div>' +
-    '<span class="tag" style="background:var(--accent-soft);color:var(--accent)">当前平台</span></div></section>' +
-    '<div class="subtle" style="margin:0 0 8px;font-size:12px">查看其他平台的账号池：' +
-    Object.entries(GW_PLATFORMS).filter(([name]) => name !== st.platform).map(([name, meta]) =>
-      '<button class="small" data-switch="' + name + '" style="margin:2px 4px 2px 0">' + esc(meta.label) + ' · ' + ((st.accounts || {})[name] || 0) + ' 账号</button>').join('') + '</div>' +
-    // 规则
-    '<h3 class="spaced">路由规则（按模型前缀固定平台/账号）</h3>' + ruleRows +
-    '<div class="actions" style="margin-top:10px"><button id="rule-add" class="small primary">＋ 新建规则</button></div>';
 
-  const bindGwSave = (btnId, inputId, field) => {
-    const btn = el.querySelector('#' + btnId);
-    if (!btn) return;
-    btn.addEventListener('click', async () => {
-      const raw = el.querySelector('#' + inputId)?.value;
-      const val = parseInt(raw, 10);
-      if (isNaN(val)) { toast('请输入数字', 3600); return; }
-      btn.disabled = true;
-      try {
-        const r = await invoke('gateway_set_limits', { [field]: val });
-        toast(field === 'port'
-          ? (r.needsRestart ? '端口已保存，重启应用后生效' : '端口已保存（与当前一致）')
-          : '速率限制已保存（实时生效）');
-        await refreshGateway(); renderRouting();
-      } catch (e) { toast('保存失败: ' + e, 4200); }
-      btn.disabled = false;
-    });
-  };
-  bindGwSave('gw-port-save', 'gw-port', 'port');
-  bindGwSave('gw-rpm-save', 'gw-rpm', 'rpm');
-  const strictSw = el.querySelector('#gw-strict');
-  if (strictSw) strictSw.addEventListener('change', async () => {
-    try {
-      await invoke('gateway_set_limits', { strict: strictSw.checked });
-      toast(strictSw.checked ? '已锁定当前平台' : '已允许任意平台（规则可改平台）');
-      await refreshGateway();
-    } catch (e) { toast('操作失败: ' + e, 4200); strictSw.checked = !strictSw.checked; }
-  });
+    // ===== 请求平台卡 =====
+    '<section class="surface" style="margin-bottom:14px;padding:18px 20px">' +
+    '<div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap">' +
+    '<h3 style="font-size:14px">请求平台 <span class="subtle" style="font-size:11.5px;font-weight:400">裸模型 id 的默认路由</span></h3>' +
+    '<select id="route-plat-select" style="padding:8px 12px;border-radius:9px;border:1px solid var(--line);font:inherit;min-width:200px">' + platOptions + '</select></div>' +
+    '<div style="display:flex;align-items:center;gap:12px;margin-top:14px;padding:12px 14px;background:var(--accent-soft,#eef6ff);border-radius:11px">' +
+    picon(st.platform) +
+    '<div style="flex:1"><strong style="font-size:13.5px">' + esc(curMeta.label || st.platform) + '</strong>' +
+    '<div class="subtle" style="margin-top:3px;font-size:12px">provider：' + esc(curMeta.provider || st.platform) + ' · 可用账号 <b>' + ((st.accounts || {})[st.platform] || 0) + '</b> 个' +
+    (curMeta.chat ? '' : ' · 无公开对话协议，网关暂不代理') + '</div></div>' +
+    '<span class="tag" style="background:var(--accent);color:#fff">当前</span></div>' +
+    (otherPlats.length ? '<div class="subtle" style="margin-top:12px;font-size:12px">切换到其他平台：</div><div style="margin-top:6px;display:flex;flex-wrap:wrap;gap:6px">' +
+      otherPlats.map(([name, meta]) => '<button class="small" data-switch="' + name + '">' + esc(meta.label) + ' · ' + ((st.accounts || {})[name] || 0) + ' 账号</button>').join('') + '</div>' : '') +
+    '</section>' +
 
-  const clearBtn = el.querySelector('#gw-logs-clear');
-  if (clearBtn) clearBtn.addEventListener('click', async () => {
-    if (!confirm('确定清空全部请求日志？此操作不可恢复。')) return;
-    clearBtn.disabled = true;
+    // ===== 路由规则卡 =====
+    '<section class="surface" style="margin-bottom:14px;padding:18px 20px">' +
+    '<div style="display:flex;align-items:center;justify-content:space-between"><h3 style="font-size:14px">路由规则 <span class="subtle" style="font-size:11.5px;font-weight:400">按模型前缀固定平台/账号</span></h3>' +
+    '<button id="gw-rule-add" class="small primary">＋ 添加规则</button></div>' +
+    '<div style="margin-top:10px">' + ruleRows + '</div></section>' +
+
+    // ===== 请求日志卡 =====
+    '<section class="surface" style="padding:18px 20px">' +
+    '<div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px"><h3 style="font-size:14px">请求日志' +
+    '<span class="subtle" style="font-size:11.5px;font-weight:400"> · 最近 ' + Math.min(st.logs?.length || 0, 30) + ' 条 · 总计 ' + logStats.total + ' · <span style="color:var(--green,#16a34a)">成功 ' + logStats.ok + '</span> · <span style="color:var(--red,#dc2626)">失败 ' + logStats.fail + '</span></span></h3>' +
+    ((logStats.total || 0) > 0 ? '<button id="gw-logs-clear" class="small danger-ghost">清空日志</button>' : '') + '</div>' +
+    '<div style="margin-top:10px">' + logRows + '</div></section>';
+
+  // 添加规则（模型前缀 + 可选平台/账号）
+  el.querySelector('#gw-rule-add')?.addEventListener('click', async () => {
+    const pattern = prompt('模型前缀（如 glm-5 或 workbuddy/glm-5）：');
+    if (!pattern || !pattern.trim()) return;
+    const plats = Object.entries(GW_PLATFORMS).map(([k, v]) => k + ' = ' + v.label).join('\n');
+    const platform = prompt('固定平台（可选，回车跳过 = 跟随当前平台）：\n' + plats) || '';
+    const account = prompt('固定账号（可选，provider:uid 格式，回车跳过 = 平台默认）：') || '';
     try {
-      const r = await invoke('gateway_clear_logs');
-      toast('已清空 ' + (r.cleared || 0) + ' 条日志');
+      await invoke('gateway_add_rule', { platform: platform.trim(), modelPattern: pattern.trim(), account: account.trim(), weight: 1, enabled: true });
+      toast('规则已添加');
       await refreshGateway(); renderRouting();
-    } catch (e) { toast('清空失败: ' + e, 4200); }
-    clearBtn.disabled = false;
+    } catch (e) { toast('添加失败: ' + e, 4200); }
   });
-
+  // 复制按钮
+  el.querySelector('#gw-copy-url')?.addEventListener('click', async () => {
+    try { await navigator.clipboard.writeText(st.baseUrl + '/v1'); toast('接口地址已复制'); } catch (e) { toast('复制失败: ' + e); }
+  });
+  // 平台下拉
   const platSelect = el.querySelector('#route-plat-select');
   if (platSelect) platSelect.addEventListener('change', async () => {
     const p = platSelect.value;
@@ -504,46 +518,40 @@ function renderRouting() {
     const rule = (GW_STATUS.rules || []).find(r => r.id === b.dataset.ruleToggle);
     if (!rule) return;
     try {
-      await invoke('gateway_update_rule', { rule: { ...rule, enabled: rule.enabled ? false : true } });
+      await invoke('gateway_update_rule', { rule: { ...rule, enabled: !rule.enabled } });
+      toast(rule.enabled ? '规则已停用' : '规则已启用');
       await refreshGateway(); renderRouting();
     } catch (e) { toast('操作失败: ' + e, 4200); }
   }));
-  $('#rule-add').addEventListener('click', () => showRuleModal());
-}
-
-function showRuleModal() {
-  const accs = SNAP?.accounts || [];
-  const accOptions = accs.map(a => '<option value="' + esc(a.provider + ':' + a.uid) + '">' + esc(platName(a.provider) + ' · ' + (a.name || a.uid.slice(0, 10))) + '</option>').join('');
-  const platOptions = Object.entries(GW_PLATFORMS).map(([k, v]) => '<option value="' + k + '">' + esc(v.label) + '</option>').join('');
-  const mask = document.createElement('div');
-  mask.className = 'modal-mask'; mask.style.display = 'flex';
-  mask.innerHTML = '<div class="modal"><h3>新建路由规则</h3>' +
-    '<div class="desc">模型前缀命中的请求固定路由到指定平台/账号；留空表示跟随当前平台。</div>' +
-    '<div style="display:grid;gap:10px;margin:12px 0">' +
-    '<label class="subtle">模型前缀（* 匹配全部）<input id="rule-model" placeholder="如 workbuddy/glm-5.3-flash 或 *" style="width:100%;padding:8px;border-radius:9px;border:1px solid var(--line);font:inherit"></label>' +
-    '<label class="subtle">目标平台<select id="rule-platform" style="width:100%;padding:8px;border-radius:9px;border:1px solid var(--line);font:inherit"><option value="">跟随当前平台</option>' + platOptions + '</select></label>' +
-    '<label class="subtle">指定账号（可选）<select id="rule-account" style="width:100%;padding:8px;border-radius:9px;border:1px solid var(--line);font:inherit"><option value="">平台内默认选号</option>' + accOptions + '</select></label>' +
-    '</div><div class="foot"><button id="rule-cancel">取消</button><button id="rule-save" class="primary">保存</button></div></div>';
-  document.body.appendChild(mask);
-  mask.querySelector('#rule-cancel').addEventListener('click', () => mask.remove());
-  mask.querySelector('#rule-save').addEventListener('click', async () => {
-    const modelPattern = mask.querySelector('#rule-model').value.trim() || '*';
-    const platform = mask.querySelector('#rule-platform').value;
-    const account = mask.querySelector('#rule-account').value;
+  const clearBtn = el.querySelector('#gw-logs-clear');
+  if (clearBtn) clearBtn.addEventListener('click', async () => {
+    if (!confirm('确定清空全部请求日志？此操作不可恢复。')) return;
+    clearBtn.disabled = true;
     try {
-      await invoke('gateway_add_rule', { modelPattern, platform, account, weight: 1, enabled: true });
-      toast('规则已保存');
-      mask.remove();
+      const r = await invoke('gateway_clear_logs');
+      toast('已清空 ' + (r.cleared || 0) + ' 条日志');
       await refreshGateway(); renderRouting();
-    } catch (e) { toast('保存失败: ' + e, 4200); }
+    } catch (e) { toast('清空失败: ' + e, 4200); }
+    clearBtn.disabled = false;
   });
-}
-
-// ===== 设置 =====
-let settingsDraft = null;
-function renderSettings() {
+  bindGwSave('gw-port-save', 'gw-port', 'port');
+  bindGwSave('gw-rpm-save', 'gw-rpm', 'rpm');
+  const strictChk = el.querySelector('#gw-strict');
+  if (strictChk) strictChk.addEventListener('change', async () => {
+    strictChk.disabled = true;
+    try {
+      await invoke('gateway_set_limits', { strict: strictChk.checked });
+      toast('已' + (strictChk.checked ? '开启' : '关闭') + '「仅允许当前平台」');
+      await refreshGateway();
+    } catch (e) { strictChk.checked = !strictChk.checked; toast('设置失败: ' + e, 4200); }
+    strictChk.disabled = false;
+  });
+}function renderSettings() {
   settingsDraft = { ...SETTINGS };
   const body = $('#settings-body');
+  // 工具安装 tab 没有可保存的草稿设置 —— 隐藏保存按钮（有独立保存按钮）
+  const footer = document.querySelector('.save-footer');
+  if (footer) footer.style.display = document.querySelector('#settings-tabs button.active')?.dataset.tab === 'tools' ? 'none' : '';
   const tab = document.querySelector('#settings-tabs button.active')?.dataset.tab || 'tasks';
   if (tab === 'tasks') {
     body.innerHTML = '<div class="task-settings"><div>' +
@@ -607,8 +615,7 @@ async function renderToolsTab(body) {
   const dlDir = TOOLS.installDir || '';
   const items = TOOLS.items || [];
   const meta = { trae: 'Trae（字节跳动）', workbuddy: 'WorkBuddy / CodeBuddy（腾讯）', minimax: 'MiniMax Code', qoder: 'Qoder', zcode: 'ZCode（智谱）', codearts: '华为云码道' };
-  body.innerHTML = '<div class="setting-row"><div><h3>平台工具一键安装</h3><p>下载官方安装包并静默安装。支持直链的平台自动下载；其余平台将打开官方下载页。</p></div></div>' +
-    '<div class="setting-row"><div><h3>安装包下载路径</h3><p>留空使用系统临时目录。安装程序本身默认装到系统默认位置（安装器参数可控部分有限）。</p></div>' +
+  body.innerHTML = '<div class="setting-row"><div><h3>安装包下载路径</h3><p>留空使用系统临时目录。安装程序本身默认装到系统默认位置（安装器参数可控部分有限）。</p></div>' +
     '<div style="display:flex;gap:6px;min-width:340px"><input id="tools-dir" type="text" value="' + esc(dlDir) + '" placeholder="D:\\Tools\\Installers" style="flex:1;padding:8px 10px;border-radius:9px;border:1px solid var(--line);font:inherit">' +
     '<button id="tools-dir-save" class="small primary">保存</button></div></div>' +
     items.map(it => {
