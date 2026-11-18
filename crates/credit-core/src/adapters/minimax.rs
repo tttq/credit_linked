@@ -50,6 +50,26 @@ async fn post_form(url: &str, token: Option<&str>, pairs: &[(&str, &str)]) -> Re
     Ok(v)
 }
 
+fn chrono_now_plus(secs: u64) -> String {
+    // RFC3339 UTC now + secs（std-only：用 SystemTime 手算日期）
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() + secs;
+    let days = now / 86400;
+    let rem = now % 86400;
+    let (h, m, s) = (rem / 3600, rem % 3600 / 60, rem % 60);
+    // civil_from_days (Howard Hinnant)
+    let z = days as i64 + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z.rem_euclid(146097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let mo = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if mo <= 2 { y + 1 } else { y };
+    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
+}
+
 pub struct MiniStart { pub device_code: String, pub verification_uri: String, pub interval_secs: u64, pub verifier: String }
 
 pub async fn start_device_login() -> Result<MiniStart, PlatformError> {
@@ -186,9 +206,26 @@ impl Adapter for MiniMaxAdapter {
             ("scope", "agent.default"),
             ("audience", "agent-backend"),
         ]).await?;
+        // OAuth 端点 400 也返回 JSON（invalid_grant 等）—— 必须显式检查 error 字段
+        if let Some(err) = v.get("error").and_then(|e| e.as_str()) {
+            return Err(PlatformError::Business {
+                code: serde_json::json!(err),
+                message: if err == "invalid_grant" {
+                    "MiniMax 授权已失效（refresh_token 已轮换作废），请重新登录 MiniMax Code 账号".into()
+                } else {
+                    format!("MiniMax refresh 失败: {err}")
+                },
+            });
+        }
+        let Some(at) = v.get("access_token").and_then(|t| t.as_str()) else {
+            return Err(PlatformError::Auth);
+        };
         let mut out = c.clone();
-        if let Some(t) = v.get("access_token").and_then(|t| t.as_str()) { out.token = t.to_string(); }
+        out.token = at.to_string();
+        // refresh_token 轮换：新 RT 必须保存，否则旧 RT 立即作废
         if let Some(r) = v.get("refresh_token").and_then(|t| t.as_str()) { out.refresh_token = Some(r.to_string()); }
+        out.expires_at = v.get("expires_in").and_then(|e| e.as_u64())
+            .map(|secs| (chrono_now_plus(secs)));
         Ok(out)
     }
 }

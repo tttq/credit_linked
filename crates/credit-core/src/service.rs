@@ -37,12 +37,22 @@ pub fn adapter_for(provider: &str) -> Option<Box<dyn Adapter>> {
 }
 
 impl Service {
+    /// 遇 Auth（401/过期）时尝试 refresh 并持久化新凭据（refresh_token 一次性轮换，必须立即落库）
+    pub async fn refreshed_cred(&self, provider: &str, uid: &str, cred: &Cred) -> Result<Cred, PlatformError> {
+        let adapter = adapter_for(provider).ok_or_else(|| PlatformError::Local(format!("no adapter for {provider}")))?;
+        let nc = adapter.refresh(cred).await?;
+        if let Ok(auth) = serde_json::to_string(&nc) {
+            let _ = self.store.upsert_account(provider, uid, &nc.name, "", &auth);
+        }
+        Ok(nc)
+    }
+
     pub async fn checkin_account(&self, provider: &str, uid: &str) -> Result<CheckinOutcome, PlatformError> {
         let accounts = self.store.list_accounts().map_err(|e| PlatformError::Local(e.to_string()))?;
         let Some((_, _, name, secret_b64, auth)) = accounts.iter().find(|(p, u, _, _, _)| p == provider && u == uid) else {
             return Err(PlatformError::Local(format!("account {provider}:{uid} not found")));
         };
-        let cred: Cred = serde_json::from_str(auth).map_err(|e| PlatformError::Local(format!("bad cred json: {e}")))?;
+        let mut cred: Cred = serde_json::from_str(auth).map_err(|e| PlatformError::Local(format!("bad cred json: {e}")))?;
         let _ = secret_b64; // secret 字段保存加密凭据；本轮 cred 明文存 auth 列（单机 DPAPI 由 vault 处理）
         let adapter = adapter_for(provider).ok_or_else(|| PlatformError::Local(format!("no adapter for {provider}")))?;
         let cycle = crate::adapters::day_cn();
@@ -54,7 +64,14 @@ impl Service {
             }
         }
 
-        let st = adapter.state(&cred).await?;
+        let st = match adapter.state(&cred).await {
+            Ok(s) => s,
+            Err(PlatformError::Auth) if cred.refresh_token.is_some() => {
+                cred = self.refreshed_cred(provider, uid, &cred).await?;
+                adapter.state(&cred).await?
+            }
+            Err(e) => return Err(e),
+        };
         let receipt = adapter.claim(&cred, &st).await;
         let outcome = match receipt {
             Ok(r) => CheckinOutcome { provider: provider.into(), uid: uid.into(), status: r.status.clone(), amount: r.amount, message: r.message.clone() },
@@ -70,9 +87,16 @@ impl Service {
         let Some((_, _, _, _, auth)) = accounts.iter().find(|(p, u, _, _, _)| p == provider && u == uid) else {
             return Err(PlatformError::Local("account not found".into()));
         };
-        let cred: Cred = serde_json::from_str(auth).map_err(|e| PlatformError::Local(e.to_string()))?;
+        let mut cred: Cred = serde_json::from_str(auth).map_err(|e| PlatformError::Local(e.to_string()))?;
         let adapter = adapter_for(provider).ok_or_else(|| PlatformError::Local("no adapter".into()))?;
-        let q = adapter.quota(&cred).await?;
+        let q = match adapter.quota(&cred).await {
+            Ok(q) => q,
+            Err(PlatformError::Auth) if cred.refresh_token.is_some() => {
+                cred = self.refreshed_cred(provider, uid, &cred).await?;
+                adapter.quota(&cred).await?
+            }
+            Err(e) => return Err(e),
+        };
         // 额度持久化：下次启动直接展示，无需手动点击
         if let Ok(qj) = serde_json::to_string(&q) {
             let _ = self.store.update_account_quota(provider, uid, &qj);
