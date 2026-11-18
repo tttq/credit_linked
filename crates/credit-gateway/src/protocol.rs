@@ -400,14 +400,24 @@ pub const ZCODE_CHAT_PATH: &str = "/api/paas/v4/chat/completions";
 
 /// ZCode chat 请求头：凭据即智谱 access_token；deviceMid 可选
 pub fn zcode_chat_headers(token: &str, device_mid: Option<&str>) -> Vec<(String, String)> {
+    // 逐字对齐 ZCode 官方客户端 buildZCodeSourceHeadersFromContext（asar 逆向）
     let mut hs = vec![
         ("Authorization".to_string(), format!("Bearer {token}")),
         ("Content-Type".to_string(), "application/json".to_string()),
         ("Accept".to_string(), "application/json".to_string()),
+        ("User-Agent".to_string(), "ZCode/3.18.2".to_string()),
+        ("HTTP-Referer".to_string(), "https://zcode.z.ai".to_string()),
+        ("X-Title".to_string(), "Z Code@electron".to_string()),
+        ("X-ZCode-App-Version".to_string(), "3.18.2".to_string()),
+        ("X-Platform".to_string(), "win32-x64".to_string()),
+        ("X-Client-Language".to_string(), "zh-CN".to_string()),
+        ("X-Client-Timezone".to_string(), "Asia/Shanghai".to_string()),
+        ("X-Os-Category".to_string(), "windows".to_string()),
     ];
     if let Some(mid) = device_mid {
         if !mid.is_empty() {
-            hs.push(("X-Device-Id".to_string(), mid.to_string()));
+            // 官方头是 X-Device-Mid（网关旧实现误用 X-Device-Id）
+            hs.push(("X-Device-Mid".to_string(), mid.to_string()));
         }
     }
     hs
@@ -442,12 +452,20 @@ pub const MINIMAX_ANTHROPIC_PATH: &str = "/mavis/api/v1/llm/v1/messages";
 
 /// MiniMax chat 请求头（凭据：MMOAT OAuth token 或 API key）
 pub fn minimax_chat_headers(token: &str) -> Vec<(String, String)> {
+    // 逐字对齐 MiniMax Code 客户端（asar 逆向：buildLocalProviderHeaders + managed identity）
+    let session_id = uuid::Uuid::new_v4().to_string();
+    let agent_id = uuid::Uuid::new_v4().to_string();
     vec![
         ("Authorization".to_string(), format!("Bearer {token}")),
         ("x-api-key".to_string(), token.to_string()),
         ("anthropic-version".to_string(), "2023-06-01".to_string()),
         ("Content-Type".to_string(), "application/json".to_string()),
         ("Accept".to_string(), "application/json".to_string()),
+        ("User-Agent".to_string(), "MiniMaxAgent".to_string()),
+        ("X-Mavis-Session-Id".to_string(), session_id),
+        ("X-Mavis-Agent-Id".to_string(), agent_id),
+        ("X-Mavis-Timezone-Offset".to_string(), "-28800".to_string()),
+        ("X-Mavis-Turn-Phase".to_string(), "initial".to_string()),
     ]
 }
 
