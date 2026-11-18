@@ -854,6 +854,12 @@ async fn gateway_delete_rule(id: String) -> Result<(), String> {
 }
 
 fn main() {
+    // panic 日志（崩溃排查）
+    std::panic::set_hook(Box::new(|info| {
+        let log = format!("[PANIC] {}\ncontext: codearts gateway request", info);
+        let _ = std::fs::write("E:/auto_change/_shots/credit-rs-panic.log", &log);
+        eprintln!("{}", log);
+    }));
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .on_window_event(|window, event| {
