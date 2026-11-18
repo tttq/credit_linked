@@ -174,6 +174,12 @@ pub async fn ops_request(c: &Cred, desktop: bool, method: Method, path: &str, qu
     let st = c.meta.get("security_token").and_then(|a| a.as_str());
     let body_str = if body.is_null() { String::new() } else { serde_json::to_string(&body).unwrap_or_default() };
     let mut base_headers: Vec<(String, String)> = vec![("content-type".into(), "application/json".into())];
+    // 官方客户端（asar）：X-Security-Token 每请求携带（HWS 网关校验会话有效性）
+    if let Some(tok) = st {
+        if !tok.is_empty() {
+            base_headers.push(("X-Security-Token".into(), tok.to_string()));
+        }
+    }
     if desktop {
         base_headers.push(("agent-type".into(), "PromptCenter".into()));
         base_headers.push(("x-language".into(), "zh-cn".into()));
@@ -336,11 +342,28 @@ impl Adapter for CodeArtsAdapter {
             ("refresh_token", rt),
             ("client_id", if self.desktop { "codearts" } else { "codearts-agent" }),
         ], &jwk).await?;
+        // 错误响应（refresh_token 轮换作废等）
+        if let Some(ec) = v.get("error_code").and_then(|e| e.as_str()) {
+            let msg = v.get("error_msg").and_then(|m| m.as_str()).unwrap_or("STS refresh failed");
+            let auth = ec.contains("1806") || msg.contains("refresh token");
+            return Err(if auth {
+                PlatformError::Auth
+            } else {
+                PlatformError::Format(format!("STS {ec}: {msg}"))
+            });
+        }
         let mut out = c.clone();
         if let Some(cred) = v.get("credentials") {
             out.meta["access_key_id"] = cred.get("access_key_id").cloned().unwrap_or(Value::Null);
             out.meta["secret_access_key"] = cred.get("secret_access_key").cloned().unwrap_or(Value::Null);
             out.meta["security_token"] = cred.get("security_token").cloned().unwrap_or(Value::Null);
+        }
+        // refresh_token 一次性轮换：新 RT 必须保存，否则旧 RT 立即作废
+        if let Some(nrt) = v.get("refresh_token").and_then(|r| r.as_str()) {
+            out.meta["refresh_token"] = json!(nrt);
+        }
+        if let Some(exp) = v.get("expires_at").and_then(|e| e.as_str()) {
+            out.expires_at = Some(exp.to_string());
         }
         Ok(out)
     }
