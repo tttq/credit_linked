@@ -816,6 +816,32 @@ fn find_node() -> Result<String, PlatformError> {
             if out.status.success() { return Ok(name.to_string()); }
         }
     }
+    // GUI 进程 PATH 可能缺 node —— 探测常见安装位置
+    let local = std::env::var("LOCALAPPDATA").unwrap_or_default();
+    let mut candidates = vec![
+        "C:/Program Files/nodejs/node.exe".to_string(),
+        "D:/ProgramFiles/develop/nodejs/node.exe".to_string(),
+        format!("{local}/Programs/nodejs/node.exe"),
+        "C:/nvm4w/nodejs/node.exe".to_string(),
+        "D:/ProgramFiles/develop/nvm/nodejs/node.exe".to_string(),
+    ];
+    // nvm 管理的版本目录（nodejs symlink 常指向它）
+    if let Ok(entries) = std::fs::read_dir("D:/ProgramFiles/develop/nvm") {
+        for e in entries.filter_map(|e| e.ok()) {
+            if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                if e.file_name().to_string_lossy().starts_with('v') {
+                    candidates.push(format!("D:/ProgramFiles/develop/nvm/{}/node.exe", e.file_name().to_string_lossy()));
+                }
+            }
+        }
+    }
+    for c in candidates {
+        if std::path::Path::new(&c).exists() {
+            if let Ok(out) = std::process::Command::new(&c).arg("--version").output() {
+                if out.status.success() { return Ok(c); }
+            }
+        }
+    }
     Err(PlatformError::Local("node.js not found; install Node.js or set NODE_BIN".into()))
 }
 
