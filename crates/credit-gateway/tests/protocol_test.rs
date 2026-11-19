@@ -137,6 +137,52 @@ fn test_all_platforms_relay_body_and_tools() {
 
 /// 上游不发结束帧就断开（长任务常见故障）：解析器不 panic，工具分片事件完整保留；
 /// 参数修复与 finish_reason 补发由网关收尾流（stream_response 的 close 流）负责。
+/// ZCode Start Plan 端点的「仅官方客户端」闸门（code=3012）回归测试。
+///
+/// 2026-11-19 实测：服务端同时要求
+///   ① 请求头 `X-ZCode-App-Version` == 当前客户端版本（3.18.2）
+///   ② 请求体 `system` 前两块是官方 CLI 固定文本块（顺序不可颠倒）
+/// 任一不满足 → HTTP 405 / code=3012。缺 system / 少一块 / 顺序颠倒都已被实测拒绝。
+#[test]
+fn test_zcode_start_plan_system_blocks_gate() {
+    use credit_gateway::protocol::{
+        zcode_plan_chat_headers, zcode_start_plan_system_blocks,
+        ZCODE_SYSTEM_CLI_PREFIX, ZCODE_SYSTEM_IDENTITY,
+    };
+
+    // ① system 块：前两块必须是官方固定文本
+    let blocks = zcode_start_plan_system_blocks("");
+    assert_eq!(blocks.len(), 2, "无用户 system 时应只有官方两块");
+    assert_eq!(blocks[0]["text"], ZCODE_SYSTEM_CLI_PREFIX);
+    assert_eq!(blocks[1]["text"], ZCODE_SYSTEM_IDENTITY);
+    assert_eq!(blocks[0]["cache_control"]["type"], "ephemeral");
+    assert_eq!(blocks[0]["type"], "text");
+
+    // 用户 system 追加为第 3 块（不破坏前两块顺序）
+    let blocks3 = zcode_start_plan_system_blocks("你是助手");
+    assert_eq!(blocks3.len(), 3);
+    assert_eq!(blocks3[0]["text"], ZCODE_SYSTEM_CLI_PREFIX);
+    assert_eq!(blocks3[1]["text"], ZCODE_SYSTEM_IDENTITY);
+    assert_eq!(blocks3[2]["text"], "你是助手");
+
+    // 空白用户 system 不应产生空块
+    assert_eq!(zcode_start_plan_system_blocks("   ").len(), 2);
+
+    // ② 请求头：版本头必须是 3.18.2，且带认证
+    let hs = zcode_plan_chat_headers("JWT_TOKEN", "MID");
+    let get = |k: &str| hs.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone()).unwrap_or_default();
+    assert_eq!(get("x-zcode-app-version"), "3.18.2");
+    assert_eq!(get("authorization"), "Bearer JWT_TOKEN");
+    assert_eq!(get("x-api-key"), "JWT_TOKEN");
+    assert_eq!(get("x-device-mid"), "MID");
+    assert_eq!(get("anthropic-version"), "2023-06-01");
+
+    // ③ 身份块文本不能为空，且 Identity 块必须以换行开头（官方 lJa 的拼接语义）
+    assert!(!ZCODE_SYSTEM_CLI_PREFIX.is_empty());
+    assert!(ZCODE_SYSTEM_IDENTITY.starts_with('\n'));
+    assert!(ZCODE_SYSTEM_IDENTITY.contains("# Harness"));
+}
+
 #[test]
 fn test_stream_ends_without_done_frame_keeps_tool_events() {
     use credit_gateway::upstream::{parse_openai_chunk, StreamEvent};

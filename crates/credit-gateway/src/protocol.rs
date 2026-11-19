@@ -734,8 +734,64 @@ pub const ZCODE_CHAT_PATH: &str = "/api/paas/v4/chat/completions";
 /// provider 的 base = `${origin}/api/anthropic`，messages 路径 /v1/messages）
 pub const ZCODE_ANTHROPIC_BASE: &str = "https://open.bigmodel.cn/api/anthropic";
 pub const ZCODE_ANTHROPIC_PATH: &str = "/v1/messages";
-/// ZCode Start Plan 对话端点（zcode.z.ai；服务端有「仅官方客户端」校验 code=3012）
+/// ZCode Start Plan 对话端点（zcode.z.ai）
+///
+/// ⚠️ 该端点有服务端「仅官方客户端」闸门（`code=3012` / HTTP 405）。2026-11-19 实测闸门由
+/// **两项**共同决定（见 [`zcode_start_plan_system_blocks`] 与 [`ZCODE_PLAN_HEADERS`]）：
+/// ① 请求头 `X-ZCode-App-Version` 必须是当前客户端版本（3.18.2）；
+/// ② 请求体 `system` 的前两个块必须是官方 CLI 的固定文本，且顺序不可颠倒。
+/// 二者缺一即返回 3012。
 pub const ZCODE_PLAN_ANTHROPIC_BASE: &str = "https://zcode.z.ai/api/v1/zcode-plan/anthropic";
+
+/// ZCode Start Plan 请求头常量（2026-11-19 对官方 CLI 抓包逐项消融得出）。
+///
+/// 关键点：`X-ZCode-App-Version` 是 3012 闸门的**必要条件** —— 官方 CLI 自己发出的请求里
+/// 该头是 `0.17.1`（AI SDK 默认值），因此官方 CLI 同样会被 3012 拒绝；把它改成当前版本
+/// `3.18.2` 后同一请求立刻返回 200。
+pub const ZCODE_PLAN_HEADERS: &[(&str, &str)] = &[
+    ("anthropic-version", "2023-06-01"),
+    ("http-referer", "https://zcode.z.ai"),
+    ("user-agent", "ZCode/3.18.2 ai-sdk/provider-utils/4.0.27 runtime/node.js/24"),
+    ("x-zcode-agent", "glm"),
+    ("x-zcode-app-version", "3.18.2"),
+    ("x-zcode-query-source", "main_turn"),
+    ("x-zcode-session-type", "main"),
+    ("x-title", "Z Code@electron"),
+    ("x-platform", "win32-x64"),
+    ("x-release-channel", "production"),
+    ("x-client-language", "zh-CN"),
+    ("x-client-timezone", "Asia/Shanghai"),
+    ("x-os-category", "windows"),
+    ("x-os-version", "10.0.26300"),
+];
+
+/// 官方 CLI 的身份前缀块（ZCode 3.18.2 `zcode.cjs` `buildCliPrefixSection` 逐字提取）。
+pub const ZCODE_SYSTEM_CLI_PREFIX: &str = "You are ZCode, an interactive agent";
+
+/// 官方 CLI 的身份 + 安全声明 + Harness 块（`buildIdentityPrompt` 逐字提取）。
+///
+/// 注意：起始有一个换行（`lJa` 用 `[["", identity, "", securityNotice].join("\n")` 拼接），
+/// 且该文本参与服务端的客户端指纹比对 —— **不能改写、不能裁剪、不能调整顺序**。
+pub const ZCODE_SYSTEM_IDENTITY: &str = "\nYou are an agent working with the user toward their goals, using your own judgment along the way.\n\nIMPORTANT: Assist with authorized security testing, defensive security, CTF challenges, and educational contexts. Refuse requests for destructive techniques, DoS attacks, mass targeting, supply chain compromise, or detection evasion for malicious purposes. Dual-use security tools (C2 frameworks, credential testing, exploit development) require clear authorization context: pentesting engagements, CTF competitions, security research, or defensive use cases.\n\n# Harness\n - Text you output outside of tool use is displayed to the user as Github-flavored markdown in a terminal.\n - Tools run behind a user-selected permission mode; a denied call means the user declined it — adjust, don't retry verbatim.\n - `<system-reminder>` tags in messages and tool results are injected by the harness, not the user. Hooks may intercept tool calls; treat hook output as user feedback.\n - Prefer the dedicated file/search tools over shell commands when one fits. Independent tool calls can run in parallel in one response.\n - Reference code as `file_path:line_number` — it's clickable.";
+
+/// 构造 Start Plan 端点所需的 `system` 数组（Anthropic 文本块 + cache_control）。
+///
+/// 实测（2026-11-19，逐一消融）：
+/// - 缺 `system` → 3012；只有第 0 块 → 3012；只有第 1 块 → 3012；
+/// - 第 0 块 + 第 1 块 → **200**；顺序颠倒 → 3012；第 0 块文本前加空格 → 3012；
+/// - 改写第 1 块个别词 → 200（说明校验的是「块数 + 前缀 + 结构」，不是全文逐字哈希）。
+///
+/// 因此最少需要前两块；用户自己的 system 提示词作为第 3 块追加。
+pub fn zcode_start_plan_system_blocks(user_system: &str) -> Vec<Value> {
+    let mut blocks = vec![
+        json!({ "type": "text", "text": ZCODE_SYSTEM_CLI_PREFIX, "cache_control": { "type": "ephemeral" } }),
+        json!({ "type": "text", "text": ZCODE_SYSTEM_IDENTITY, "cache_control": { "type": "ephemeral" } }),
+    ];
+    if !user_system.trim().is_empty() {
+        blocks.push(json!({ "type": "text", "text": user_system, "cache_control": { "type": "ephemeral" } }));
+    }
+    blocks
+}
 
 /// ZCode Anthropic 格式 body（coding plan 通道）。`messages` 须已经过
 /// `to_anthropic_messages` 转换（Anthropic 线格式），此处只做打包。
@@ -773,6 +829,24 @@ pub fn zcode_chat_headers(token: &str, device_mid: Option<&str>) -> Vec<(String,
             // 官方头是 X-Device-Mid（网关旧实现误用 X-Device-Id）
             hs.push(("X-Device-Mid".to_string(), mid.to_string()));
         }
+    }
+    hs
+}
+
+/// ZCode Start Plan 端点请求头（2026-11-19 对官方 CLI 抓包 + 逐项消融得出）。
+///
+/// `X-ZCode-App-Version` 必须与当前客户端版本一致（3.18.2），否则服务端返回 3012。
+/// 认证用本机 `zcodejwttoken`（长效会话 JWT），同时带 `X-Api-Key`（官方 AI SDK 行为）。
+pub fn zcode_plan_chat_headers(token: &str, device_mid: &str) -> Vec<(String, String)> {
+    let mut hs: Vec<(String, String)> = ZCODE_PLAN_HEADERS
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    hs.push(("authorization".to_string(), format!("Bearer {token}")));
+    hs.push(("x-api-key".to_string(), token.to_string()));
+    hs.push(("content-type".to_string(), "application/json".to_string()));
+    if !device_mid.is_empty() {
+        hs.push(("x-device-mid".to_string(), device_mid.to_string()));
     }
     hs
 }

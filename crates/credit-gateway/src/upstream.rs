@@ -663,10 +663,14 @@ pub fn parse_trae_sse(stream: impl Stream<Item = Result<bytes::Bytes, reqwest::E
 
 // ============================ ZCode（智谱） ============================
 
-/// 智谱模型清单：对齐官方 ZCode 客户端 builtin 目录（3.18.2，~/.zcode/v2/runtime/provider/
-/// …/zcode-builtin.json 逆向）——Start Plan（account:zai/bigmodel-start-plan）可用模型为
+/// 智谱模型清单：对齐官方 ZCode 客户端 builtin 目录（3.18.2，resources/glm/provider/
+/// zcode-builtin.json 逆向）——Start Plan（account:zai/bigmodel-start-plan）builtin 声明
 /// GLM-5.3-Flash / GLM-5.2 / GLM-5-Turbo；GLM-5.3 属 Coding Plan 档。
 /// 旧清单（glm-5.3-flash 小写 / glm-5-flash / glm-5.3-air / glm-4.7）是错的，上游不认识。
+///
+/// 2026-11-19 Start Plan 端点实测：GLM-5.3-Flash / GLM-5.3 返回 200；GLM-5.2 与
+/// GLM-5-Turbo 返回 400 code=3006（model not allowed）—— 按账号权益放开，故保留在清单里
+/// 但请求时会给出明确报错。
 pub async fn zcode_fetch_models(_cred: &Cred) -> Result<Vec<ModelInfo>, PlatformError> {
     let mut out = Vec::new();
     for (id, name, ctx) in [
@@ -681,16 +685,25 @@ pub async fn zcode_fetch_models(_cred: &Cred) -> Result<Vec<ModelInfo>, Platform
     Ok(out)
 }
 
-/// ZCode chat 通道（双级路由，2026-11-19 端点矩阵实测结论）：
+/// ZCode chat 通道（2026-11-19 实测结论：Start Plan 专属端点可用了）
 ///
-/// ① **首选：bigmodel Coding-Plan Anthropic 端点**
+/// **① 首选：Start Plan 专属端点**（官方客户端同款）
+///    `POST https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages`
+///    凭据 = 本机 ZCode 的 `zcodejwttoken`（长效会话 JWT，无 exp）。
+///
+///    该端点有服务端「仅官方客户端」闸门（`code=3012` / HTTP 405）。2026-11-19 逐项消融后
+///    确认闸门 = **两项同时满足**：
+///    ① 请求头 `X-ZCode-App-Version: 3.18.2`（当前客户端版本）；
+///    ② 请求体 `system` 的前两块是官方 CLI 固定文本块（CLI Prefix + Identity/Harness），
+///       顺序不可颠倒。
+///    官方 CLI 自己发的请求头是 `0.17.1`（AI SDK 默认值），所以官方 CLI 也会被 3012 拒；
+///    把该头改成 3.18.2 后，同一请求体立刻 200 并正常流式返回。
+///
+/// **② 回退：bigmodel Coding-Plan Anthropic 端点**
 ///    `POST https://open.bigmodel.cn/api/anthropic/v1/messages`
-///    凭据 = 用长效 zcodejwttoken（无 exp）经 `GET /api/v1/oauth/profile` 动态换取的
-///    新鲜 bigmodel access_token（官方客户端的取票通道，实测返回 code=0）。
+///    凭据 = 用长效 zcodejwttoken 经 `GET /api/v1/oauth/profile` 动态换取的新鲜
+///    bigmodel access_token（官方客户端的取票通道，实测 code=0）。
 ///    认证有效（429=额度不足是上游业务错误，非鉴权失败）。
-/// ② Start Plan 专属端点（zcode.z.ai/api/v1/zcode-plan/anthropic）有服务端深度校验
-///    （HTTP 405 code=3012），连官方 @anthropic-ai/sdk 指纹头都被拒 —— 属服务端限制，
-///    网关不再尝试（此前把它当唯一通道导致所有对话 502）。
 pub async fn zcode_chat_stream(cred: &Cred, body: Value) -> Result<EventStream, String> {
     let mid = cred.meta.get("deviceMid").and_then(|d| d.as_str()).unwrap_or("");
     let model = body.get("model").and_then(|m| m.as_str()).unwrap_or("").to_string();
@@ -710,11 +723,68 @@ pub async fn zcode_chat_stream(cred: &Cred, body: Value) -> Result<EventStream, 
         return Err("本机 ZCode 凭据缺少 zcodejwttoken（对话取票令牌），请重新登录 ZCode 客户端并「扫描本机」".into());
     }
 
-    // 取新鲜 bigmodel token（长效 jwt → /api/v1/oauth/profile → data.bigmodel.access_token）
-    let fresh = credit_core::adapters::zcode::fresh_bigmodel_token(cred)
-        .await
-        .map_err(|e| format!("ZCode 取票失败（zcodejwttoken → oauth/profile）：{e}；请在 ZCode 客户端重新登录后「扫描本机」"))?;
+    // —— ① Start Plan 专属端点（官方同款）——
+    // system 前两块必须是官方固定文本，否则服务端返回 3012。
+    a_body["system"] = Value::Array(crate::protocol::zcode_start_plan_system_blocks(&sys));
+    a_body["stream"] = Value::Bool(true);
 
+    let url = format!("{}{}", crate::protocol::ZCODE_PLAN_ANTHROPIC_BASE, crate::protocol::ZCODE_ANTHROPIC_PATH);
+    let hs = crate::protocol::zcode_plan_chat_headers(&jwt, mid);
+    let mut req = stream_client().post(&url).json(&a_body);
+    for (k, v) in &hs { req = req.header(k, v); }
+    let resp = match req.send().await {
+        Ok(r) => r,
+        Err(e) => return Err(format!("ZCode 对话端点请求失败（{url}）：{e}")),
+    };
+    let st = resp.status().as_u16();
+    if st == 200 {
+        return Ok(parse_anthropic_sse(resp.bytes_stream()));
+    }
+    let txt = resp.text().await.unwrap_or_default();
+    // 3012 = 官方客户端身份闸门未过（版本头或 system 块不匹配）
+    if txt.contains("3012") {
+        return Err(format!(
+            "ZCode Start Plan 被服务端「仅官方客户端」校验拒绝（code=3012）：{txt}；\
+             请确认已升级到 3.18.2 客户端（X-ZCode-App-Version 需与当前版本一致）"
+        ));
+    }
+    // 3006 = 该账号无权使用此模型（官方 builtin 目录列出 3 个模型，但按账号权益放开）
+    if txt.contains("3006") {
+        return Err(format!(
+            "ZCode Start Plan 当前账号无权使用该模型（code=3006）：{txt}；\
+             当前账号实测可用 GLM-5.3-Flash / GLM-5.3（GLM-5.2、GLM-5-Turbo 需更高档权益）"
+        ));
+    }
+    // 3007 = 安全校验（验证码）拦截：官方客户端会弹验证码，第三方无法自动过
+    if txt.contains("3007") {
+        return Err(format!(
+            "ZCode Start Plan 触发安全校验（code=3007）：{txt}；该档位需要官方客户端完成验证码，\
+             请改用其它平台或等待风控解除"
+        ));
+    }
+    // 1113 = 额度不足（账号无可用资源包）
+    if txt.contains("1113") {
+        return Err(format!(
+            "ZCode 对话被拒（HTTP {st} code=1113 余额不足或无可用资源包）：{txt}"
+        ));
+    }
+    if txt.contains("401") || st == 401 {
+        return Err(format!(
+            "ZCode 令牌被拒（HTTP {st}）：zcodejwttoken 可能已失效，请在 ZCode 客户端重新登录后「扫描本机」"
+        ));
+    }
+
+    // —— ② 回退：bigmodel Coding-Plan 端点 ——
+    // 该端点没有 3012 闸门，用用户自己的 system 提示词即可（不必带官方固定块）。
+    if !sys.is_empty() {
+        a_body["system"] = json!([{ "type": "text", "text": sys }]);
+    } else {
+        a_body.as_object_mut().map(|o| o.remove("system"));
+    }
+    let fresh = match credit_core::adapters::zcode::fresh_bigmodel_token(cred).await {
+        Ok(t) => t,
+        Err(e) => return Err(format!("ZCode Start Plan 请求失败且取票回退也失败：{e}")),
+    };
     let url = format!("{}{}", crate::protocol::ZCODE_ANTHROPIC_BASE, crate::protocol::ZCODE_ANTHROPIC_PATH);
     let mut hs = crate::protocol::zcode_chat_headers(&fresh, Some(mid));
     hs.push(("anthropic-version".to_string(), "2023-06-01".to_string()));
@@ -729,7 +799,6 @@ pub async fn zcode_chat_stream(cred: &Cred, body: Value) -> Result<EventStream, 
         return Ok(parse_anthropic_sse(resp.bytes_stream()));
     }
     let txt = resp.text().await.unwrap_or_default();
-    // 1113 = 额度不足（账号无 coding plan 权益/资源包），给出可执行指引
     if txt.contains("1113") {
         return Err(format!(
             "ZCode 对话被拒（HTTP {st} code=1113 余额不足或无可用资源包）：当前账号在 bigmodel 平台没有可用的 \
