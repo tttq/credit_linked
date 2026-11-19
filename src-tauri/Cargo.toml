@@ -14,6 +14,8 @@ anyhow.workspace = true
 
 # regex 用于解析 MiniMax 官网最新版直链
 regex = "1"
+# winreg 用于检测本机已安装软件（Uninstall 注册表），替代慢的 powershell 子进程
+winreg = "0.55"
 reqwest = { workspace = true, features = ["json"] }
 
 [build-dependencies]

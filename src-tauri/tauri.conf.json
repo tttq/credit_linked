@@ -34,6 +34,9 @@
     "targets": [
       "nsis"
     ],
+    "resources": [
+      "../crates/credit-gateway/sidecar/*"
+    ],
     "icon": [
       "icons/icon.ico",
       "icons/icon.png"

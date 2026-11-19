@@ -128,12 +128,12 @@ impl Platform {
         }
     }
 
-    /// 该平台是否有可用 chat 通道（false = 只保留签到/额度，网关路由时明确报错）
+    /// 该平台是否有可用 chat 通道
     pub fn chat_capable(&self) -> bool {
         matches!(self,
             Platform::WorkBuddy | Platform::WorkBuddyIntl
             | Platform::Trae | Platform::TraeEnterprise | Platform::TraeIntl
-            | Platform::Zcode | Platform::Minimax | Platform::Qoder)
+            | Platform::Zcode | Platform::Minimax | Platform::Qoder | Platform::CodeArts)
     }
 
 }
@@ -256,9 +256,10 @@ pub fn trae_version_code(build_version: Option<&str>) -> String {
     }
 }
 
-/// Trae chat 请求头（对齐 buildTraeHeaders 的 agent-task profile）
+/// Trae 对话请求头（对齐 dsh-connect-trae buildTraeHeaders，SOLO 通道需要 x-uid/请求 id）
 /// identity: machine_id / device_id / build_version / app_version 均来自凭据 meta（本机扫描或登录时入库）
 pub fn trae_chat_headers(token: &str, meta: &Value) -> Vec<(String, String)> {
+    let uid = meta.get("uid").and_then(|v| v.as_str()).unwrap_or("");
     let request_id = uuid::Uuid::new_v4().to_string();
     let trace_id: String = request_id.replace('-', "").chars().take(32).collect();
     let machine_id = meta.get("machineId").and_then(|v| v.as_str()).unwrap_or("");
@@ -283,10 +284,15 @@ pub fn trae_chat_headers(token: &str, meta: &Value) -> Vec<(String, String)> {
         ("x-os-version".to_string(), os_version.to_string()),
         ("x-app-version-code".to_string(), version_code.clone()),
         ("x-ide-version-code".to_string(), version_code),
+        ("x-app-version".to_string(), app_version.clone()),
+        ("x-ide-version".to_string(), app_version.clone()),
+        ("x-ide-version-type".to_string(), "stable".to_string()),
         ("x-custom-trace-id".to_string(), trace_id.clone()),
         ("x-flow-traceparent".to_string(), format!("04-{trace_id}-{}-01", &trace_id[..16.min(trace_id.len())])),
         ("request-traffic-type".to_string(), "prod".to_string()),
-        ("Content-Type".to_string(), "application/json".to_string()),
+        ("x-uid".to_string(), uid.to_string()),
+        ("x-request-id".to_string(), request_id.clone()),
+        ("x-trae-request-id".to_string(), request_id),
         ("Accept".to_string(), "text/event-stream".to_string()),
     ]
 }
@@ -309,14 +315,16 @@ pub fn trae_remote_headers(token: &str, intl: bool) -> Vec<(String, String)> {
     ]
 }
 
-/// Trae chat body（对齐 prepareSoloBody 的 SOLO 形状 + 企业路由补 session_id）
-pub fn trae_chat_body(messages: &[Value], model: &str, max_tokens: Option<u32>, reasoning_effort: Option<&str>, enterprise: bool) -> Value {
+/// Trae chat body（对齐 prepareSoloBody 的 SOLO 形状 + 企业路由补 session_id）。
+/// `function` 必须与模型所属通道一致：模型只在列出它的 function 下可调用
+/// （如 glm-5.3 在 CN 上仅 solo_work_remote 提供），映射来自模型目录。
+pub fn trae_chat_body(messages: &[Value], model: &str, function: &str, max_tokens: Option<u32>, reasoning_effort: Option<&str>, enterprise: bool) -> Value {
     let request_id = uuid::Uuid::new_v4().to_string();
     let mut body = json!({
         "messages": messages,
         "model": model,
         "config_name": model,
-        "function": "solo_work_lite",
+        "function": if function.is_empty() { "solo_work_lite" } else { function },
         "stream": true,
         "request_id": request_id,
         "session_id": request_id,
@@ -409,6 +417,39 @@ pub fn wb_chat_body(messages: &[Value], system: &str, model: &str, max_tokens: O
 pub const ZCODE_CHAT_BASE: &str = "https://open.bigmodel.cn";
 /// 智谱 chat 路径（OpenAI 兼容）
 pub const ZCODE_CHAT_PATH: &str = "/api/paas/v4/chat/completions";
+/// ZCode coding plan 走 Anthropic 兼容端点（asar 逆向：bigmodel/zai *CodingPlan / *StartPlan
+/// provider 的 base = `${origin}/api/anthropic`，messages 路径 /v1/messages）
+pub const ZCODE_ANTHROPIC_BASE: &str = "https://open.bigmodel.cn/api/anthropic";
+pub const ZCODE_ANTHROPIC_PATH: &str = "/v1/messages";
+/// ZCode Start Plan 对话端点（zcode.z.ai；服务端有「仅官方客户端」校验 code=3012）
+pub const ZCODE_PLAN_ANTHROPIC_BASE: &str = "https://zcode.z.ai/api/v1/zcode-plan/anthropic";
+
+/// ZCode Anthropic 格式 body（coding plan 通道）
+pub fn zcode_anthropic_body(messages: &[Value], system: &str, model: &str, max_tokens: Option<u32>) -> Value {
+    let mut msgs: Vec<Value> = Vec::new();
+    for m in messages {
+        let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("user").to_string();
+        let content = match m.get("content") {
+            Some(Value::String(s)) => s.clone(),
+            Some(Value::Array(arr)) => arr.iter()
+                .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+                .collect::<Vec<_>>().join("\n"),
+            _ => String::new(),
+        };
+        if role == "system" { continue; }
+        msgs.push(json!({ "role": role, "content": content }));
+    }
+    let mut body = json!({
+        "model": model,
+        "messages": msgs,
+        "max_tokens": max_tokens.unwrap_or(4096),
+        "stream": true,
+    });
+    if !system.is_empty() {
+        body["system"] = json!(system);
+    }
+    body
+}
 
 /// ZCode chat 请求头：凭据即智谱 access_token；deviceMid 可选
 pub fn zcode_chat_headers(token: &str, device_mid: Option<&str>) -> Vec<(String, String)> {
@@ -591,4 +632,49 @@ pub fn qoder_chat_body(messages: &[Value], model: &str) -> Value {
         "request_id": request_id,
     })
 }
+
+// ============================ CodeArts（华为码道）============================
+
+/// 码道 chat 端点（product.json inferhubBaseUrl；主域失败 fallback .cn 域）
+pub const CODEARTS_CHAT_BASE: &str = "https://snap-access.cn-north-4.myhuaweicloud.com";
+pub const CODEARTS_CHAT_BASE_FALLBACK: &str = "https://snap-access.cn-north-4.myhuaweicloud.cn";
+/// kernel 头白名单 maas_type 用（benefit/education 渠道），默认对话不带
+pub const CODEARTS_CLIENT_VERSION: &str = "0.2.9";
+
+/// 码道 chat body：OpenAI 兼容 + stream_options.include_usage + enable_thinking
+/// （kernel chat_core.rs 逆向：无 sessionId/agentId，多轮靠完整 messages 重发）
+pub fn codearts_chat_body(messages: &[Value], system: &str, model: &str, max_tokens: Option<u32>, reasoning_effort: Option<&str>) -> Value {
+    let mut msgs: Vec<Value> = Vec::new();
+    if !system.is_empty() {
+        msgs.push(json!({ "role": "system", "content": system }));
+    }
+    for m in messages {
+        let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("user").to_string();
+        // content 展平为字符串（OpenAI 线格式 string content）
+        let content = match m.get("content") {
+            Some(Value::String(s)) => s.clone(),
+            Some(Value::Array(arr)) => arr.iter()
+                .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+                .collect::<Vec<_>>().join("\n"),
+            _ => String::new(),
+        };
+        if role == "system" && !system.is_empty() { continue; } // 已注入首条
+        msgs.push(json!({ "role": role, "content": content }));
+    }
+    let mut body = json!({
+        "model": model,
+        "messages": msgs,
+        "stream": true,
+        "stream_options": { "include_usage": true },
+    });
+    if let Some(mt) = max_tokens {
+        body["max_tokens"] = json!(mt);
+    }
+    // enable_thinking：off/none 关闭，其余开启（kernel fast-model 注入逻辑）
+    body["enable_thinking"] = json!(!matches!(reasoning_effort, Some("off") | Some("none")));
+    body
+}
+
+// 码道 chat 请求头在 upstream::codearts_chat_stream 内构造（需要 Cred 全量字段）
+// 此处仅保留 body 构造。
 

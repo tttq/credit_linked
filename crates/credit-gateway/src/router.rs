@@ -45,6 +45,19 @@ impl Router {
         Platform::parse(&v).unwrap_or(Platform::WorkBuddy)
     }
 
+    /// 当前平台的原始选择（保留 codearts-desktop / codearts 通道区分）
+    pub fn current_platform_raw(&self) -> String {
+        let v = self.store.get_setting("gw_platform", "workbuddy").unwrap_or_default();
+        if Platform::parse(&v).is_some() { v } else { "workbuddy".into() }
+    }
+
+    /// 按原始字符串持久化（desktop/IDE 通道区分保留）
+    pub fn set_current_platform_str(&self, s: &str) {
+        if Platform::parse(s).is_some() {
+            let _ = self.store.set_setting("gw_platform", s);
+        }
+    }
+
     pub fn set_current_platform(&self, p: Platform) {
         let _ = self.store.set_setting("gw_platform", p.as_str());
     }

@@ -69,7 +69,9 @@ function platMeta(p) { return PLAT[p] || { color: '#456' }; }
 function picon(p, cls) {
   const m = platMeta(p);
   const iconFile = { trae: 'trae.png', workbuddy: 'workbuddy.jpg', minimax: 'minimax.png', qoder: 'qoder.png', codearts: 'codearts.svg', 'codearts-desktop': 'codearts-desktop.png', doubao: 'doubao.ico', zcode: null }[p];
-  if (iconFile) return '<img class="picon ' + (cls || '') + '" style="width:26px;height:26px;border-radius:7px;object-fit:cover;flex:0 0 auto" src="platforms/' + iconFile + '" onerror="this.outerHTML=piconFallback(\'' + p + '\',\'' + (cls || '') + '\')">';
+  // svg 无固有位图尺寸，object-fit:cover 不生效会撑破容器 —— svg 用 contain
+  const fit = iconFile && iconFile.endsWith('.svg') ? 'contain' : 'cover';
+  if (iconFile) return '<img class="picon ' + (cls || '') + '" style="width:26px;height:26px;border-radius:7px;object-fit:' + fit + ';flex:0 0 auto" src="platforms/' + iconFile + '" onerror="this.outerHTML=piconFallback(\'' + p + '\',\'' + (cls || '') + '\')">';
   return piconFallback(p, cls);
 }
 function piconFallback(p, cls) {
@@ -426,7 +428,8 @@ const GW_PLATFORMS = {
   'zcode':            { label: 'ZCode (智谱)', provider: 'zcode', chat: true },
   'minimax':          { label: 'MiniMax', provider: 'minimax', chat: true },
   'qoder':            { label: 'Qoder', provider: 'qoder', chat: true },
-  'codearts':         { label: '华为码道', provider: 'codearts', chat: false },
+  'codearts':         { label: '华为码道 (IDE)', provider: 'codearts', chat: false },
+  'codearts-desktop': { label: '码道桌面', provider: 'codearts-desktop', chat: false },
 };
 let GW_STATUS = null;
 
@@ -455,7 +458,14 @@ async function refreshGatewayAccounts() {
     b.disabled = true;
     try {
       await invoke('gateway_switch_account', { accountRef: b.dataset.ref });
-      toast('已手动切换账号');
+      // 切换后立即用新账号拉一次余额，验证凭据可用 + 让用户看到切换生效
+      const [prov, uid] = b.dataset.ref.split(':');
+      let verify = '';
+      try {
+        const q = await invoke('quota_refresh', { provider: prov, uid });
+        verify = q.remaining != null ? (' · 余额 ' + fmt(q.remaining)) : '';
+      } catch (e) { verify = ' · 凭据校验失败: ' + String(e).slice(0, 80); }
+      toast('已切换账号（网关请求将使用该账号）' + verify, 4200);
       await refreshGatewayAccounts();
     } catch (e) { toast('切换失败: ' + e, 4200); b.disabled = false; }
   }));
@@ -571,7 +581,12 @@ function renderRouting() {
     const next = d.accounts[(cur + 1) % d.accounts.length];
     try {
       await invoke('gateway_switch_account', { accountRef: next.ref });
-      toast('已切换账号：' + next.name);
+      // 同步拉余额验证新账号
+      const [prov, uid] = next.ref.split(':');
+      let verify = '';
+      try { const q = await invoke('quota_refresh', { provider: prov, uid }); verify = q.remaining != null ? (' · 余额 ' + fmt(q.remaining)) : ''; }
+      catch (e) { verify = ' · 凭据校验失败: ' + String(e).slice(0, 80); }
+      toast('已切换账号：' + next.name + verify, 4200);
       await refreshGatewayAccounts();
     } catch (e) { toast('切换失败: ' + e, 4200); }
   });
@@ -625,11 +640,29 @@ function renderRouting() {
     statusEl.textContent = '获取模型中…';
     try {
       const r = await fetch(st.baseUrl + '/v1/models').then(x => x.json());
-      // 当前平台模型（/v1/models 已按当前平台过滤，id 即裸模型 id）
-      const models = (r.data || []).map(m => m.raw_model || m.id);
+      // /v1/models 返回全平台目录：当前平台为裸 id，其它平台为「平台/模型」——直接用 id 作为请求模型
+      const models = (r.data || []).map(m => m.id).filter(Boolean);
       if (!models.length) {
-        modelSel.innerHTML = '<option value="">（当前平台无可用模型 —— 检查账号）</option>';
-        statusEl.textContent = '';
+        modelSel.innerHTML = '<option value="">（无可用模型）</option>';
+        // 码道：STS 可能过期 —— 提供一键同步客户端最新会话
+        if (st.platform === 'codearts' || st.platform === 'codearts-desktop') {
+          statusEl.innerHTML = '码道凭据可能已过期（客户端 refresh 会轮换 STS） <button id="gw-ca-sync" class="small primary" style="margin-left:6px">从客户端同步最新会话</button>';
+          statusEl.querySelector('#gw-ca-sync')?.addEventListener('click', async (ev) => {
+            ev.target.disabled = true; ev.target.textContent = '同步中…';
+            try {
+              const sr = await invoke('codearts_sync_local');
+              if (sr.synced?.length) {
+                toast('已同步 ' + sr.synced.join(' / ') + ' 的最新凭据');
+                fetchModels();
+              } else {
+                toast('客户端里没有登录态 —— 请先在码道客户端登录，或在账号管理「扫描本机」导入');
+              }
+            } catch (e) { toast('同步失败: ' + e, 4200); }
+            ev.target.disabled = false; ev.target.textContent = '从客户端同步最新会话';
+          });
+        } else {
+          statusEl.textContent = '该平台没有可用账号或凭据失效 —— 到账号管理检查';
+        }
         return;
       }
       modelSel.innerHTML = models.map(m => '<option value="' + esc(m) + '">' + esc(m) + '</option>').join('');
@@ -821,7 +854,12 @@ function renderSettings() {
 let TOOLS = null;
 let TOOLS_QUOTA_REFRESHED = false; // 防止 quota 刷新 → 重绘 → 再刷新 的死循环
 async function renderToolsTab(body) {
-  body.innerHTML = '<div class="empty">加载平台信息…</div>';
+  // 立即渲染骨架（每平台一行占位），数据回来后原地更新 —— 不再整页"加载平台信息…"
+  const SKELETON_META = { trae: 'Trae（字节跳动）', workbuddy: 'WorkBuddy / CodeBuddy（腾讯）', minimax: 'MiniMax Code', qoder: 'Qoder', zcode: 'ZCode（智谱）', codearts: '华为云码道' };
+  body.innerHTML = Object.keys(SKELETON_META).map(p =>
+    '<div class="setting-row" data-tool="' + p + '"><div><h3>' + picon(p) + ' ' + SKELETON_META[p] + '</h3><p class="subtle">检测安装状态…</p></div>' +
+    '<div class="actions"><span class="subtle" style="font-size:11.5px">…</span></div></div>').join('') +
+    '<div class="setting-row"><div><h3>安装包下载路径</h3><p class="subtle">…</p></div></div>';
   // 后台探测 MiniMax 直链缓存，不阻塞渲染
   invoke('tools_refresh_minimax_url').catch(() => {});
   if (!TOOLS) {
@@ -856,19 +894,31 @@ async function renderToolsTab(body) {
       const qtxt = it.accounts > 0 ? ' · 已装 ' + it.accounts + ' 个账号' + (it.quotaTotal != null ? ' · 剩余额度 ' + fmt(it.quotaTotal) : '') : ' · 未添加账号';
       return '<div class="setting-row" data-tool="' + it.platform + '"><div><h3>' + picon(it.platform) + ' ' + (meta[it.platform] || it.platform) + '</h3>' +
         '<p>' + (it.direct ? '支持应用内直链下载 · ' + esc(it.url.split('/').pop() || '') : '无稳定直链 → 打开官方下载页手动下载') + qtxt + '</p></div>' +
-        '<div class="actions" style="display:flex;gap:6px;align-items:center">' +
-        '<span data-status style="font-size:11.5px;font-weight:600;' + (it.installed ? 'color:var(--green,#16a34a)' : 'color:var(--subtle,#7f7d91)') + '">' + (it.installed ? '✓ 已安装 ' : '') + st + '</span>' +
+        '<div class="actions" style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;justify-content:flex-end">' +
+        '<span data-status style="font-size:11.5px;font-weight:600;' + (it.installed ? 'color:var(--green,#16a34a)' : 'color:var(--subtle,#7f7d91)') + '">' + (it.installed ? '✓ 已安装 ' : '未检测到') + st + '</span>' +
         (it.direct ? '<button data-dl="' + it.platform + '" class="small ' + (it.installed ? '' : 'primary') + '">' + (it.installed ? '重新安装' : '一键下载安装') + '</button>' : '<button data-page="' + it.platform + '" class="small">打开下载页</button>') +
+        '<button data-setdir="' + it.platform + '" class="small" title="客户端装在非常规位置时，手动指定安装目录">指定目录</button>' +
         '</div></div>';
     }).join('') +
-    '<p class="notice">静默安装使用官方安装器的无人值守参数（NSIS /S）。企业定制版安装路径由各平台安装器决定。</p>';
+    '<p class="notice">已安装检测：自动扫描注册表卸载信息与常见安装路径；若客户端装在自定义位置，点「指定目录」手动导入安装目录（含主程序的文件夹）。</p>';
   // 绑定
-  const dirSave = body.querySelector('#tools-dir-save');
-  if (dirSave) dirSave.addEventListener('click', async () => {
-    const v = body.querySelector('#tools-dir')?.value || '';
-    try { await invoke('settings_set', { key: 'toolsInstallDir', value: v }); TOOLS.installDir = v; toast('下载路径已保存'); }
-    catch (e) { toast('保存失败: ' + e, 4200); }
-  });
+  body.querySelectorAll('[data-setdir]').forEach(b => b.addEventListener('click', async () => {
+    const p = b.dataset.setdir;
+    const dir = prompt('请输入 ' + (meta[p] || p) + ' 的安装目录（含主 exe 的文件夹路径）：', '');
+    if (dir == null) return;
+    if (!dir.trim()) {
+      try { await invoke('tools_set_install_dir', { platform: p, dir: '' }); toast('已清除手动指定目录'); TOOLS = null; renderToolsTab(body); } catch (e) { toast('操作失败: ' + e, 4200); }
+      return;
+    }
+    b.disabled = true;
+    try {
+      const r = await invoke('tools_set_install_dir', { platform: p, dir: dir.trim() });
+      toast(r.installed ? ('已导入：' + r.exe) : '已清除手动指定目录');
+      TOOLS = null;
+      renderToolsTab(body);
+    } catch (e) { toast('导入失败: ' + e, 4200); }
+    b.disabled = false;
+  }));
   body.querySelectorAll('[data-dl]').forEach(b => b.addEventListener('click', async () => {
     const p = b.dataset.dl;
     const dir = body.querySelector('#tools-dir')?.value || '';

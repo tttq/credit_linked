@@ -1,8 +1,8 @@
-//! ZCode（智谱）适配器：活动发现 → captcha 配置门 → before 快照 → claim →
-//! after 快照 → correlate 五条件唯一匹配（匹配不上 pending，永不重发）。
+//! ZCode（智谱）适配器（对齐客户端 3.18.2 逆向）：
+//! 活动发现 GET /billing/preview → claim（响应 code/data.plan 判定）→ 余额 /billing/balance。
+//! billing 类端点只认 zcodejwttoken；无 refresh API（续期 = 重新 OAuth）。
 
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 
 use crate::adapters::*;
 use crate::error::PlatformError;
@@ -31,34 +31,17 @@ async fn request_with(c: &Cred, path: &str, method: Method, body: Option<Value>,
     let mut hs = vec![
         ("Authorization".to_string(), format!("Bearer {}", token)),
         ("Content-Type".to_string(), "application/json".to_string()),
+        // 客户端公共源头发射器（逆向）：claim/balance 请求带版本与平台标识
+        ("User-Agent".to_string(), "ZCode/3.18.2".to_string()),
+        ("X-ZCode-App-Version".to_string(), "3.18.2".to_string()),
+        ("X-Platform".to_string(), "win32-x64".to_string()),
+        ("HTTP-Referer".to_string(), "https://zcode.z.ai".to_string()),
+        ("X-Os-Category".to_string(), "windows".to_string()),
     ];
     let dev = c.meta.get("deviceMid").and_then(|d| d.as_str()).unwrap_or("");
     if !dev.is_empty() { hs.push(("X-Device-Mid".to_string(), dev.to_string())); }
     let hs: Vec<(&str, String)> = hs.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
     platform_fetch(&format!("{BASE}{path}"), method, body, &hs).await
-}
-
-/// 活动证据键：SHA256(JSON([planId, [[entitlement_id, effective_at], ...]]))
-pub fn evidence_key(plan_id: &str, entitlements: &[Value]) -> String {
-    let pairs: Vec<Value> = entitlements.iter().map(|e| json!([
-        e.get("entitlement_id").cloned().unwrap_or(Value::Null),
-        e.get("effective_at").cloned().unwrap_or(Value::Null),
-    ])).collect();
-    let payload = json!([plan_id, pairs]);
-    hex_lower(&Sha256::digest(payload.to_string().as_bytes()))
-}
-
-pub fn hex_lower(b: &[u8]) -> String { b.iter().map(|x| format!("{x:02x}")).collect() }
-
-/// 免费活动判定：无 price/amount/payment/subscription/invitation_code/conditions，
-/// requires_captcha !== true，claimable !== false
-fn is_free_plan(p: &Value) -> bool {
-    for k in ["price", "amount", "payment", "subscription", "invitation_code", "conditions"] {
-        if p.get(k).map(|v| !v.is_null()).unwrap_or(false) { return false; }
-    }
-    if p.get("requires_captcha").and_then(|v| v.as_bool()) == Some(true) { return false; }
-    if p.get("claimable").and_then(|v| v.as_bool()) == Some(false) { return false; }
-    true
 }
 
 #[async_trait::async_trait]
@@ -71,37 +54,19 @@ impl Adapter for ZcodeAdapter {
     }
 
     async fn state(&self, c: &Cred) -> Result<CheckinState, PlatformError> {
-        let cfg = business(request(c, "/api/v1/client/configs", Method::GET, None).await?)?;
-        // 活动来自 config：startPlanPreview（免费套餐预览）+ codingPlanStaticProducts
-        let mut plans: Vec<Value> = Vec::new();
-        if let Some(mut p) = cfg.pointer("/configs/startPlanPreview").cloned() {
-            if p.get("plan_id").is_none() { p["plan_id"] = p.get("planId").cloned().unwrap_or(Value::Null); }
-            // startPlanPreview 即免费体验套餐，直接纳入（claim 阶段再按 plan_id 领取）
-            plans.push(p);
-        }
-        if let Some(arr) = cfg.pointer("/configs/codingPlanStaticProducts").and_then(|x| x.as_array()) {
-            for p in arr {
-                let mut v = p.clone();
-                if v.get("plan_id").is_none() { v["plan_id"] = v.get("planId").cloned().unwrap_or(Value::Null); }
-                if is_free_plan(&v) { plans.push(v); }
-            }
-        }
-        // 兼容旧端点（若服务端仍提供）
-        if plans.is_empty() {
-            if let Ok(preview) = billing_request(c, "/api/v1/zcode-plan/plan/preview", Method::GET, None).await {
-                if let Ok(d) = business(preview) {
-                    let mut found: Vec<Value> = d.get("plans").and_then(|p| p.as_array()).cloned().unwrap_or_default()
-                        .into_iter().filter(is_free_plan).collect();
-                    plans.append(&mut found);
-                }
-            }
-        }
-        let captcha_manual = cfg.pointer("/configs/captcha/enabled").and_then(|b| b.as_bool()).unwrap_or(false)
+        // 活动来源（逆向确认）：GET /billing/preview?app_version=…&platform=… 的 data.plans[]
+        // （configs.startPlanPreview 只是免费套餐展示配置，可领性以 preview 为准）
+        let v = billing_request(c, "/api/v1/zcode-plan/billing/preview?app_version=3.18.2&platform=win32-x64", Method::GET, None).await?;
+        let d = business(v)?;
+        let plans: Vec<Value> = d.get("plans").and_then(|p| p.as_array()).cloned().unwrap_or_default();
+        // captcha 门（仅提示用）：enabled 且 skip_model_request!==true 时 claim 需要验证码
+        let cfg = business(request(c, "/api/v1/client/configs?app_version=3.18.2&platform=win32-x64", Method::GET, None).await?).unwrap_or(Value::Null);
+        let captcha_block = cfg.pointer("/configs/captcha/enabled").and_then(|b| b.as_bool()).unwrap_or(false)
             && cfg.pointer("/configs/captcha/skip_model_request").and_then(|b| b.as_bool()).unwrap_or(false) == false;
         Ok(CheckinState {
             checked: false,
-            claimable: !plans.is_empty(),
-            requires_manual: if plans.is_empty() && captcha_manual { Some(true) } else { None },
+            claimable: !plans.is_empty() && !captcha_block,
+            requires_manual: if !plans.is_empty() && captcha_block { Some(true) } else { None },
             raw: json!({ "plans": plans }),
             ..Default::default()
         })
@@ -112,9 +77,8 @@ impl Adapter for ZcodeAdapter {
         if plans.is_empty() {
             return Ok(Receipt { status: "no-activity".into(), amount: None, message: None });
         }
-        // before 快照
-        let before = balance(c).await?;
-        let before_ids: Vec<Value> = before.as_array().map(|a| a.iter().map(|p| p.get("user_plan_id").cloned().unwrap_or(Value::Null)).collect()).unwrap_or_default();
+        // 客户端语义（逆向）：成功 = code===0 && data.plan 存在；失败 = code!==0，
+        // data.message + data.plan.ends_at（下次可领时间）。无幂等键（body 只有 plan_id）。
         let mut last_err: Option<PlatformError> = None;
         for plan in &plans {
             let pid = plan.get("plan_id").or_else(|| plan.get("planId")).or_else(|| plan.get("id"))
@@ -122,27 +86,31 @@ impl Adapter for ZcodeAdapter {
             if pid.is_empty() { continue; }
             match billing_request(c, "/api/v1/zcode-plan/billing/claim", Method::POST, Some(json!({ "plan_id": pid }))).await {
                 Ok(resp) => {
-                    let direct = resp.pointer("/data/plan/user_plan_id").cloned().unwrap_or(Value::Null);
-                    if !direct.is_null() {
-                        return Ok(Receipt { status: "success".into(), amount: None, message: Some(format!("plan {pid} claimed")) });
+                    let code = resp.get("code").and_then(|x| x.as_i64())
+                        .or_else(|| resp.get("code").and_then(|x| x.as_str()).and_then(|s| s.parse().ok()))
+                        .unwrap_or(-1);
+                    if code == 0 && !resp.pointer("/data/plan").unwrap_or(&Value::Null).is_null() {
+                        let granted = resp.pointer("/data/plan/entitlements")
+                            .and_then(|e| e.as_array())
+                            .map(|a| a.iter().filter_map(|e| e.get("grant_units").and_then(|g| g.as_f64())).sum::<f64>())
+                            .unwrap_or(0.0);
+                        return Ok(Receipt {
+                            status: "success".into(),
+                            amount: if granted > 0.0 { Some(granted) } else { None },
+                            message: Some(format!("plan {pid} claimed")),
+                        });
                     }
-                    // correlate：after 快照唯一匹配
-                    let after = balance(c).await?;
-                    let anchor = now_secs_ms();
-                    let matched = after.as_array().map(|arr| {
-                        let cands: Vec<&Value> = arr.iter().filter(|p| {
-                            let same_plan = p.get("plan_id").and_then(|v| v.as_str()) == Some(pid.as_str());
-                            let new_id = !before_ids.contains(&p.get("user_plan_id").cloned().unwrap_or(Value::Null));
-                            let starts = p.get("starts_at").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                            let in_window = starts >= (anchor - 5000) as f64 && starts <= (anchor + 120000) as f64;
-                            same_plan && new_id && in_window
-                        }).collect();
-                        cands.len() == 1
-                    }).unwrap_or(false);
-                    if matched {
-                        return Ok(Receipt { status: "success".into(), amount: None, message: Some(format!("plan {pid} correlated")) });
-                    }
-                    return Ok(Receipt { status: "pending".into(), amount: None, message: Some(format!("plan {pid} submitted, awaiting correlation")) });
+                    // 失败：取 message 与 ends_at（下次可领时间）
+                    let msg = resp.pointer("/data/message").and_then(|m| m.as_str())
+                        .or_else(|| resp.get("msg").and_then(|m| m.as_str()))
+                        .unwrap_or("已领取或不可重复领取").to_string();
+                    let ends_at = resp.pointer("/data/plan/ends_at").and_then(|e| e.as_i64());
+                    let hint = ends_at.map(|ts| {
+                        let (y, mo, d) = crate::adapters::civil_from_days(ts / 86400);
+                        let rem = ts % 86400;
+                        format!("（下次可领 {y:04}-{mo:02}-{d:02} {:02}:{:02}）", rem / 3600, (rem % 3600) / 60)
+                    }).unwrap_or_default();
+                    return Ok(Receipt { status: "already".into(), amount: None, message: Some(format!("{msg}{hint}")) });
                 }
                 Err(e) => { last_err = Some(e); }
             }
@@ -152,32 +120,22 @@ impl Adapter for ZcodeAdapter {
 
     async fn quota(&self, c: &Cred) -> Result<Quota, PlatformError> {
         let d = balance(c).await?;
-        let mut total_units = 0.0; let mut used_units = 0.0;
-        // 真实端点 /billing/balance 返回 { plans:[...], balances:[...] }
+        // 客户端公式：remaining = Σ balances[].remaining_units；total = Σ total_units
+        let mut remaining = 0.0;
         if let Some(bs) = d.get("balances").and_then(|b| b.as_array()) {
             for b in bs {
-                total_units += b.get("total_units").or_else(|| b.get("total")).and_then(|t| t.as_f64()).unwrap_or(0.0);
-                used_units += b.get("used_units").or_else(|| b.get("used")).and_then(|t| t.as_f64()).unwrap_or(0.0);
+                remaining += b.get("remaining_units").and_then(|t| t.as_f64()).unwrap_or(0.0);
             }
         }
-        if total_units == 0.0 {
-            if let Some(ps) = d.as_array().or_else(|| d.get("plans").and_then(|p| p.as_array())) {
-                for p in ps {
-                    if let Some(ents) = p.get("entitlements").and_then(|e| e.as_array()) {
-                        for e in ents {
-                            total_units += e.get("grant_units").and_then(|t| t.as_f64()).unwrap_or(0.0);
-                        }
-                    }
-                    if let Some(w) = p.get("windows").and_then(|w| w.as_array()) {
-                        for win in w {
-                            total_units += win.get("total_units").and_then(|t| t.as_f64()).unwrap_or(0.0);
-                            used_units += win.get("used_units").and_then(|t| t.as_f64()).unwrap_or(0.0);
-                        }
-                    }
-                }
-            }
-        }
-        Ok(Quota { remaining: Some((total_units - used_units).max(0.0)), parts: json!([{ "name": "zcode", "total": total_units, "used": used_units }]), sampled_at: now_iso() })
+        let parts = json!(d.get("balances").and_then(|b| b.as_array()).cloned().unwrap_or_default()
+            .into_iter().map(|b| json!({
+                "name": b.get("show_name").or_else(|| b.get("entitlement_id")).cloned().unwrap_or(json!("zcode")),
+                "total": b.get("total_units").cloned().unwrap_or(json!(0)),
+                "used": b.get("used_units").cloned().unwrap_or(json!(0)),
+                "remaining": b.get("remaining_units").cloned().unwrap_or(json!(0)),
+                "expiresAt": b.get("expires_at").cloned().unwrap_or(json!(null)),
+            })).collect::<Vec<_>>());
+        Ok(Quota { remaining: Some(remaining.max(0.0)), parts, sampled_at: now_iso() })
     }
 
     async fn refresh(&self, _c: &Cred) -> Result<Cred, PlatformError> {
@@ -186,12 +144,8 @@ impl Adapter for ZcodeAdapter {
 }
 
 pub async fn balance(c: &Cred) -> Result<Value, PlatformError> {
-    // 真实端点：/billing/balance（旧的 user-plans 实测 404）
-    let v = billing_request(c, "/api/v1/zcode-plan/billing/balance", Method::GET, None).await?;
+    // 真实端点（逆向）：/billing/balance?app_version=…，响应 { plans, balances }，只认 zcodejwttoken
+    let v = billing_request(c, "/api/v1/zcode-plan/billing/balance?app_version=3.18.2", Method::GET, None).await?;
     let d = business(v)?;
     Ok(d.get("data").cloned().unwrap_or(d))
-}
-
-fn now_secs_ms() -> i64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64
 }

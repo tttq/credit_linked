@@ -29,7 +29,7 @@ fn test_wb_chat_body() {
 #[test]
 fn test_trae_chat_body() {
     let msgs = serde_json::json!([{"role": "user", "content": [{"type": "text", "text": "hi"}]}]);
-    let body = credit_gateway::protocol::trae_chat_body(msgs.as_array().unwrap(), "glm-5.2", None, None, true);
+    let body = credit_gateway::protocol::trae_chat_body(msgs.as_array().unwrap(), "glm-5.2", "solo_work_lite", None, None, true);
     assert_eq!(body["config_name"], "glm-5.2");
     assert_eq!(body["function"], "solo_work_lite");
     assert!(body["session_id"].is_string());

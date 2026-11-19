@@ -45,6 +45,8 @@ pub struct GatewayState {
     pub device_salt: std::sync::Mutex<String>,
     /// Turing 设备 token 缓存 (token, 拉取时间)
     pub device_token: std::sync::Mutex<Option<(String, std::time::Instant)>>,
+    /// 模型目录缓存（全平台聚合；外部 Agent 频繁拉 /v1/models，避免每次打上游）
+    pub models_cache: std::sync::Mutex<Option<(Instant, serde_json::Value)>>,
 }
 
 impl GatewayState {
@@ -230,46 +232,236 @@ async fn list_platforms(State(st): State<Arc<GatewayState>>) -> Response {
 
 // ---------- 模型清单 ----------
 
-async fn list_models(
-    State(st): State<Arc<GatewayState>>,
-    headers: axum::http::HeaderMap,
-) -> Response {
-    if !st.check_auth(headers.get(axum::http::header::AUTHORIZATION).and_then(|v| v.to_str().ok())) {
-        return openai_error_response(StatusCode::UNAUTHORIZED, "unauthorized", "missing or invalid Authorization bearer");
+/// 从本机重新同步凭据（各平台 token 由本地客户端持续轮换）：
+/// ① trae/workbuddy/qoder：先重扫本机登录态，失败再走 refresh 链（refresh_token）；
+/// ② minimax/zcode/codearts：读客户端存储；zcode/码道 token 未变时自动拉起客户端等待刷新。
+/// 返回 true = 已拿到新凭据。
+async fn refresh_creds_from_local(st: &Arc<GatewayState>, platform: Platform, stale: &Cred) -> bool {
+    use credit_core::service::Service;
+    let svc = Service { store: st.store.clone() };
+    match platform {
+        Platform::Minimax => svc.import_account("minimax", false).await.is_ok(),
+        // Trae（国内/企业/国际）、WorkBuddy、Qoder：本地登录态扫描 + refresh_token 刷新链
+        Platform::Trae | Platform::TraeEnterprise | Platform::TraeIntl
+        | Platform::WorkBuddy | Platform::WorkBuddyIntl | Platform::Qoder => {
+            let (provider, intl) = match platform {
+                Platform::Trae | Platform::TraeEnterprise => ("trae", false),
+                Platform::TraeIntl => ("trae", false), // 本地扫描只识别国内版；国际版走 refresh
+                Platform::WorkBuddyIntl => ("workbuddy", true),
+                Platform::WorkBuddy => ("workbuddy", false),
+                _ => ("qoder", false),
+            };
+            if svc.import_account(provider, intl).await.is_ok() {
+                return true;
+            }
+            // 扫描失败（如国际版）→ 走 refresh_token 链
+            svc.refreshed_cred(&stale.provider, &stale.uid, stale).await.is_ok()
+        }
+        Platform::Zcode => {
+            let stale_token = stale.token.clone();
+            // 1) 本地磁盘 token 已变化（客户端在线轮换过）→ 直接导入
+            if let Some(l) = credit_core::adapters::zcode_local::read_live_auth() {
+                if l.access_token != stale_token {
+                    return svc.import_account("zcode", false).await.is_ok();
+                }
+            }
+            // 2) token 仍是旧的 → 拉起本机客户端，等它自动刷新再导入
+            let old_fp = credit_core::adapters::zcode_local::token_fingerprint();
+            match credit_core::adapters::zcode_local::launch_client() {
+                Some(exe) => eprintln!("[gateway] zcode token 过期，已拉起客户端 {}，等待其刷新…", exe.display()),
+                None => {
+                    eprintln!("[gateway] zcode token 过期且本机未安装 ZCode 客户端");
+                    return false;
+                }
+            }
+            let wait = tokio::task::spawn_blocking(move || {
+                credit_core::adapters::zcode_local::wait_for_token_change(old_fp.as_deref(), std::time::Duration::from_secs(15))
+            }).await.ok().flatten();
+            match wait {
+                Some(_) => svc.import_account("zcode", false).await.is_ok(),
+                None => {
+                    eprintln!("[gateway] zcode 客户端 15s 内未刷新 token（可能需要在客户端里重新登录）");
+                    false
+                }
+            }
+        }
+        Platform::CodeArts => {
+            let desktop = stale.provider == "codearts-desktop";
+            let read = || credit_core::adapters::codearts_local::read_live_session(desktop)
+                .or_else(|| credit_core::adapters::codearts_local::read_live_session(!desktop));
+            let stale_st = stale.meta.get("security_token").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            // 1) 本地会话已更新 → 直接导入
+            if let Some(l) = read() {
+                let cur = l.session.pointer("/session/securityToken").and_then(|v| v.as_str()).unwrap_or("");
+                if !cur.is_empty() && cur != stale_st {
+                    return svc.import_account(&stale.provider, false).await.is_ok();
+                }
+            }
+            // 2) 拉起本机客户端等刷新
+            let old_fp = credit_core::adapters::codearts_local::session_fingerprint(desktop);
+            match credit_core::adapters::codearts_local::launch_client() {
+                Some(exe) => eprintln!("[gateway] 码道 STS 过期，已拉起客户端 {}，等待其刷新…", exe.display()),
+                None => {
+                    eprintln!("[gateway] 码道 STS 过期且本机未安装 CodeArts 客户端");
+                    return false;
+                }
+            }
+            let wait = tokio::task::spawn_blocking(move || {
+                credit_core::adapters::codearts_local::wait_for_session_change(desktop, old_fp.as_deref(), std::time::Duration::from_secs(15))
+            }).await.ok().flatten();
+            match wait {
+                Some(_) => svc.import_account(&stale.provider, false).await.is_ok(),
+                None => {
+                    eprintln!("[gateway] 码道客户端 15s 内未刷新 STS（可能需要在客户端里重新登录）");
+                    false
+                }
+            }
+        }
     }
-    let mut data = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    // 模型目录只返回当前请求平台的模型（跟随「请求平台」切换；模型 id 为裸 id）
-    let targets: Vec<Platform> = vec![st.router.current_platform()];
-    for platform in targets {
-        let Some(cred) = st.router.accounts_for(platform).into_iter().next() else { continue };
-        let models = match platform {
+}
+
+/// 拉取一个平台的模型列表（含码道双通道兜底）
+async fn fetch_models_for(st: &Arc<GatewayState>, platform: Platform, raw: &str) -> Option<Vec<upstream::ModelInfo>> {
+    let all = st.router.accounts_for(platform);
+    let prefer = |desktop: bool| -> Vec<Cred> {
+        if raw == "codearts-desktop" {
+            if desktop {
+                all.iter().filter(|c| c.provider == "codearts-desktop").cloned().collect()
+            } else {
+                all.iter().filter(|c| c.provider != "codearts-desktop").cloned().collect()
+            }
+        } else {
+            all.iter().filter(|c| (c.provider == "codearts-desktop") == desktop).cloned().collect()
+        }
+    };
+    let pool = prefer(true);
+    let fallback = prefer(false);
+    let mut cred = pool.first().cloned();
+    if cred.is_none() {
+        cred = fallback.first().cloned();
+    }
+    let cred = cred?;
+    let desktop_channel = cred.provider == "codearts-desktop";
+    // 模型目录拉取失败（多为 token 过期）时，先走凭据恢复链（本地重扫 / refresh_token）再试一次
+    let mut cred = cred;
+    let mut retried = false;
+    loop {
+        let out = match platform {
             Platform::WorkBuddy | Platform::WorkBuddyIntl => upstream::wb_fetch_models(&cred).await,
             Platform::Trae | Platform::TraeEnterprise => upstream::trae_fetch_models(&cred, false).await,
             Platform::TraeIntl => upstream::trae_fetch_models(&cred, true).await,
             Platform::Zcode => upstream::zcode_fetch_models(&cred).await,
             Platform::Minimax => upstream::minimax_fetch_models(&cred).await,
             Platform::Qoder => upstream::qoder_fetch_models(&cred).await,
-            Platform::CodeArts => {
-                // 惰性 refresh：仅当前 STS 疑似过期才轮换 RT（RT 一次性，无条件 refresh 会
-                // 把 token 提前消耗掉，导致签到/额度链路 1806 失效）。先用现有 STS 请求，
-                // 401/过期时由上层 refreshed_cred 链路恢复。
-                let _ = &cred;
-                upstream::codearts_fetch_models(&cred, false).await
-            }
+            Platform::CodeArts => upstream::codearts_fetch_models(&cred, desktop_channel).await,
         };
-        let Ok(models) = models else { continue };
-        for m in models {
-            let key = m.id.clone();
-            if !seen.insert(key.clone()) {
-                continue;
+        match out {
+            Ok(ms) => return Some(ms),
+            Err(e) => {
+                let auth_like = matches!(&e, credit_core::error::PlatformError::Auth)
+                    || e.to_string().contains("401") || e.to_string().contains("403");
+                if auth_like && !retried {
+                    retried = true;
+                    if let Ok(nc) = refresh_creds_for(&st, platform, &cred).await {
+                        cred = nc;
+                        continue;
+                    }
+                }
+                // 码道：当前通道失败用另一通道凭据兜底（同账号共用 STS 会话）
+                if platform == Platform::CodeArts {
+                    if let Some(alt) = fallback.first() {
+                        return upstream::codearts_fetch_models(alt, alt.provider == "codearts-desktop").await.ok();
+                    }
+                }
+                return None;
             }
+        }
+    }
+}
+
+/// 静默刷新指定平台凭据（不弹窗、不阻塞太久），返回新凭据
+async fn refresh_creds_for(st: &Arc<GatewayState>, platform: Platform, stale: &Cred) -> Result<Cred, ()> {
+    use credit_core::service::Service;
+    let svc = Service { store: st.store.clone() };
+    match platform {
+        Platform::Trae | Platform::TraeEnterprise | Platform::TraeIntl => {
+            let intl = platform == Platform::TraeIntl;
+            if svc.import_account("trae", intl).await.is_ok() {
+                if let Some(c) = st.router.accounts_for(platform).into_iter().find(|c| c.token != stale.token) {
+                    return Ok(c);
+                }
+            }
+            svc.refreshed_cred(&stale.provider, &stale.uid, stale).await.map_err(|_| ())
+        }
+        Platform::WorkBuddy | Platform::WorkBuddyIntl => {
+            let intl = platform == Platform::WorkBuddyIntl;
+            if svc.import_account("workbuddy", intl).await.is_ok() {
+                if let Some(c) = st.router.accounts_for(platform).into_iter().find(|c| c.token != stale.token) {
+                    return Ok(c);
+                }
+            }
+            svc.refreshed_cred(&stale.provider, &stale.uid, stale).await.map_err(|_| ())
+        }
+        Platform::Qoder => {
+            if svc.import_account("qoder", false).await.is_ok() {
+                if let Some(c) = st.router.accounts_for(platform).into_iter().find(|c| c.token != stale.token) {
+                    return Ok(c);
+                }
+            }
+            svc.refreshed_cred(&stale.provider, &stale.uid, stale).await.map_err(|_| ())
+        }
+        _ => {
+            if refresh_creds_from_local(st, platform, stale).await {
+                st.router.accounts_for(platform).into_iter().next().ok_or(())
+            } else {
+                Err(())
+            }
+        }
+    }
+}
+
+/// 构建全平台模型目录（当前平台裸 id；其它平台 "平台/模型"，外部 Agent 可直接选）
+/// strict（仅允许当前平台）开启时只列当前平台，避免选到会被 403 的模型。
+async fn build_models_catalog(st: &Arc<GatewayState>) -> serde_json::Value {
+    let current_raw = st.router.current_platform_raw();
+    let strict = st.store.get_setting("gatewayStrict", "1").ok().map(|v| v == "1").unwrap_or(true);
+    // 聚合所有「有账号」的平台（含码道双通道）
+    let mut targets: Vec<(Platform, String)> = Vec::new();
+    for p in Platform::all() {
+        let n = st.router.accounts_for(p).len();
+        if n == 0 { continue; }
+        if p == Platform::CodeArts {
+            let all = st.router.accounts_for(p);
+            let has_agent = all.iter().any(|c| c.provider == "codearts");
+            let has_desktop = all.iter().any(|c| c.provider == "codearts-desktop");
+            if has_agent { targets.push((p, "codearts".to_string())); }
+            if has_desktop { targets.push((p, "codearts-desktop".to_string())); }
+        } else {
+            targets.push((p, p.as_str().to_string()));
+        }
+    }
+    // strict：只保留当前通道；否则当前平台排首位
+    if strict {
+        targets.retain(|(_, raw)| raw == &current_raw);
+    } else {
+        targets.sort_by_key(|(_, raw)| if raw == &current_raw { 0 } else { 1 });
+    }
+
+    let mut data = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for (platform, raw) in targets {
+        let Some(models) = fetch_models_for(st, platform, &raw).await else { continue };
+        let is_current = raw == current_raw;
+        for m in models {
+            // 当前平台用裸 id（兼容 UI/旧客户端）；其它平台加前缀避免跨平台重名
+            let id = if is_current { m.id.clone() } else { format!("{raw}/{}", m.id) };
+            if !seen.insert(id.clone()) { continue; }
             data.push(json!({
-                "id": key,
+                "id": id,
                 "object": "model",
                 "created": 0,
-                "owned_by": platform.as_str(),
-                "platform": platform.as_str(),
+                "owned_by": raw,
+                "platform": raw,
                 "raw_model": m.id,
                 "name": m.name,
                 "context_window": m.context_window,
@@ -278,7 +470,29 @@ async fn list_models(
             }));
         }
     }
-    Json(json!({ "object": "list", "data": data })).into_response()
+    json!({ "object": "list", "data": data })
+}
+
+async fn list_models(
+    State(st): State<Arc<GatewayState>>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    if !st.check_auth(headers.get(axum::http::header::AUTHORIZATION).and_then(|v| v.to_str().ok())) {
+        return openai_error_response(StatusCode::UNAUTHORIZED, "unauthorized", "missing or invalid Authorization bearer");
+    }
+    // 60s 缓存（外部 Agent 会频繁拉模型列表；上游拉取含网络请求与 sidecar spawn）
+    if let Ok(g) = st.models_cache.lock() {
+        if let Some((at, cached)) = &*g {
+            if at.elapsed() < std::time::Duration::from_secs(60) {
+                return Json(cached.clone()).into_response();
+            }
+        }
+    }
+    let catalog = build_models_catalog(&st).await;
+    if let Ok(mut g) = st.models_cache.lock() {
+        *g = Some((Instant::now(), catalog.clone()));
+    }
+    Json(catalog).into_response()
 }
 
 // ---------- chat completions ----------
@@ -368,18 +582,51 @@ async fn chat_completions(
 
     // 逐账号 failover + 11128 渠道风控退避重试（风控抖动时"请重新发送"即可过，自动重试代替手动）
     let mut last_error: Option<(String, String)> = None;
+    // 凭据自愈每个请求最多尝试一次（避免拉起客户端 + 等待刷新重复阻塞）
+    let mut healed = false;
     'outer: for attempt in 0..3u32 {
         if attempt > 0 {
             tokio::time::sleep(std::time::Duration::from_millis(1500 * attempt as u64)).await;
         }
         for cred in &creds {
-            match dispatch_stream(&st, platform, cred, &model, &messages, &system, max_tokens, reasoning_effort.as_deref()).await {
+            let mut attempt_cred = cred.clone();
+            let mut outcome = dispatch_stream(&st, platform, &attempt_cred, &model, &messages, &system, max_tokens, reasoning_effort.as_deref()).await;
+            // 凭据自愈：minimax/zcode/码道的 token 由本机客户端持续轮换，401 时重读客户端存储
+            // （token 未变则自动拉起客户端并等其刷新）再试一次
+            if let Err((code, msg)) = &outcome {
+                let is_auth = code == "auth" || msg.contains("401") || msg.contains("Unauthorized")
+                    || msg.contains("令牌已过期") || msg.contains("AUTH:") || msg.contains("1806")
+                    || msg.contains("APIG.0602");
+                if is_auth && !healed && matches!(platform,
+                    Platform::Minimax | Platform::Zcode | Platform::CodeArts
+                    | Platform::Trae | Platform::TraeEnterprise | Platform::TraeIntl
+                    | Platform::WorkBuddy | Platform::WorkBuddyIntl | Platform::Qoder) {
+                    healed = true;
+                    if refresh_creds_from_local(&st, platform, &attempt_cred).await {
+                        let rows = st.store.list_accounts().unwrap_or_default();
+                        // 自愈后凭据可能换了 uid（如 ZCode 重登）——优先取 token 与旧凭据不同的那行，
+                        // 其次回退到同 uid 重新加载
+                        let pick = rows.iter()
+                            .filter(|(p, _, _, _, _)| p == &attempt_cred.provider)
+                            .find_map(|(_, _, _, _, auth)| serde_json::from_str::<Cred>(auth).ok())
+                            .filter(|c| c.token != attempt_cred.token)
+                            .or_else(|| rows.iter()
+                                .find(|(p, u, _, _, _)| p == &attempt_cred.provider && u == &attempt_cred.uid)
+                                .and_then(|(_, _, _, _, auth)| serde_json::from_str::<Cred>(auth).ok()));
+                        if let Some(nc) = pick {
+                            attempt_cred = nc;
+                            outcome = dispatch_stream(&st, platform, &attempt_cred, &model, &messages, &system, max_tokens, reasoning_effort.as_deref()).await;
+                        }
+                    }
+                }
+            }
+            match outcome {
                 Ok(events) => {
                     return if stream {
                         // 流式：拿到流即记成功（客户端边收边用）
                         let _ = st.store.log_gateway_request(
                             platform.as_str(),
-                            &format!("{}:{}", cred.provider, cred.uid),
+                            &format!("{}:{}", attempt_cred.provider, attempt_cred.uid),
                             &model, true, Some(200), None, None,
                         );
                         stream_response(&model, platform.as_str(), events)
@@ -388,7 +635,7 @@ async fn chat_completions(
                         let (resp, has_content) = blocking_response(&model, platform.as_str(), events).await;
                         let _ = st.store.log_gateway_request(
                             platform.as_str(),
-                            &format!("{}:{}", cred.provider, cred.uid),
+                            &format!("{}:{}", attempt_cred.provider, attempt_cred.uid),
                             &model, has_content, Some(if has_content { 200 } else { 502 }),
                             if has_content { None } else { Some("empty stream (no finish_reason/content)") },
                             None,
@@ -405,9 +652,9 @@ async fn chat_completions(
                     let failover_worthy = code == "auth" || code == "rate" || code == "network" || code == "upstream" || quota_exhausted;
                     if failover_worthy && !is_channel_block {
                         // 渠道拦截不算账号故障（账号本身正常，别标 failed）
-                        let _ = st.store.update_account_status(&cred.provider, &cred.uid, "failed", Some(msg.as_str()));
+                        let _ = st.store.update_account_status(&attempt_cred.provider, &attempt_cred.uid, "failed", Some(msg.as_str()));
                         // 自动切换：当前账号不可用时，把选中账号切到同平台下一个可用账号
-                        let cur_ref = format!("{}:{}", cred.provider, cred.uid);
+                        let cur_ref = format!("{}:{}", attempt_cred.provider, attempt_cred.uid);
                         let selected = st.store.get_setting("gw_account", "").unwrap_or_default();
                         if selected == cur_ref || selected.is_empty() {
                             if let Some(next) = creds.iter().find(|c| {
@@ -420,7 +667,19 @@ async fn chat_completions(
                             }
                         }
                     }
-                    last_error = Some((code, msg.clone()));
+                    let mut final_msg = msg.clone();
+                    // 凭据类平台 + 认证类错误：补一句可执行指引（自愈已尝试拉起客户端）
+                    let auth_like = code == "auth" || msg.contains("401") || msg.contains("Unauthorized")
+                        || msg.contains("令牌已过期") || msg.contains("AUTH:") || msg.contains("1806")
+                        || msg.contains("APIG.0602");
+                    if auth_like {
+                        final_msg = match platform {
+                            Platform::Zcode => format!("{msg} | 已自动同步并尝试拉起本机 ZCode 客户端刷新令牌；若仍失败，请在 ZCode 客户端重新登录，再点账号管理的「扫描本机」"),
+                            Platform::CodeArts => format!("{msg} | 已自动同步并尝试拉起本机码道客户端刷新 STS；若仍失败，请在码道客户端重新登录，再点账号管理的「扫描本机」"),
+                            _ => final_msg,
+                        };
+                    }
+                    last_error = Some((code, final_msg));
                     if !failover_worthy {
                         break 'outer;
                     }
@@ -460,14 +719,32 @@ async fn dispatch_stream(
             let device = if dev_token.is_empty() && machine.is_empty() { None } else { Some((dev_token.as_str(), machine.as_str(), session.as_str())) };
             upstream::wb_chat_stream(cred, body, device).await.map_err(|e| ("upstream".to_string(), e))
         }
-        Platform::Trae | Platform::TraeEnterprise => {
-            let enterprise = Router::is_enterprise_cred(cred);
-            let body = crate::protocol::trae_chat_body(messages, model, max_tokens, reasoning_effort, enterprise);
-            upstream::trae_chat_stream(cred, false, enterprise, body).await.map_err(|e| ("upstream".to_string(), e))
-        }
-        Platform::TraeIntl => {
-            let body = crate::protocol::trae_chat_body(messages, model, max_tokens, reasoning_effort, false);
-            upstream::trae_chat_stream(cred, true, false, body).await.map_err(|e| ("upstream".to_string(), e))
+        Platform::Trae | Platform::TraeEnterprise | Platform::TraeIntl => {
+            let intl = platform == Platform::TraeIntl;
+            let enterprise = platform == Platform::TraeEnterprise || (platform == Platform::Trae && Router::is_enterprise_cred(cred));
+            // 模型只在列出它的 function 下可调用：先用模型目录映射的 function，再按优先级回退
+            let mut funcs: Vec<String> = Vec::new();
+            if let Some(f) = upstream::trae_model_function(model) { funcs.push(f); }
+            for f in ["solo_work_lite", "solo_work_remote", "chat_v3", "solo_coder", "solo_agent_remote"] {
+                if !funcs.iter().any(|x| x == f) { funcs.push(f.to_string()); }
+            }
+            let mut last: Result<EventStream, (String, String)> =
+                Err(("upstream".to_string(), "trae: no attempt".to_string()));
+            for f in funcs {
+                let body = crate::protocol::trae_chat_body(messages, model, &f, max_tokens, reasoning_effort, enterprise);
+                match upstream::trae_chat_stream(cred, intl, enterprise, body).await {
+                    Ok(s) => return Ok(s),
+                    Err(e) => {
+                        // 4001 = function/config_name 不匹配，换下一个 function；其它错误立即返回
+                        if e.contains("4001") || e.contains("config_name") {
+                            last = Err(("upstream".to_string(), e));
+                            continue;
+                        }
+                        return Err(("upstream".to_string(), e));
+                    }
+                }
+            }
+            last
         }
         Platform::Zcode => {
             let thinking = !matches!(reasoning_effort, Some("off") | Some("none"));
@@ -483,7 +760,10 @@ async fn dispatch_stream(
             upstream::qoder_chat_stream(cred, body).await.map_err(|e| ("upstream".to_string(), e))
         }
         Platform::CodeArts => {
-            Err(("chat_unavailable".to_string(), format!("平台 {} 暂无可用的对话通道", platform.display())))
+            // 码道对话：desktop/IDE 通道头区分，凭据共用同一 STS 会话
+            let desktop = cred.provider == "codearts-desktop";
+            let body = crate::protocol::codearts_chat_body(messages, system, model, max_tokens, reasoning_effort.as_deref());
+            upstream::codearts_chat_stream(cred, body, desktop).await.map_err(|e| ("upstream".to_string(), e))
         }
     }
 }

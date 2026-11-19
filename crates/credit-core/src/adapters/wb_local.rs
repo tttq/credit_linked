@@ -60,7 +60,12 @@ fn open_envelope(enc_obj: &Value, key: &[u8]) -> Option<Value> {
     let mut ct_tag = ct;
     ct_tag.extend_from_slice(&tag);
     let pt = gcm_decrypt(key, &nonce, &ct_tag, &build_envelope_aad(&env)).ok()?;
-    serde_json::from_slice(&pt).ok()
+    // 字段级信封（framing=field）解出的是裸字符串（如 accessToken JWT），不是 JSON；
+    // 文件级信封解出的是 JSON。先尝试 JSON，失败则按 UTF-8 字符串处理。
+    if let Ok(v) = serde_json::from_slice::<Value>(&pt) {
+        return Some(v);
+    }
+    String::from_utf8(pt).ok().map(Value::String)
 }
 
 /// spawn 官方客户端取 atRestSecretKey（与原版逐字同脚本）。
@@ -98,6 +103,86 @@ pub fn read_session(intl: bool, client_exe: Option<&std::path::Path>) -> anyhow:
     } else {
         raw
     };
+    Ok(Some(session))
+}
+
+/// 本机 WorkBuddy 客户端 exe 候选（解密会话需要启动它取 atRestSecretKey）
+pub fn client_exe_candidates() -> Vec<std::path::PathBuf> {
+    let local = std::env::var("LOCALAPPDATA").unwrap_or_default();
+    [
+        format!("{local}/Programs/WorkBuddy/WorkBuddy.exe"),
+        "D:/ProgramFiles/software/WorkBuddy/WorkBuddy.exe".to_string(),
+        "C:/Program Files/WorkBuddy/WorkBuddy.exe".to_string(),
+        "D:/ProgramFiles/develop/WorkBuddy/WorkBuddy.exe".to_string(),
+        format!("{local}/Programs/CodeBuddy/CodeBuddy.exe"),
+    ].into_iter().map(std::path::PathBuf::from).collect()
+}
+
+pub fn find_client_exe() -> Option<std::path::PathBuf> {
+    client_exe_candidates().into_iter().find(|p| p.exists())
+}
+
+fn value_has_envelope(v: &Value) -> bool {
+    if is_wb_encrypted(v) {
+        return true;
+    }
+    match v {
+        Value::Object(map) => map.values().any(value_has_envelope),
+        Value::Array(arr) => arr.iter().any(value_has_envelope),
+        _ => false,
+    }
+}
+
+/// 递归解密字段级信封（客户端新版把 auth.accessToken 等字段单独包 $wbEncrypted）
+fn decrypt_tree(v: &mut Value, key: &[u8]) {
+    match v {
+        Value::Object(map) => {
+            let keys: Vec<String> = map.keys().cloned().collect();
+            for k in keys {
+                let child = map.get(&k).cloned().unwrap_or(Value::Null);
+                if is_wb_encrypted(&child) {
+                    if let Some(plain) = open_envelope(&child, key) {
+                        map.insert(k, plain);
+                        continue;
+                    }
+                }
+                if let Some(slot) = map.get_mut(&k) {
+                    decrypt_tree(slot, key);
+                }
+            }
+        }
+        Value::Array(arr) => {
+            for item in arr.iter_mut() {
+                decrypt_tree(item, key);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// 读会话并按需解密字段级信封（新版 WorkBuddy 逐字段加密）。
+/// 返回错误说明为什么无法解密（客户端未安装/启动失败），便于 UI 提示。
+pub fn read_session_full(intl: bool) -> anyhow::Result<Option<Value>> {
+    let raw = match read_session(intl, None) {
+        Ok(Some(v)) => v,
+        Ok(None) => return Ok(None),
+        // 整文件加密（旧格式）：需要有客户端 exe 才能解
+        Err(_) => {
+            let exe = find_client_exe().ok_or_else(|| anyhow::anyhow!("未找到 WorkBuddy 客户端，无法读取加密会话"))?;
+            match read_session(intl, Some(&exe))? {
+                Some(v) => v,
+                None => return Ok(None),
+            }
+        }
+    };
+    if !value_has_envelope(&raw) {
+        return Ok(Some(raw));
+    }
+    let exe = find_client_exe()
+        .ok_or_else(|| anyhow::anyhow!("会话字段已加密，但本机未找到 WorkBuddy 客户端（无法取得解密密钥）"))?;
+    let key = master_key_from_client(&exe).map_err(|e| anyhow::anyhow!("启动 WorkBuddy 取解密密钥失败: {e}"))?;
+    let mut session = raw;
+    decrypt_tree(&mut session, &key);
     Ok(Some(session))
 }
 

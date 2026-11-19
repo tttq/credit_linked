@@ -156,16 +156,84 @@ impl Adapter for TraeAdapter {
     }
 
     async fn refresh(&self, c: &Cred) -> Result<Cred, PlatformError> {
-        // Trae refresh：/trae/api/v3/oauth/RefreshToken（未登录流程不主动调用；占位对齐）
-        let url = format!("{}/trae/api/v3/oauth/RefreshToken", host_of(c));
-        let hs_full = headers(c);
-    let hs: Vec<(&str, String)> = hs_full.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
-        let v = platform_fetch(&url, Method::POST, Some(json!({ "refresh_token": c.refresh_token })), &hs).await?;
-        let d = business(v)?;
-        let mut out = c.clone();
-        if let Some(t) = d.get("Token").or_else(|| d.get("accessToken")).and_then(|t| t.as_str()) {
-            out.token = t.to_string();
+        // Trae 官方续期（对齐 dsh-connect-trae refresh.ts）：
+        //   POST {host}/trae/api/v3/oauth/ExchangeToken
+        //   body: ClientID + ClientSecret:"" + RefreshToken + DeviceInfo + DeviceProof(RSA-SHA256 签名)
+        //   签名消息 = "POST\n{path}\n{clientId}\n{refreshToken}\n{timestamp}\n{nonce}"
+        // 本机扫描导入的账号带 storage 中的设备密钥对；无法签名时回退旧契约。
+        let refresh_token = c.refresh_token.clone().unwrap_or_default();
+        if refresh_token.is_empty() {
+            return Err(PlatformError::Identity("Trae 凭据缺少 refresh_token，请重新登录 Trae 后扫描本机".into()));
         }
+        let host = host_of(c);
+        let base = host.trim_end_matches('/').to_string();
+        // 身份信息（本机客户端安装目录）
+        let data_dir = crate::adapters::trae_local::trae_data_dir();
+        let identity = data_dir.as_deref().and_then(crate::adapters::trae_local::read_identity);
+        let keypair = data_dir.as_deref().and_then(crate::adapters::trae_local::read_device_keypair);
+
+        // 当前契约（有设备私钥才能签名）
+        if let (Some(id), Some(kp)) = (identity.as_ref(), keypair.as_ref()) {
+            let path = "/trae/api/v3/oauth/ExchangeToken";
+            // ClientID 按版本区分：桌面客户端 vs SOLO 包（刷新 token 与客户端绑定）
+            let is_solo = data_dir.as_ref().and_then(|d| d.file_name()).map(|n| n.to_string_lossy().to_uppercase().contains("SOLO")).unwrap_or(false);
+            let client_id = if is_solo { "en1oxy7wnw8j9n" } else { "ono9krqynydwx5" };
+            if let Some((sig, ts, nonce)) =
+                crate::adapters::trae_local::sign_device_proof(&kp.private_key_pem, path, client_id, &refresh_token)
+            {
+                let body = json!({
+                    "ClientID": client_id,
+                    "ClientSecret": "",
+                    "RefreshToken": refresh_token,
+                    "DeviceInfo": {
+                        "DeviceID": id.device_id,
+                        "MachineID": id.machine_id,
+                        "PlatformCode": "IDE_PC",
+                        "DeviceType": "PC",
+                        "ClientVersion": id.app_version.clone().unwrap_or_default(),
+                        "DevicePublicKey": kp.public_key_pem,
+                        "OSInfo": if cfg!(windows) { "windows" } else { "mac" },
+                        "OSVersion": id.os_version,
+                    },
+                    "DeviceProof": { "Signature": sig, "Timestamp": ts, "Nonce": nonce },
+                    "IDEVersion": id.app_version.clone().unwrap_or_default(),
+                });
+                let url = format!("{base}{path}");
+                let hs: Vec<(&str, String)> = vec![("Content-Type", "application/json".to_string())];
+                if let Ok(v) = platform_fetch(&url, Method::POST, Some(body), &hs).await {
+                    // 响应信封：{ResponseMetadata, Result:{Token, RefreshToken, TokenExpireAt, ...}}
+                    let d = v.get("Result").cloned().unwrap_or(v);
+                    if let Some(t) = pick_str(&d, &["Token", "accessToken", "access_token"]) {
+                        let mut out = c.clone();
+                        out.token = t.to_string();
+                        if let Some(rt) = pick_str(&d, &["RefreshToken", "refreshToken"]) { out.refresh_token = Some(rt); }
+                        if let Some(exp) = d.get("TokenExpireAt").and_then(|v| v.as_i64()) {
+                            out.expires_at = Some(exp.to_string());
+                        }
+                        return Ok(out);
+                    }
+                }
+            }
+        }
+        // 旧契约回退：POST {host}/cloudide/api/v3/trae/oauth/ExchangeToken
+        let legacy = json!({
+            "ClientID": "ono9krqynydwx5",
+            "ClientSecret": "-",
+            "RefreshToken": refresh_token,
+            "UserID": c.uid,
+        });
+        let url = format!("{base}/cloudide/api/v3/trae/oauth/ExchangeToken");
+        let hs: Vec<(&str, String)> = vec![("Content-Type", "application/json".to_string())];
+        let v = platform_fetch(&url, Method::POST, Some(legacy), &hs).await?;
+        let d = v.get("Result").cloned().unwrap_or(v);
+        let mut out = c.clone();
+        if let Some(t) = pick_str(&d, &["Token", "accessToken", "access_token"]) {
+            out.token = t.to_string();
+        } else {
+            return Err(PlatformError::Identity("Trae 续期失败：响应中没有新 token，请重新登录 Trae 后扫描本机".into()));
+        }
+        if let Some(rt) = pick_str(&d, &["RefreshToken", "refreshToken"]) { out.refresh_token = Some(rt); }
+        if let Some(exp) = d.get("TokenExpireAt").and_then(|v| v.as_i64()) { out.expires_at = Some(exp.to_string()); }
         Ok(out)
     }
 }

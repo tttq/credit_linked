@@ -232,6 +232,18 @@ impl Service {
                     return Err(PlatformError::Local("Trae 登录态 token 为空".into()));
                 }
                 let uid = jwt_uid_of(&token);
+                // 身份头信息（对齐 dsh-connect-trae readTraeIdentity）：聊天请求必须带机器/设备/版本头
+                let id = &live.identity;
+                let mut meta = serde_json::json!({
+                    "deviceId": live.device_id,
+                    "host": live.host.unwrap_or_else(|| "https://api.trae.cn".into()),
+                    "reqSource": crate::adapters::trae_local::request_source_for_dir(&live.data_dir),
+                });
+                if !id.machine_id.is_empty() { meta["machineId"] = json!(id.machine_id); }
+                if !id.device_id.is_empty() { meta["deviceId"] = json!(id.device_id); }
+                if let Some(v) = &id.app_version { meta["appVersion"] = json!(v); }
+                if let Some(v) = &id.build_version { meta["buildVersion"] = json!(v); }
+                if !id.os_version.is_empty() { meta["osVersion"] = json!(id.os_version); }
                 crate::adapters::Cred {
                     provider: "trae".into(),
                     uid,
@@ -239,18 +251,16 @@ impl Service {
                     token,
                     refresh_token: live.auth.get("refreshToken").and_then(|t| t.as_str()).map(|s| s.to_string()),
                     expires_at: None,
-                    meta: json!({
-                        "deviceId": live.device_id,
-                        "host": live.host.unwrap_or_else(|| "https://api.trae.cn".into()),
-                        "reqSource": crate::adapters::trae_local::request_source_for_dir(&live.data_dir),
-                    }),
+                    meta,
                 }
             }
             "wb" | "workbuddy" => {
-                let sess = crate::adapters::wb_local::read_session(intl, None).ok().flatten()
+                // 新版会话字段级加密：read_session_full 会在需要时拉起客户端取密钥解密
+                let sess = crate::adapters::wb_local::read_session_full(intl)
+                    .map_err(|e| PlatformError::Local(format!("读取 WorkBuddy 会话失败: {e}")))?
                     .ok_or_else(|| PlatformError::Local("未发现 WorkBuddy 会话文件（未登录或未安装）".into()))?;
                 let acc = crate::adapters::wb_local::session_to_account(&sess)
-                    .ok_or_else(|| PlatformError::Local("会话文件缺少 accessToken".into()))?;
+                    .ok_or_else(|| PlatformError::Local("会话文件缺少 accessToken（客户端可能未登录）".into()))?;
                 crate::adapters::Cred {
                     provider: if intl { "workbuddy-intl".into() } else { "workbuddy".into() },
                     uid: acc.get("uid").and_then(|u| u.as_str()).unwrap_or_default().to_string(),
@@ -288,13 +298,23 @@ impl Service {
                 let Some(live) = crate::adapters::zcode_local::read_live_auth() else {
                     return Err(PlatformError::Local("未发现 ZCode 登录信息（客户端未安装或未登录）".into()));
                 };
+                // ZCode 客户端同一时间只有一个登录账号：导入后清理旧 uid 账号（重登会换 uid）
+                let new_uid = live.uid.clone();
+                if let Ok(rows) = self.store.list_accounts() {
+                    for (p, u, _, _, _) in rows {
+                        if p == "zcode" && u != new_uid {
+                            let _ = self.store.delete_account("zcode", &u);
+                        }
+                    }
+                }
                 crate::adapters::Cred {
                     provider: "zcode".into(),
                     uid: live.uid,
                     name: live.name.unwrap_or_else(|| "ZCode (智谱)".into()),
                     token: live.access_token,
                     refresh_token: None,
-                    expires_at: None,
+                    // zcodejwttoken 是 JWT：解码 exp 填 expires_at（UI 显示用）
+                    expires_at: live.zcode_jwt.as_deref().and_then(jwt_exp_of),
                     meta: json!({
                         "deviceMid": live.device_mid,
                         "zcodeJwt": live.zcode_jwt.unwrap_or_default(),
@@ -303,22 +323,26 @@ impl Service {
             }
             "codearts" | "codearts-desktop" => {
                 let desktop = platform == "codearts-desktop";
-                let Some(live) = crate::adapters::codearts_local::read_live_session(desktop) else {
+                // 通道共用同一账号 STS 会话：找不到对应客户端时回退另一通道的本机会话
+                let live = crate::adapters::codearts_local::read_live_session(desktop)
+                    .or_else(|| crate::adapters::codearts_local::read_live_session(!desktop));
+                let Some(live) = live else {
                     return Err(PlatformError::Local("未发现码道客户端登录信息（请先在码道客户端登录后再扫描，或改用「添加账号」走授权流程）".into()));
                 };
+                // 注意：read_live_session 返回的是 {loginContext, session} 根对象，字段在 session 下
                 let sess = &live.session;
-                let ak = sess.get("accessKey").and_then(|a| a.as_str()).unwrap_or_default().to_string();
-                let sk = sess.get("secretKey").and_then(|a| a.as_str()).unwrap_or_default().to_string();
-                let st_ = sess.get("securityToken").and_then(|a| a.as_str()).unwrap_or_default().to_string();
+                let ak = sess.pointer("/session/accessKey").and_then(|a| a.as_str()).unwrap_or_default().to_string();
+                let sk = sess.pointer("/session/secretKey").and_then(|a| a.as_str()).unwrap_or_default().to_string();
+                let st_ = sess.pointer("/session/securityToken").and_then(|a| a.as_str()).unwrap_or_default().to_string();
                 if ak.is_empty() || sk.is_empty() {
                     return Err(PlatformError::Local("码道会话缺少 accessKey/secretKey，请重新在客户端登录后再扫描".into()));
                 }
-                let uid = sess.get("userId").and_then(|a| a.as_str()).unwrap_or_default().to_string();
-                let name = sess.get("userName").and_then(|a| a.as_str())
+                let uid = sess.pointer("/session/userId").and_then(|a| a.as_str()).unwrap_or_default().to_string();
+                let name = sess.pointer("/session/userName").and_then(|a| a.as_str())
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| if desktop { "码道桌面".into() } else { "华为云码道".into() });
                 // expiresAt 是 epoch 毫秒 → 转 ISO（显示用）
-                let expires_iso = sess.get("expiresAt").and_then(|e| e.as_i64()).map(|ms| {
+                let expires_iso = sess.pointer("/session/expiresAt").and_then(|e| e.as_i64()).map(|ms| {
                     let days = ms / 1000 / 86400;
                     let (y, mo, d) = crate::adapters::civil_from_days(days);
                     format!("{y:04}-{mo:02}-{d:02}")
@@ -329,7 +353,7 @@ impl Service {
                     name: name.clone(),
                     token: String::new(),
                     // RT 入库：客户端回写的 RT 几乎总是最新可用的一条
-                    refresh_token: sess.get("refreshToken").and_then(|a| a.as_str()).map(|s| s.to_string()),
+                    refresh_token: sess.pointer("/session/refreshToken").and_then(|a| a.as_str()).map(|s| s.to_string()),
                     expires_at: expires_iso,
                     meta: json!({
                         "access_key_id": ak, "secret_access_key": sk, "security_token": st_,
@@ -345,8 +369,14 @@ impl Service {
                 // verify 校验（caller-identity；失败不阻塞导入）
                 let adapter = crate::adapters::codearts::CodeArtsAdapter { desktop };
                 if let Ok(id) = crate::adapters::Adapter::verify(&adapter, &cred).await {
-                    if let Some(n) = id.get("user").and_then(|u| u.get("name")).and_then(|n| n.as_str()) {
-                        cred.name = n.to_string();
+                    // caller-identity 返回 {account_id, principal_id, principal_urn}
+                    if let Some(pn) = id.get("principal_urn").and_then(|u| u.as_str()) {
+                        if let Some(n) = pn.rsplit(":user:").nth(1) {
+                            if !n.is_empty() { cred.name = n.to_string(); }
+                        }
+                    }
+                    if let Some(pid) = id.get("principal_id").and_then(|u| u.as_str()) {
+                        if !pid.is_empty() && cred.uid.starts_with("local-") { cred.uid = pid.to_string(); }
                     }
                 }
                 cred
@@ -447,4 +477,16 @@ fn jwt_uid_of(token: &str) -> String {
     let Ok(bytes) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(parts[1]) else { return String::new() };
     let v: Value = serde_json::from_slice(&bytes).unwrap_or_default();
     v.pointer("/data/id").and_then(|i| i.as_str()).unwrap_or("").to_string()
+}
+
+/// JWT exp claim → ISO 日期（zcodejwttoken 用）
+fn jwt_exp_of(token: &str) -> Option<String> {
+    use base64::Engine;
+    let parts: Vec<&str> = token.split('.').collect();
+    if parts.len() < 2 { return None; }
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(parts[1]).ok()?;
+    let v: Value = serde_json::from_slice(&bytes).ok()?;
+    let exp = v.get("exp").and_then(|e| e.as_i64())?;
+    let (y, mo, d) = crate::adapters::civil_from_days(exp / 86400);
+    Some(format!("{y:04}-{mo:02}-{d:02}"))
 }

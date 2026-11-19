@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 credit-core = { path = "../credit-core" }
+rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true

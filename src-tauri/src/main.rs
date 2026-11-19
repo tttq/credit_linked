@@ -270,6 +270,43 @@ async fn account_toggle_auto(provider: String, uid: String, auto: bool) -> Resul
     s.store.set_account_auto(&provider, &uid, auto).map_err(|e| e.to_string())
 }
 
+/// 从码道客户端 secretStorage 同步最新会话（AK/SK/STS/RT）到两个通道的已存账号。
+/// 客户端每次 refresh 都回写 secretStorage —— 扫描一次即可让 IDE/桌面凭据都复活。
+#[tauri::command]
+async fn codearts_sync_local() -> Result<serde_json::Value, String> {
+    use credit_core::adapters::codearts_local;
+    let mut synced = Vec::new();
+    for desktop in [true, false] {
+        let Some(live) = codearts_local::read_live_session(desktop) else { continue };
+        let s = &live.session;
+        let provider = if desktop { "codearts-desktop" } else { "codearts" };
+        let uid = s.pointer("/session/userId").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+        if uid.is_empty() { continue; }
+        let s_svc = svc()?;
+        let rows = s_svc.store.list_accounts().map_err(|e| e.to_string())?;
+        // 该通道已有账号 → 原地刷新凭据；没有则跳过（提示走扫描导入）
+        if let Some((prov, uid_existing, name, _, auth)) = rows.iter().find(|(p, _, _, _, _)| p == provider) {
+            let mut cred: credit_core::adapters::Cred = serde_json::from_str(auth).map_err(|e| e.to_string())?;
+            cred.meta["access_key_id"] = s.pointer("/session/accessKey").cloned().unwrap_or(serde_json::Value::Null);
+            cred.meta["secret_access_key"] = s.pointer("/session/secretKey").cloned().unwrap_or(serde_json::Value::Null);
+            cred.meta["security_token"] = s.pointer("/session/securityToken").cloned().unwrap_or(serde_json::Value::Null);
+            cred.refresh_token = s.pointer("/session/refreshToken").and_then(|v| v.as_str()).map(|x| x.to_string());
+            cred.meta["verifier"] = s.pointer("/loginContext/pkcePair/codeVerifier").cloned().unwrap_or(serde_json::Value::Null);
+            cred.meta["privateJwk"] = s.pointer("/loginContext/dpopKeyPair/privateKey").cloned().unwrap_or(serde_json::Value::Null);
+            let exp_ms = s.pointer("/session/expiresAt").and_then(|e| e.as_i64());
+            if let Some(ms) = exp_ms {
+                let (y, mo, d) = credit_core::adapters::civil_from_days(ms / 1000 / 86400);
+                cred.expires_at = Some(format!("{y:04}-{mo:02}-{d:02}"));
+            }
+            let auth_js = serde_json::to_string(&cred).map_err(|e| e.to_string())?;
+            s_svc.store.upsert_account(prov, uid_existing, name, "", &auth_js).map_err(|e| e.to_string())?;
+            synced.push(provider.to_string());
+        }
+        let _ = uid;
+    }
+    Ok(serde_json::json!({ "ok": true, "synced": synced }))
+}
+
 /// 本机 Trae 客户端已注册的全部设备号（去重）
 #[tauri::command]
 async fn trae_local_devices() -> Result<Vec<String>, String> {
@@ -461,9 +498,15 @@ fn gw_router() -> Result<Router, String> {
 async fn gateway_status() -> Result<serde_json::Value, String> {
     let router = gw_router()?;
     let current = router.current_platform();
-    let accounts: serde_json::Map<String, serde_json::Value> = Platform::all().iter()
+    let mut accounts: serde_json::Map<String, serde_json::Value> = Platform::all().iter()
         .map(|p| (p.as_str().to_string(), serde_json::json!(router.accounts_for(*p).len())))
         .collect();
+    // 两个码道通道的账号数分别上报（UI 下拉按通道展示）
+    let ca = router.accounts_for(Platform::CodeArts);
+    let ca_agent = ca.iter().filter(|c| c.provider == "codearts").count();
+    let ca_desktop = ca.iter().filter(|c| c.provider == "codearts-desktop").count();
+    accounts.insert("codearts".into(), serde_json::json!(ca_agent));
+    accounts.insert("codearts-desktop".into(), serde_json::json!(ca_desktop));
     let s = svc()?;
     let port: u16 = s.store.get_setting("gatewayPort", &GATEWAY_DEFAULT_PORT.to_string())
         .ok().and_then(|v| v.parse().ok()).unwrap_or(GATEWAY_DEFAULT_PORT);
@@ -480,7 +523,7 @@ async fn gateway_status() -> Result<serde_json::Value, String> {
         "running": true,
         "port": port,
         "baseUrl": format!("http://127.0.0.1:{port}"),
-        "platform": current.as_str(),
+        "platform": router.current_platform_raw(),
         "platformLabel": current.display(),
         "accounts": accounts,
         "rules": router.list_rules(),
@@ -529,70 +572,81 @@ async fn gateway_clear_logs() -> Result<serde_json::Value, String> {
 
 // ===== 平台工具下载安装 =====
 
-/// 检测平台客户端本机是否已安装（常见安装路径 + 客户端凭据探测）
-/// 通过注册表 Uninstall 键查询本机安装的软件名列表（一次查询，缓存 5 分钟）
-fn registry_installed_names() -> Vec<String> {
-    static CACHE: std::sync::OnceLock<(std::sync::Mutex<Option<(std::time::Instant, Vec<String>)>>, )> = std::sync::OnceLock::new();
-    let cache = &CACHE.get().unwrap().0;
-    if let Ok(g) = cache.lock() {
-        if let Some((at, v)) = &*g {
-            if at.elapsed() < std::time::Duration::from_secs(300) {
-                return v.clone();
+/// 检测平台客户端本机是否已安装（注册表 Uninstall 键直查，无子进程，毫秒级）
+/// 返回 (display_name, install_location, uninstall_cmd) 列表
+fn registry_installed_entries() -> Vec<(String, String, String)> {
+    use winreg::enums::*;
+    use winreg::RegKey;
+    let mut out: Vec<(String, String, String)> = Vec::new();
+    let hives = [HKEY_LOCAL_MACHINE, HKEY_CURRENT_USER];
+    let subkeys = [
+        r"Software\Microsoft\Windows\CurrentVersion\Uninstall",
+        r"Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall",
+    ];
+    for hive in hives {
+        for sk in subkeys {
+            let Ok(root) = RegKey::predef(hive).open_subkey_with_flags(sk, KEY_READ) else { continue };
+            for key in root.enum_keys().flatten() {
+                let Ok(k) = root.open_subkey_with_flags(&key, KEY_READ) else { continue };
+                let name: String = k.get_value("DisplayName").unwrap_or_default();
+                if name.is_empty() { continue; }
+                let loc: String = k.get_value("InstallLocation").unwrap_or_default();
+                let un: String = k.get_value("UninstallString").unwrap_or_default();
+                out.push((name, loc, un));
             }
         }
     }
-    let names: Vec<String> = std::process::Command::new("powershell")
-        .args(["-NoProfile", "-Command", "$ks=@('HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*','HKLM:\\Software\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*','HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*'); Get-ItemProperty $ks -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName } | ForEach-Object { $_.DisplayName }"])
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).lines().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
-        .unwrap_or_default();
-    if let Ok(mut g) = cache.lock() {
-        *g = Some((std::time::Instant::now(), names.clone()));
-    }
-    names
+    out
 }
 
 /// 卸载器目录里找主程序（Uninstall 旁通常就是主 exe）
-fn installed_by_uninstaller(platform: &str, names: &[String]) -> bool {
-    // 注册表 DisplayName 前缀匹配
-    let hit = match platform {
-        "qoder" => names.iter().any(|n| n.to_lowercase().starts_with("qoder")),
-        "minimax" => names.iter().any(|n| n.to_lowercase().starts_with("minimax")),
-        "trae" => names.iter().any(|n| n.to_lowercase().starts_with("trae")),
-        "workbuddy" => names.iter().any(|n| n.to_lowercase().starts_with("workbuddy") || n.to_lowercase().starts_with("codebuddy")),
-        "zcode" => names.iter().any(|n| n.to_lowercase().starts_with("zcode")),
-        "codearts" | "codearts-desktop" => names.iter().any(|n| n.to_lowercase().starts_with("codearts") || n.contains("码道")),
-        _ => false,
-    };
-    if hit { return true; }
-    // 注册表 InstallLocation 不可用时兜底：扫描常见自定义安装根目录的卸载器
-    let roots = ["C:/Program Files", "C:/Program Files (x86)", "D:/ProgramFiles/develop", "D:/ProgramFiles/software", "D:/Program Files"];
-    let uninstaller_names: &[&str] = match platform {
-        "qoder" => &["Uninstall Qoder CN.exe", "Uninstall Qoder.exe"],
-        "minimax" => &["Uninstall MiniMax Code.exe"],
-        "trae" => &["Uninstall Trae CN.exe", "Uninstall Trae.exe"],
-        "workbuddy" => &["Uninstall WorkBuddy.exe", "Uninstall CodeBuddy.exe"],
-        "zcode" => &["Uninstall ZCode.exe"],
-        "codearts" | "codearts-desktop" => &["Uninstall CodeArts.exe"],
-        _ => &[],
-    };
-    roots.iter().any(|root| std::fs::read_dir(root).map(|rd| {
-        for entry in rd.filter_map(|e| e.ok()) {
-            if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) { continue; }
-            for un in uninstaller_names {
-                if entry.path().join(un).exists() { return true; }
-            }
+fn installed_by_uninstaller(platform: &str, entries: &[(String, String, String)]) -> bool {
+    entries.iter().any(|(name, _loc, _un)| {
+        let n = name.to_lowercase();
+        match platform {
+            "qoder" => n.starts_with("qoder"),
+            "minimax" => n.starts_with("minimax"),
+            "trae" => n.starts_with("trae"),
+            "workbuddy" => n.starts_with("workbuddy") || n.starts_with("codebuddy"),
+            "zcode" => n.starts_with("zcode"),
+            "codearts" | "codearts-desktop" => n.starts_with("codearts") || name.contains("码道"),
+            _ => false,
         }
-        false
-    }).unwrap_or(false))
+    })
 }
 
 fn tool_installed(platform: &str) -> bool {
+    // 用户手动导入的安装目录优先（settings: toolDir:<platform> = 主 exe 所在目录）
+    if let Ok(s) = svc() {
+        if let Ok(dir) = s.store.get_setting(&format!("toolDir:{platform}"), "") {
+            if !dir.is_empty() {
+                let d = std::path::Path::new(&dir);
+                // 目录下任一已知主 exe 或卸载器存在即视为已安装
+                if let Ok(rd) = std::fs::read_dir(d) {
+                    for e in rd.flatten() {
+                        let n: String = e.file_name().to_string_lossy().to_lowercase();
+                        if n.ends_with(".exe") && (n.contains("uninstall") || main_exe_matches(platform, &n)) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+    }
     let local = std::env::var("LOCALAPPDATA").unwrap_or_default();
     let userprofile = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).unwrap_or_default();
     // 注册表卸载信息最可靠（覆盖任意自定义安装位置）
-    let reg = registry_installed_names();
+    let reg = registry_installed_entries();
     if installed_by_uninstaller(platform, &reg) { return true; }
+    // 卸载器命令行里若带路径，其目录下通常就是主 exe
+    if let Some(hit) = reg.iter().find(|(name, _, _)| installed_by_uninstaller(platform, &[(name.clone(), String::new(), String::new())])) {
+        let un = &hit.2;
+        // "D:\...\Uninstall xxx.exe" /currentuser → 提取 exe 所在目录
+        let exe_path = un.split('"').nth(1).unwrap_or(un.split(' ').next().unwrap_or(""));
+        if !exe_path.is_empty() && std::path::Path::new(exe_path).exists() {
+            return true;
+        }
+    }
     // 下面所有路径用 '/'（Windows API 接受正斜杠），避免转义地狱
     // 卸载器/主程序常见位置（兜底）
     let candidates: Vec<String> = match platform {
@@ -649,6 +703,19 @@ fn tool_installed(platform: &str) -> bool {
         _ => vec![],
     };
     candidates.iter().chain(uninstallers.iter()).any(|c| std::path::Path::new(c).exists())
+}
+
+/// 手动导入的目录里判断 exe 文件名是否是该平台主程序
+fn main_exe_matches(platform: &str, filename_lower: &str) -> bool {
+    match platform {
+        "qoder" => filename_lower.starts_with("qoder"),
+        "minimax" => filename_lower.starts_with("minimax"),
+        "trae" => filename_lower.starts_with("trae"),
+        "workbuddy" => filename_lower.starts_with("workbuddy") || filename_lower.starts_with("codebuddy"),
+        "zcode" => filename_lower.starts_with("zcode"),
+        "codearts" | "codearts-desktop" => filename_lower.starts_with("codearts"),
+        _ => false,
+    }
 }
 
 /// 平台官方安装包直链（Windows x64）与下载页。url 为空时打开 page。
@@ -736,6 +803,37 @@ async fn tools_info() -> Result<serde_json::Value, String> {
         }));
     }
     Ok(serde_json::json!({ "items": out, "downloads": DOWNLOADS.lock().unwrap().clone(), "installDir": install_dir }))
+}
+
+/// 手动导入平台安装目录：持久化到 settings，tool_installed 优先使用
+#[tauri::command]
+async fn tools_set_install_dir(platform: String, dir: String) -> Result<serde_json::Value, String> {
+    let platform: &str = &platform;
+    let s = svc()?;
+    let key = format!("toolDir:{platform}");
+    if dir.trim().is_empty() {
+        let _ = s.store.set_setting(&key, "");
+        return Ok(serde_json::json!({ "ok": true, "installed": false, "cleared": true }));
+    }
+    let d = std::path::Path::new(dir.trim());
+    if !d.is_dir() {
+        return Err("目录不存在，请选择客户端安装目录（含主 exe）".into());
+    }
+    // 目录里至少要有一个平台相关 exe（主程序或卸载器）
+    let mut found = String::new();
+    if let Ok(rd) = std::fs::read_dir(d) {
+        for e in rd.flatten() {
+            let n: String = e.file_name().to_string_lossy().to_lowercase();
+            if n.ends_with(".exe") && (n.contains("uninstall") || main_exe_matches(platform, &n)) {
+                found = e.file_name().to_string_lossy().to_string();
+                break;
+            }
+        }
+    }
+    if found.is_empty() {
+        return Err(format!("目录里没有找到 {} 的主程序/卸载器 exe", platform));
+    }    s.store.set_setting(&key, dir.trim()).map_err(|e| e.to_string())?;
+    Ok(serde_json::json!({ "ok": true, "installed": true, "exe": found }))
 }
 
 /// 后台探测 MiniMax 最新版直链并缓存（不阻塞工具页渲染）
@@ -873,18 +971,23 @@ async fn platform_ensure_running(platform: String) -> Result<serde_json::Value, 
 
 #[tauri::command]
 async fn gateway_set_platform(platform: String) -> Result<serde_json::Value, String> {
+    // 保留原始通道字符串（codearts vs codearts-desktop 都映射 Platform::CodeArts）
+    if credit_gateway::protocol::Platform::parse(&platform).is_none() {
+        return Err(format!("未知平台: {platform}"));
+    }
     let router = gw_router()?;
-    let p = Platform::parse(&platform).ok_or_else(|| format!("未知平台: {platform}"))?;
-    router.set_current_platform(p);
-    Ok(serde_json::json!({ "ok": true, "current": p.as_str(), "label": p.display() }))
+    router.set_current_platform_str(&platform);
+    let p = credit_gateway::protocol::Platform::parse(&platform).unwrap();
+    Ok(serde_json::json!({ "ok": true, "current": platform, "label": p.display() }))
 }
 
 /// 列出当前请求平台的账号（供「一键切换账号」使用）
 #[tauri::command]
 async fn gateway_accounts() -> Result<serde_json::Value, String> {
     let router = gw_router()?;
-    let p = router.current_platform();
-    let provider = p.account_provider();
+    // 原始通道字符串：codearts / codearts-desktop 区分（都映射 Platform::CodeArts）
+    let raw = router.current_platform_raw();
+    let provider = if raw == "codearts-desktop" { "codearts-desktop" } else { Platform::parse(&raw).unwrap().account_provider() };
     let s = svc()?;
     let full = s.store.list_accounts_full().unwrap_or_default();
     let rows = s.store.list_accounts().map_err(|e| e.to_string())?;
@@ -905,7 +1008,7 @@ async fn gateway_accounts() -> Result<serde_json::Value, String> {
             })
         }).collect();
     Ok(serde_json::json!({
-        "platform": p.as_str(), "provider": provider,
+        "platform": raw, "provider": provider,
         "active": chosen, "accounts": accounts,
     }))
 }
@@ -914,20 +1017,20 @@ async fn gateway_accounts() -> Result<serde_json::Value, String> {
 #[tauri::command]
 async fn gateway_switch_account(account_ref: Option<String>) -> Result<serde_json::Value, String> {
     let router = gw_router()?;
-    let p = router.current_platform();
-    let provider = p.account_provider();
+    let raw = router.current_platform_raw();
+    let provider = if raw == "codearts-desktop" { "codearts-desktop".to_string() } else { Platform::parse(&raw).unwrap().account_provider().to_string() };
     let s = svc()?;
     let rows = s.store.list_accounts().map_err(|e| e.to_string())?;
     let valid: Vec<String> = rows.iter()
-        .filter(|(prov, _, _, _, _)| prov == provider)
+        .filter(|(prov, _, _, _, _)| prov == &provider)
         .map(|(prov, uid, _, _, _)| format!("{prov}:{uid}"))
         .collect();
     let chosen = account_ref.unwrap_or_default();
     if !chosen.is_empty() && !valid.contains(&chosen) {
-        return Err(format!("账号 {chosen} 不属于平台 {}（{}）", p.display(), provider));
+        return Err(format!("账号 {chosen} 不属于平台 {provider}"));
     }
     s.store.set_setting("gw_account", &chosen).map_err(|e| e.to_string())?;
-    Ok(serde_json::json!({ "ok": true, "platform": p.as_str(), "active": chosen, "available": valid.len() }))
+    Ok(serde_json::json!({ "ok": true, "platform": raw, "active": chosen, "available": valid.len() }))
 }
 
 #[tauri::command]
@@ -1021,6 +1124,7 @@ fn main() {
                     port,
                     device_salt: std::sync::Mutex::new(credit_gateway::server::device_salt_init()),
                     device_token: std::sync::Mutex::new(None),
+                    models_cache: std::sync::Mutex::new(None),
                 });
                 let addr = SocketAddr::from(([127, 0, 0, 1], port));
                 if let Err(e) = credit_gateway::serve(state, addr).await {
@@ -1080,11 +1184,11 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             snapshot, import, checkin, quota_refresh, history,
             login_start, login_poll, login_cancel,
-            account_delete, account_toggle_auto, trae_local_devices, trae_set_device,
+            account_delete, account_toggle_auto, trae_local_devices, trae_set_device, codearts_sync_local,
             statistics, daily_income, settings_get, settings_set, account_list_all, open_url,
             login_open_window, login_close_window,
             gateway_status, gateway_set_platform, gateway_add_rule, gateway_update_rule, gateway_delete_rule,
-            gateway_set_limits, gateway_clear_logs, gateway_accounts, gateway_switch_account, tools_info, tools_refresh_minimax_url, tools_download, tools_install, tools_open_page, quota_refresh_all, quit_app, platform_ensure_running, check_update, download_update, install_update,
+            gateway_set_limits, gateway_clear_logs, gateway_accounts, gateway_switch_account, tools_info, tools_set_install_dir, tools_refresh_minimax_url, tools_download, tools_install, tools_open_page, quota_refresh_all, quit_app, platform_ensure_running, check_update, download_update, install_update,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -162,6 +162,7 @@ pub async fn wb_fetch_models(cred: &Cred) -> Result<Vec<ModelInfo>, PlatformErro
 }
 
 /// WorkBuddy chat：POST {chat_base}/v2/chat/completions（OpenAI 线格式 SSE）
+/// 上游额度/风控错误可能以 HTTP 200 + JSON 返回（如 14018 额度用尽），此处识别并透传。
 pub async fn wb_chat_stream(cred: &Cred, body: Value, device: Option<(&str, &str, &str)>) -> Result<EventStream, String> {
     let domain = cred.meta.get("domain").and_then(|d| d.as_str()).unwrap_or("");
     let base = if wb_is_global(domain) { wb_chat_base(domain) } else { WB_CN_CHAT_BASE };
@@ -173,10 +174,36 @@ pub async fn wb_chat_stream(cred: &Cred, body: Value, device: Option<(&str, &str
         req = req.header(k, v);
     }
     let resp = send_sse(req).await?;
+    let is_sse = resp.headers().get("content-type").and_then(|v| v.to_str().ok())
+        .map(|v| v.to_lowercase().contains("text/event-stream")).unwrap_or(false);
+    if !is_sse {
+        let text = resp.text().await.unwrap_or_default();
+        let msg = serde_json::from_str::<Value>(&text).ok()
+            .and_then(|v| {
+                v.pointer("/error/data/msg").and_then(|m| m.as_str())
+                    .or_else(|| v.pointer("/error/message").and_then(|m| m.as_str()))
+                    .map(|s| s.to_string())
+            })
+            .unwrap_or_else(|| text.chars().take(300).collect());
+        let quota = text.contains("14018") || msg.contains("额度") || msg.contains("quota");
+        return Err(format!("WorkBuddy 上游返回错误{}: {msg}", if quota { "（额度不足）" } else { "" }));
+    }
     Ok(parse_openai_sse(resp.bytes_stream()))
 }
 
 // ============================ Trae ============================
+
+/// 模型 → function 映射缓存（由 trae_fetch_models 从官方 models 目录填充）。
+/// Trae 的模型只在列出它的 function 下可调用，chat 请求必须带正确的 function。
+fn trae_function_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, String>> {
+    static C: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, String>>> = std::sync::OnceLock::new();
+    C.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// 查询模型所属 function（未抓过模型目录时返回 None）
+pub fn trae_model_function(model: &str) -> Option<String> {
+    trae_function_cache().lock().ok()?.get(model).cloned()
+}
 
 /// Trae 模型目录：GET {remote}/models?functions=...
 pub async fn trae_fetch_models(cred: &Cred, intl: bool) -> Result<Vec<ModelInfo>, PlatformError> {
@@ -202,10 +229,24 @@ pub async fn trae_fetch_models(cred: &Cred, intl: bool) -> Result<Vec<ModelInfo>
     let list = body.pointer("/data/list").and_then(|l| l.as_array()).cloned().unwrap_or_default();
     let mut rows: Vec<Value> = Vec::new();
     let mut grouped = false;
+    // 模型 → 所属 function 映射：模型只在列出它的 function 下可调用（对话必须带对 function）
+    let mut fn_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     for entry in &list {
         if let Some(models) = entry.get("models").and_then(|m| m.as_array()) {
             grouped = true;
+            let fname = entry.get("function").and_then(|f| f.as_str()).unwrap_or("").to_string();
+            for m in models {
+                let name = m.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                if !name.is_empty() && !fname.is_empty() {
+                    fn_map.entry(name.to_string()).or_insert_with(|| fname.clone());
+                }
+            }
             rows.extend(models.iter().cloned());
+        }
+    }
+    if !fn_map.is_empty() {
+        if let Ok(mut cache) = trae_function_cache().lock() {
+            for (k, v) in fn_map { cache.insert(k, v); }
         }
     }
     if !grouped {
@@ -250,7 +291,12 @@ pub async fn trae_chat_stream(cred: &Cred, intl: bool, enterprise: bool, body: V
         TRAE_CN_CHAT_BASE.to_string()
     };
     let url = format!("{base}/api/agent/v3/llm_utils_chat");
-    let hs = trae_chat_headers(&cred.token, &cred.meta);
+    // SOLO 通道需要 x-uid 头；meta 里没有时用凭据 uid 补上
+    let mut meta = cred.meta.clone();
+    if meta.get("uid").and_then(|v| v.as_str()).unwrap_or("").is_empty() {
+        meta["uid"] = Value::String(cred.uid.clone());
+    }
+    let hs = trae_chat_headers(&cred.token, &meta);
     let mut req = http_client().post(&url).json(&body);
     for (k, v) in &hs {
         req = req.header(k, v);
@@ -533,67 +579,74 @@ pub fn parse_trae_sse(stream: impl Stream<Item = Result<bytes::Bytes, reqwest::E
 
 // ============================ ZCode（智谱） ============================
 
-/// 智谱模型清单：GET {ZCODE_CHAT_BASE}/api/paas/v4/models（OpenAI 风格 list）
-/// 端点不可用或返回非标准结构时返回静态已知清单（GLM 系列）。
-pub async fn zcode_fetch_models(cred: &Cred) -> Result<Vec<ModelInfo>, PlatformError> {
-    let mid = cred.meta.get("deviceMid").and_then(|d| d.as_str()).unwrap_or("");
-    let hs = zcode_chat_headers(&cred.token, Some(mid));
-    let url = format!("{ZCODE_CHAT_BASE}/api/paas/v4/models");
-    let mut req = http_client().get(&url);
-    for (k, v) in &hs {
-        req = req.header(k, v);
-    }
+/// 智谱模型清单：与官方 ZCode 客户端 Start Plan 目录对齐（GLM 系列）。
+/// 按用户要求不再请求公开平台 API（open.bigmodel.cn），目录直接取官方客户端 catalog。
+pub async fn zcode_fetch_models(_cred: &Cred) -> Result<Vec<ModelInfo>, PlatformError> {
     let mut out = Vec::new();
-    if let Ok(resp) = req.send().await {
-        if resp.status().as_u16() == 200 {
-            if let Ok(body) = resp.json::<Value>().await {
-                if let Some(list) = body.get("data").and_then(|d| d.as_array()) {
-                    for m in list {
-                        let id = m.get("id").and_then(|i| i.as_str()).unwrap_or_default().to_string();
-                        if id.is_empty() { continue; }
-                        out.push(ModelInfo {
-                            name: m.get("display_name").and_then(|n| n.as_str()).filter(|s| !s.is_empty())
-                                .or_else(|| m.get("name").and_then(|n| n.as_str()))
-                                .unwrap_or(&id).to_string(),
-                            id,
-                            context_window: m.get("context_length").and_then(|v| v.as_u64())
-                                .or_else(|| m.get("context_window").and_then(|v| v.as_u64())),
-                            max_tokens: None,
-                            credit_multiplier: None,
-                            supports_images: None,
-                        });
-                    }
-                }
-            }
-        }
-    }
-    if out.is_empty() {
-        // 静态已知 GLM 清单（开放平台公开模型）
-        for (id, name, ctx) in [
-            ("glm-5.3", "GLM-5.3", 200_000u64),
-            ("glm-5.2", "GLM-5.2", 128_000),
-            ("glm-5.3-flash", "GLM-5.3-Flash", 200_000),
-            ("glm-5-flash", "GLM-5-Flash", 128_000),
-            ("glm-5.3-air", "GLM-5.3-Air", 200_000),
-            ("glm-4.7", "GLM-4.7", 200_000),
-        ] {
-            out.push(ModelInfo { id: id.into(), name: name.into(), context_window: Some(ctx), max_tokens: None, credit_multiplier: None, supports_images: None });
-        }
+    for (id, name, ctx) in [
+        ("glm-5.3", "GLM-5.3", 200_000u64),
+        ("glm-5.3-flash", "GLM-5.3-Flash", 200_000),
+        ("glm-5.2", "GLM-5.2", 128_000),
+        ("glm-5-flash", "GLM-5-Flash", 128_000),
+        ("glm-5.3-air", "GLM-5.3-Air", 200_000),
+        ("glm-4.7", "GLM-4.7", 200_000),
+    ] {
+        out.push(ModelInfo { id: id.into(), name: name.into(), context_window: Some(ctx), max_tokens: None, credit_multiplier: None, supports_images: None });
     }
     Ok(out)
 }
 
-/// 智谱 chat：POST open.bigmodel.cn/api/paas/v4/chat/completions（OpenAI 线格式 SSE）
+/// ZCode chat 通道：**只走本地 ZCode 软件的真实请求地址**（不走公开平台 API）。
+/// 逆向确认（桌面客户端 host 包 + 内核 zcode.cjs）：
+///   POST https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages
+///   凭据 = 本机 credentials.json 解密出的 zcodejwttoken（Start Plan 专用）
+///   请求头 = 官方客户端同款（X-Device-Mid / X-ZCode-App-Version / X-Platform …）
+/// 注意：该端点有服务端「仅官方客户端」校验（code=3012），非官方客户端会被拒；
+/// 这是服务端限制，网关会返回明确提示而不是回退到公开平台 API。
 pub async fn zcode_chat_stream(cred: &Cred, body: Value) -> Result<EventStream, String> {
     let mid = cred.meta.get("deviceMid").and_then(|d| d.as_str()).unwrap_or("");
-    let url = format!("{ZCODE_CHAT_BASE}{ZCODE_CHAT_PATH}");
-    let hs = zcode_chat_headers(&cred.token, Some(mid));
-    let mut req = http_client().post(&url).json(&body);
-    for (k, v) in &hs {
-        req = req.header(k, v);
+    let model = body.get("model").and_then(|m| m.as_str()).unwrap_or("").to_string();
+    let max_tokens = body.get("max_tokens").and_then(|v| v.as_u64()).map(|v| v as u32);
+    // 从 OpenAI messages 里分离 system（Anthropic 线格式用独立 system 字段）
+    let msgs: Vec<Value> = body.get("messages").and_then(|m| m.as_array()).cloned().unwrap_or_default();
+    let mut system = String::new();
+    let mut rest: Vec<Value> = Vec::new();
+    for m in &msgs {
+        if m.get("role").and_then(|r| r.as_str()) == Some("system") {
+            if let Some(s) = m.get("content").and_then(|c| c.as_str()) {
+                if system.is_empty() { system = s.to_string(); } else { system.push('\n'); system.push_str(s); }
+            }
+            continue;
+        }
+        rest.push(m.clone());
     }
-    let resp = send_sse(req).await?;
-    Ok(parse_openai_sse(resp.bytes_stream()))
+    let jwt = cred.meta.get("zcodeJwt").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    if jwt.is_empty() {
+        return Err("本机 ZCode 凭据缺少 zcodejwttoken（Start Plan 对话令牌），请重新登录 ZCode 客户端并「扫描本机」".into());
+    }
+    let a_body = crate::protocol::zcode_anthropic_body(&rest, &system, &model, max_tokens);
+    let url = format!("{}{}", crate::protocol::ZCODE_PLAN_ANTHROPIC_BASE, crate::protocol::ZCODE_ANTHROPIC_PATH);
+    let mut hs = crate::protocol::zcode_chat_headers(&jwt, Some(mid));
+    hs.push(("anthropic-version".to_string(), "2023-06-01".to_string()));
+    let mut req = http_client().post(&url).json(&a_body);
+    for (k, v) in &hs { req = req.header(k, v); }
+    let resp = match req.send().await {
+        Ok(r) => r,
+        Err(e) => return Err(format!("ZCode 本地客户端端点请求失败（{url}）：{e}")),
+    };
+    let st = resp.status().as_u16();
+    if st == 200 {
+        return Ok(parse_anthropic_sse(resp.bytes_stream()));
+    }
+    let txt = resp.text().await.unwrap_or_default();
+    if txt.contains("3012") || txt.contains("official ZCode client") {
+        return Err(format!(
+            "ZCode 本地客户端端点拒绝第三方调用（HTTP {st} code=3012 This client is not supported）：\
+             该 Start Plan 对话端点由服务端校验官方客户端身份，第三方网关无法代替官方客户端发起对话；\
+             本网关已支持 ZCode 的模型目录/余额等账号功能，对话请使用 ZCode 客户端本身（{url}）"
+        ));
+    }
+    Err(format!("ZCode 本地客户端端点返回 HTTP {st}：{}", truncate(&txt, 240)))
 }
 
 // ============================ MiniMax ============================
@@ -847,10 +900,13 @@ fn find_node() -> Result<String, PlatformError> {
 }
 
 fn sidecar_script() -> Result<std::path::PathBuf, PlatformError> {
-    // sidecar 目录与本 crate 同级：crates/credit-gateway/sidecar/qoder-signer.mjs
+    // sidecar 目录：开发时 crates/credit-gateway/sidecar/；打包后在 resource 目录（exe 同级 sidecar/）
     let candidates = [
         std::env::var("QODER_SIGNER").ok().map(std::path::PathBuf::from),
         std::env::current_exe().ok().and_then(|e| e.parent().map(|p| p.join("sidecar/qoder-signer.mjs"))),
+        // Tauri NSIS 安装布局：resources 放在安装根/resources/ 下
+        std::env::current_exe().ok().and_then(|e| e.parent().and_then(|p| p.parent()).map(|p| p.join("resources/sidecar/qoder-signer.mjs"))),
+        std::env::current_exe().ok().and_then(|e| e.parent().map(|p| p.join("../resources/sidecar/qoder-signer.mjs"))),
         std::env::current_dir().ok().map(|d| d.join("crates/credit-gateway/sidecar/qoder-signer.mjs")),
     ];
     for c in candidates.into_iter().flatten() {
@@ -859,6 +915,82 @@ fn sidecar_script() -> Result<std::path::PathBuf, PlatformError> {
         }
     }
     Err(PlatformError::Local("qoder-signer.mjs not found (set QODER_SIGNER)".into()))
+}
+
+/// 华为码道 chat：POST {snap-access}/api/v2/chat/completions（OpenAI 兼容 SSE）。
+/// 签名头集与 PromptCenter 门面不同：无 agent-type；x-auth-token 与 x-security-token 同值。
+/// desktop/IDE 仅影响通道头（x-ot-client-type / ide-name / plugin-name）。
+pub async fn codearts_chat_stream(cred: &Cred, body: Value, desktop: bool) -> Result<EventStream, String> {
+    let sts = cred.meta.get("security_token").and_then(|t| t.as_str()).unwrap_or("");
+    let ak = cred.meta.get("access_key_id").and_then(|a| a.as_str()).unwrap_or("");
+    let sk = cred.meta.get("secret_access_key").and_then(|a| a.as_str()).unwrap_or("");
+    if ak.is_empty() || sk.is_empty() {
+        return Err("码道凭据缺少 AK/SK —— 请重新扫描导入".into());
+    }
+    let host = "snap-access.cn-north-4.myhuaweicloud.com";
+    let path = "/api/v2/chat/completions";
+    let body_str = serde_json::to_string(&body).map_err(|e| e.to_string())?;
+    let model = body.get("model").and_then(|m| m.as_str()).unwrap_or("").to_string();
+
+    // 通道头（桌面 vs IDE 插件；凭据共用同一 STS 会话）
+    let client_type = if desktop { "desktop" } else { "ide" };
+    let ide_name = if desktop { "codearts_space" } else { "codemate_vscode" };
+    let trace_hex: String = {
+        let mut b = [0u8; 16];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut b);
+        b.iter().map(|x| format!("{x:02x}")).collect()
+    };
+    let span_hex: String = {
+        let mut b = [0u8; 8];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut b);
+        b.iter().map(|x| format!("{x:02x}")).collect()
+    };
+    // 实测：网关校验 x-span-id 类头 max length 64 —— x-snap-traceid 不能拼 uuid_hex(65)，
+    // 用单段 hex32；span/trace 各自独立 hex 亦在 64 内
+    let trace = trace_hex.clone();
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
+    let (y, mo, d) = credit_core::adapters::civil_from_days(now / 86400);
+    let rem = now % 86400;
+    let created = format!("{y:04}-{mo:02}-{d:02}T{:02}:{:02}:{:02}Z", rem / 3600, (rem % 3600) / 60, rem % 60);
+
+    // 业务头（content-type/host/x-sdk-date 由 sign_codearts 内部补全并纳入签名）
+    let extra: Vec<(String, String)> = vec![
+        ("x-security-token".into(), sts.to_string()),
+        ("x-auth-token".into(), sts.to_string()),
+        ("user-session-id".into(), uuid::Uuid::new_v4().to_string()),
+        ("x-snap-traceid".into(), trace.clone()),
+        ("x-span-id".into(), uuid::Uuid::new_v4().to_string()),
+        ("traceid".into(), trace.clone()),
+        ("x-ot-trace-id".into(), trace.clone()),
+        ("x-ot-span-id".into(), span_hex),
+        ("x-ot-client-version".into(), "0.2.9".into()),
+        ("x-ot-client-type".into(), client_type.into()),
+        ("ide-name".into(), ide_name.into()),
+        ("ide-version".into(), "0.2.9".into()),
+        ("plugin-name".into(), ide_name.into()),
+        ("plugin-version".into(), "0.2.9".into()),
+        ("user-msg-id".into(), format!("msg_{}", uuid::Uuid::new_v4().simple())),
+        ("created-time".into(), created),
+        ("model-id".into(), model.clone()),
+        ("model-name".into(), model),
+    ];
+    let host_of = host.to_string();
+    let (auth, signed) = credit_core::adapters::codearts::sign_codearts(ak, sk, "POST", &host_of, path, "", &extra, &body_str, Some(sts));
+    let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(300)).build().unwrap();
+    let url = format!("https://{host}{path}");
+    let mut req = client.post(&url).header("Content-Type", "application/json");
+    for (k, v) in &signed {
+        req = req.header(k, v);
+    }
+    req = req.header("Authorization", &auth).body(body_str);
+    let resp = req.send().await.map_err(|e| format!("network: {e}"))?;
+    let status = resp.status().as_u16();
+    if !(200..300).contains(&status) {
+        let text = resp.text().await.unwrap_or_default();
+        return Err(format!("CodeArts chat HTTP {status}: {}", truncate(&text, 300)));
+    }
+    // OpenAI 兼容 SSE（data: 帧 + [DONE]），reasoning_content 已被 parse_openai_chunk 支持
+    Ok(parse_openai_sse(resp.bytes_stream()))
 }
 
 /// 华为码道模型清单：GET {API_BASE}/v1/model/builtin（HWS 签名 + x-security-token）

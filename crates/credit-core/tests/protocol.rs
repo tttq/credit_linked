@@ -4,7 +4,6 @@ use credit_core::adapters::codearts::sign_codearts;
 use credit_core::adapters::trae::{parse_callback_query, urlencoding_lite};
 use credit_core::adapters::trae_local::request_source_for_dir;
 use credit_core::adapters::wb_local::build_envelope_aad;
-use credit_core::adapters::zcode::evidence_key;
 use credit_core::crypto::aes_cbc::{tc_decrypt, HEADER};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
@@ -114,17 +113,6 @@ fn test_codearts_canonical_deterministic() {
     let sig1 = a1.split("Signature=").nth(1).unwrap();
     let sig2 = a2.split("Signature=").nth(1).unwrap();
     assert_eq!(sig1, sig2, "same-second signatures must match");
-}
-
-#[test]
-fn test_zcode_evidence_key_stable() {
-    let ents = vec![json!({"entitlement_id": "e1", "effective_at": 1700000000i64})];
-    let k1 = evidence_key("plan-9", &ents);
-    let k2 = evidence_key("plan-9", &ents);
-    assert_eq!(k1, k2);
-    assert_eq!(k1.len(), 64);
-    let ents2 = vec![json!({"entitlement_id": "e2", "effective_at": 1700000000i64})];
-    assert_ne!(k1, evidence_key("plan-9", &ents2));
 }
 
 #[test]

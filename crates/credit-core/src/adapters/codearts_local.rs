@@ -97,3 +97,62 @@ pub fn read_live_session(desktop: bool) -> Option<CodeArtsLive> {
     }
     None
 }
+
+/// 会话指纹（识别客户端是否刷新了 STS；不泄露明文）
+pub fn session_fingerprint(desktop: bool) -> Option<String> {
+    let live = read_live_session(desktop).or_else(|| read_live_session(!desktop))?;
+    let s = &live.session;
+    let ak = s.pointer("/session/accessKey").and_then(|v| v.as_str()).unwrap_or("");
+    let st = s.pointer("/session/securityToken").and_then(|v| v.as_str()).unwrap_or("");
+    let mut h = Sha256::new();
+    h.update(ak.as_bytes());
+    h.update(st.as_bytes());
+    Some(h.finalize().iter().map(|b| format!("{b:02x}")).collect::<String>()[..16].to_string())
+}
+
+/// 本机码道客户端 exe 候选（desktop 与 IDE 版）
+pub fn client_exe_candidates() -> Vec<std::path::PathBuf> {
+    let local = std::env::var("LOCALAPPDATA").unwrap_or_default();
+    [
+        "D:/ProgramFiles/software/CodeArts/CodeArts.exe".to_string(),
+        format!("{local}/Programs/CodeArts/CodeArts.exe"),
+        "C:/Program Files/CodeArts/CodeArts.exe".to_string(),
+        "C:/Program Files (x86)/CodeArts/CodeArts.exe".to_string(),
+        "D:/ProgramFiles/develop/CodeArts/CodeArts.exe".to_string(),
+    ].into_iter().map(std::path::PathBuf::from).collect()
+}
+
+/// 找本机码道客户端 exe（已安装才返回）
+pub fn find_client_exe() -> Option<std::path::PathBuf> {
+    client_exe_candidates().into_iter().find(|p| p.exists())
+}
+
+/// 启动本机码道客户端；返回 Some(路径) = 已尝试拉起；None = 未安装
+pub fn launch_client() -> Option<std::path::PathBuf> {
+    let exe = find_client_exe()?;
+    // GUI 应用：完全分离 stdio（避免子进程继承父进程管道句柄导致挂起）
+    let _ = std::process::Command::new(&exe)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    Some(exe)
+}
+
+/// 等待客户端刷新 STS（会话指纹变化），最多 timeout
+pub fn wait_for_session_change(desktop: bool, old_fp: Option<&str>, timeout: std::time::Duration) -> Option<CodeArtsLive> {
+    let start = std::time::Instant::now();
+    loop {
+        let cur_fp = session_fingerprint(desktop);
+        let changed = match (old_fp, cur_fp.as_deref()) {
+            (Some(old), Some(cur)) => cur != old,
+            (None, Some(_)) => true,
+            _ => false,
+        };
+        if changed {
+            return read_live_session(desktop).or_else(|| read_live_session(!desktop));
+        }
+        if start.elapsed() >= timeout { return None; }
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+    }
+}

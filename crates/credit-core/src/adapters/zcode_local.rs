@@ -26,15 +26,23 @@ fn decrypt_gcm(key: &[u8; 32], iv: &[u8], tag: &[u8], data: &[u8]) -> Option<Str
 
 /// OS 密钥库读取 32 字节 key
 fn os_key(cred_file: &std::path::Path) -> Option<[u8; 32]> {
-    // 客户端支持的环境变量覆盖（app.asar gx/Xhe）
-    if let Ok(secret) = std::env::var("ZCODE_CREDENTIAL_SECRET") {
-        let key = B64URL.decode(secret.as_bytes()).ok()?;
-        if key.len() == 32 { let mut r = [0u8; 32]; r.copy_from_slice(&key); return Some(r); }
+    // 客户端语义（逆向确认）：ZCODE_CREDENTIAL_SECRET / _FILE 互斥，key = SHA256(字符串原值)
+    let env_secret = std::env::var("ZCODE_CREDENTIAL_SECRET").ok();
+    let env_file = std::env::var("ZCODE_CREDENTIAL_SECRET_FILE").ok();
+    if env_secret.is_some() && env_file.is_some() {
+        return None; // 两者同时设置客户端直接报错
     }
-    if let Ok(path) = std::env::var("ZCODE_CREDENTIAL_SECRET_FILE") {
+    if let Some(secret) = env_secret {
+        let key: [u8; 32] = Sha256::digest(secret.as_bytes()).into();
+        return Some(key);
+    }
+    if let Some(path) = env_file {
+        // 内容须为 32–4096 字节；key = SHA256(文件内容字符串)
         let s = std::fs::read_to_string(path).ok()?;
-        let key = B64URL.decode(s.trim().as_bytes()).ok()?;
-        if key.len() == 32 { let mut r = [0u8; 32]; r.copy_from_slice(&key); return Some(r); }
+        let n = s.len();
+        if !(32..=4096).contains(&n) { return None; }
+        let key: [u8; 32] = Sha256::digest(s.as_bytes()).into();
+        return Some(key);
     }
     #[cfg(windows)]
     {
@@ -62,8 +70,12 @@ fn os_key(cred_file: &std::path::Path) -> Option<[u8; 32]> {
     }
     #[cfg(not(windows))]
     {
-        let _ = cred_file;
-        let entry = keyring::Entry::new("ZCode Credential Encryption", &crate::platform_dirs::username()).ok()?;
+        // 客户端在所有平台都用 SHA256(credentials.json 绝对路径)hex 作为 keyring user
+        let abs = std::fs::canonicalize(cred_file).ok()?;
+        let abs_str = abs.to_string_lossy().to_string();
+        let abs_str = abs_str.strip_prefix("\\\\?\\").unwrap_or(&abs_str);
+        let user = hex_lower(&Sha256::digest(abs_str.as_bytes()));
+        let entry = keyring::Entry::new("ZCode Credential Encryption", &user).ok()?;
         let secret = entry.get_password().ok()?;
         let key = B64URL.decode(secret.as_bytes()).ok()?;
         if key.len() != 32 { return None; }
@@ -83,7 +95,14 @@ pub fn decode_zcode_value(raw: &str, secret: &str, os_key: Option<&[u8; 32]>) ->
             decrypt_gcm(&key, &B64URL.decode(seg[0]).ok()?, &B64URL.decode(seg[1]).ok()?, &B64URL.decode(seg[2]).ok()?)
         }
         Some("v2") => {
+            // 格式 enc:v2:{os|env}:{fp24}:{iv}.{tag}.{ct}：fp = SHA256(key).hex()[0:24]，
+            // 与当前解析出的 key 不匹配立即返回 None（客户端同语义，不做跨 key 尝试）
+            let source = parts.get(2).copied()?;
+            if source != "os" && source != "env" { return None; }
+            let fp = parts.get(3).copied()?;
             let key = os_key?;
+            let expect: String = Sha256::digest(key).iter().map(|b| format!("{b:02x}")).collect();
+            if !expect.starts_with(fp) { return None; }
             decrypt_gcm(key, &B64URL.decode(seg[0]).ok()?, &B64URL.decode(seg[1]).ok()?, &B64URL.decode(seg[2]).ok()?)
         }
         _ => None,
@@ -117,6 +136,17 @@ pub struct ZcodeLiveAuth {
     pub zcode_jwt: Option<String>,
 }
 
+/// 读取并解密单个凭据键（调试/补充 token 用，如 oauth:linked_bigmodel）
+pub fn read_credential(key_name: &str) -> Option<String> {
+    let dir = zcode_v2_dir()?;
+    let cred_file = dir.join(CREDENTIAL_FILENAME);
+    let cred: Value = serde_json::from_reader(std::fs::File::open(&cred_file).ok()?).ok()?;
+    let key = os_key(&cred_file);
+    let secret = fallback_secret();
+    let raw = cred.get(key_name)?.as_str()?;
+    decode_zcode_value(raw, &secret, key.as_ref())
+}
+
 pub fn read_live_auth() -> Option<ZcodeLiveAuth> {
     let dir = zcode_v2_dir()?;
     let cred_file = dir.join(CREDENTIAL_FILENAME);
@@ -126,6 +156,7 @@ pub fn read_live_auth() -> Option<ZcodeLiveAuth> {
     let read = |k: &str| -> Option<String> { decode_zcode_value(cred.get(k)?.as_str()?, &secret, key.as_ref()) };
     let provider = read("oauth:active_provider")?;
     let (uk, tk) = if provider == "zai_cn" { ("oauth:zai_cn:user_info", "oauth:zai_cn:access_token") }
+        else if provider == "zai" { ("oauth:zai:user_info", "oauth:zai:access_token") }
         else if provider == "bigmodel" { ("oauth:bigmodel:user_info", "oauth:bigmodel:access_token") }
         else { return None; };
     let user: Value = serde_json::from_str(&read(uk)?).ok()?;
@@ -138,4 +169,59 @@ pub fn read_live_auth() -> Option<ZcodeLiveAuth> {
     let device_mid = tele.get("deviceMid").and_then(|d| d.as_str()).unwrap_or_default().to_string();
     let name = user.get("name").and_then(|n| n.as_str()).map(|s| s.to_string());
     Some(ZcodeLiveAuth { uid, name, access_token, device_mid, zcode_jwt })
+}
+
+/// token 指纹（识别客户端是否已刷新凭据；不泄露 token 明文）
+pub fn token_fingerprint() -> Option<String> {
+    let auth = read_live_auth()?;
+    Some(hex_lower(&Sha256::digest(auth.access_token.as_bytes()))[..16].to_string())
+}
+
+/// 本机 ZCode 客户端可执行文件候选
+pub fn client_exe_candidates() -> Vec<std::path::PathBuf> {
+    let local = std::env::var("LOCALAPPDATA").unwrap_or_default();
+    [
+        "D:/ProgramFiles/develop/ZCode/ZCode.exe".to_string(),
+        format!("{local}/Programs/ZCode/ZCode.exe"),
+        format!("{local}/Programs/zcode/ZCode.exe"),
+        "C:/Program Files/ZCode/ZCode.exe".to_string(),
+        "D:/ProgramFiles/software/ZCode/ZCode.exe".to_string(),
+    ].into_iter().map(std::path::PathBuf::from).collect()
+}
+
+/// 找本机 ZCode 客户端 exe（已安装才返回）
+pub fn find_client_exe() -> Option<std::path::PathBuf> {
+    client_exe_candidates().into_iter().find(|p| p.exists())
+}
+
+/// 启动本机 ZCode 客户端（已运行则单实例应用会自动聚焦现有窗口）。
+/// 返回 Some(路径) = 已尝试拉起；None = 未安装。
+pub fn launch_client() -> Option<std::path::PathBuf> {
+    let exe = find_client_exe()?;
+    // GUI 应用：完全分离 stdio（否则子进程继承父进程管道句柄会导致父端读取挂起）
+    let _ = std::process::Command::new(&exe)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    Some(exe)
+}
+
+/// 等待客户端刷新 token（credentials.json 中的 access_token 变化），最多 timeout。
+/// 返回 Some(新 auth) = 已刷新；None = 超时/无法读取。
+pub fn wait_for_token_change(old_fp: Option<&str>, timeout: std::time::Duration) -> Option<ZcodeLiveAuth> {
+    let start = std::time::Instant::now();
+    loop {
+        let cur_fp = token_fingerprint();
+        let changed = match (old_fp, cur_fp.as_deref()) {
+            (Some(old), Some(cur)) => cur != old,
+            (None, Some(_)) => true,
+            _ => false,
+        };
+        if changed {
+            return read_live_auth();
+        }
+        if start.elapsed() >= timeout { return None; }
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+    }
 }
