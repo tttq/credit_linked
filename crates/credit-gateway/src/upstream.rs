@@ -13,7 +13,6 @@ use credit_core::adapters::Cred;
 use credit_core::error::PlatformError;
 
 use crate::protocol::*;
-use reqwest::Method;
 
 /// 上游 chat 产出的一条流事件
 #[derive(Debug, Clone)]
@@ -753,6 +752,7 @@ pub async fn qoder_fetch_models(_cred: &Cred) -> Result<Vec<ModelInfo>, Platform
 
 /// Qoder 签名 sidecar 常驻进程（每进程一个，stdio 协议）
 pub struct QoderSigner {
+    #[allow(dead_code)] // 保留句柄防止子进程被 drop 关闭；stderr 由系统接管
     child: tokio::process::Child,
     stdin: tokio::process::ChildStdin,
     stdout: tokio::process::ChildStdout,
@@ -861,18 +861,19 @@ fn sidecar_script() -> Result<std::path::PathBuf, PlatformError> {
     Err(PlatformError::Local("qoder-signer.mjs not found (set QODER_SIGNER)".into()))
 }
 
-/// 华为码道模型清单：GET {API_BASE}/v1/model/builtin（HWS 签名 + X-Security-Token）
-pub async fn codearts_fetch_models(cred: &Cred, desktop: bool) -> Result<Vec<ModelInfo>, PlatformError> {
+/// 华为码道模型清单：GET {API_BASE}/v1/model/builtin（HWS 签名 + x-security-token）
+pub async fn codearts_fetch_models(cred: &Cred, _desktop: bool) -> Result<Vec<ModelInfo>, PlatformError> {
     // 官方客户端 listBuiltinModels 形态：GET /v1/model/builtin + X-Security-Token + Agent-Type: PromptCenter
     let sts = cred.meta.get("security_token").and_then(|t| t.as_str()).unwrap_or("");
     let ak = cred.meta.get("access_key_id").and_then(|a| a.as_str()).unwrap_or("");
     let sk = cred.meta.get("secret_access_key").and_then(|a| a.as_str()).unwrap_or("");
     let base = "https://snap-access.cn-north-4.myhuaweicloud.com";
     let url = format!("{base}/v1/model/builtin");
+    // header 名统一小写，与 sign_codearts 的 SignedHeaders 一致（HWS 按字节匹配）
     let extra_headers: Vec<(String, String)> = vec![
-        ("X-Security-Token".into(), sts.to_string()),
-        ("Agent-Type".into(), "PromptCenter".into()),
-        ("X-Language".into(), "zh-cn".into()),
+        ("x-security-token".into(), sts.to_string()),
+        ("agent-type".into(), "PromptCenter".into()),
+        ("x-language".into(), "zh-cn".into()),
     ];
     let body_str = "";
     // 用 credit-core 的 sign_codearts 构造 HWS 签名头
@@ -908,7 +909,6 @@ pub async fn codearts_fetch_models(cred: &Cred, desktop: bool) -> Result<Vec<Mod
 }
 /// Qoder chat：sidecar 签名 → POST agent_chat_generation（SSE 双层信封 → OpenAI chunk）
 pub async fn qoder_chat_stream(cred: &Cred, body: Value) -> Result<EventStream, String> {
-    use tokio::io::AsyncBufReadExt;
     // 1. 签名
     let mut signer = QoderSigner::spawn().await.map_err(|e| e.to_string())?;
     let signed = signer.sign(&json!({

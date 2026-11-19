@@ -26,6 +26,16 @@ fn decrypt_gcm(key: &[u8; 32], iv: &[u8], tag: &[u8], data: &[u8]) -> Option<Str
 
 /// OS 密钥库读取 32 字节 key
 fn os_key(cred_file: &std::path::Path) -> Option<[u8; 32]> {
+    // 客户端支持的环境变量覆盖（app.asar gx/Xhe）
+    if let Ok(secret) = std::env::var("ZCODE_CREDENTIAL_SECRET") {
+        let key = B64URL.decode(secret.as_bytes()).ok()?;
+        if key.len() == 32 { let mut r = [0u8; 32]; r.copy_from_slice(&key); return Some(r); }
+    }
+    if let Ok(path) = std::env::var("ZCODE_CREDENTIAL_SECRET_FILE") {
+        let s = std::fs::read_to_string(path).ok()?;
+        let key = B64URL.decode(s.trim().as_bytes()).ok()?;
+        if key.len() == 32 { let mut r = [0u8; 32]; r.copy_from_slice(&key); return Some(r); }
+    }
     #[cfg(windows)]
     {
         let abs = std::fs::canonicalize(cred_file).ok()?;
@@ -35,7 +45,10 @@ fn os_key(cred_file: &std::path::Path) -> Option<[u8; 32]> {
         let target = format!("{}.ZCode Credential Encryption", hash);
         let candidates = [
             std::env::var("ZCODE_OSKEY_SCRIPT").ok().map(std::path::PathBuf::from),
+            // 打包后：Tauri resource_dir / scripts
+            std::env::var("RESOURCE_DIR").ok().map(|d| std::path::PathBuf::from(d).join("scripts/zcode-oskey.ps1")),
             std::env::current_exe().ok().and_then(|e| e.parent().map(|x| x.join("scripts/zcode-oskey.ps1"))),
+            std::env::current_exe().ok().and_then(|e| e.parent().map(|x| x.join("../resources/scripts/zcode-oskey.ps1"))),
             std::env::current_dir().ok().map(|d| d.join("crates/credit-core/scripts/zcode-oskey.ps1")),
         ];
         let script = candidates.into_iter().flatten().find(|x| x.exists())?;
@@ -95,7 +108,14 @@ pub fn zcode_v2_dir() -> Option<std::path::PathBuf> {
     None
 }
 
-pub struct ZcodeLiveAuth { pub uid: String, pub name: Option<String>, pub access_token: String, pub device_mid: String }
+pub struct ZcodeLiveAuth {
+    pub uid: String,
+    pub name: Option<String>,
+    pub access_token: String,
+    pub device_mid: String,
+    /// plan/billing 类接口只认 zcodejwttoken（OAuth access_token 会 401）
+    pub zcode_jwt: Option<String>,
+}
 
 pub fn read_live_auth() -> Option<ZcodeLiveAuth> {
     let dir = zcode_v2_dir()?;
@@ -112,8 +132,10 @@ pub fn read_live_auth() -> Option<ZcodeLiveAuth> {
     let uid = user.get("user_id").or_else(|| user.get("id")).and_then(|x| x.as_str())?.to_string();
     let access_token = read(tk)?;
     if access_token.is_empty() { return None; }
+    // zcodejwttoken：plan/billing 接口专用；可能缺失或为空
+    let zcode_jwt = read("zcodejwttoken").filter(|s| !s.is_empty());
     let tele: Value = serde_json::from_reader(std::fs::File::open(dir.join(TELEMETRY_FILENAME)).ok()?).ok()?;
     let device_mid = tele.get("deviceMid").and_then(|d| d.as_str()).unwrap_or_default().to_string();
     let name = user.get("name").and_then(|n| n.as_str()).map(|s| s.to_string());
-    Some(ZcodeLiveAuth { uid, name, access_token, device_mid })
+    Some(ZcodeLiveAuth { uid, name, access_token, device_mid, zcode_jwt })
 }

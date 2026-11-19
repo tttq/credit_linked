@@ -7,6 +7,7 @@ pub mod minimax;
 pub mod minimax_local;
 pub mod qoder;
 pub mod codearts;
+pub mod codearts_local;
 pub mod zcode;
 pub mod zcode_local;
 

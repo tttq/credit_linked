@@ -6,7 +6,6 @@ use credit_core::adapters::trae_local::request_source_for_dir;
 use credit_core::adapters::wb_local::build_envelope_aad;
 use credit_core::adapters::zcode::evidence_key;
 use credit_core::crypto::aes_cbc::{tc_decrypt, HEADER};
-use credit_core::schedule::RandomSchedule;
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use serde_json::json;
@@ -25,7 +24,7 @@ fn seal_for_test(body: &[u8], salt: [u8; 32]) -> String {
     let k = Sha512::digest(&cat);
     let mut mac_and_body = Sha512::digest(body).to_vec();
     mac_and_body.extend_from_slice(body);
-    let mut enc = Aes128CbcEnc::new((&k[..16]).into(), (&k[16..32]).into());
+    let enc = Aes128CbcEnc::new((&k[..16]).into(), (&k[16..32]).into());
     let mut out = vec![0u8; mac_and_body.len() + 16];
     out[..mac_and_body.len()].copy_from_slice(&mac_and_body);
     let n = enc.encrypt_padded_mut::<Pkcs7>(&mut out, mac_and_body.len()).unwrap().len();
@@ -98,7 +97,6 @@ fn test_wb_envelope_aad_tlv() {
 
 #[test]
 fn test_codearts_idempotent_key_shape() {
-    use sha2::Digest;
     let day = credit_core::adapters::day_cn();
     let key = credit_core::adapters::codearts::sign_codearts("AK", "SK", "GET", "snap-access.cn-north-4.myhuaweicloud.com", "/v1/ops/delivery", "channel=IDE", &[], "", None);
     let (auth, headers) = key;

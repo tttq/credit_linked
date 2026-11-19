@@ -19,6 +19,7 @@ pub const AGENT_BASE: &str = "https://agent.minimax.cn";
 pub const CLIENT_ID: &str = "mcode-public";
 pub const SUFFIX: &str = "?timezone_offset=28800&is_desktop=1&client=desktop";
 
+#[allow(dead_code)]
 fn form(headers_token: Option<&str>, pairs: &[(&str, &str)]) -> (Vec<(String, String)>, Option<Value>) {
     let mut hs = vec![("Content-Type".to_string(), "application/x-www-form-urlencoded".to_string())];
     if let Some(t) = headers_token {
@@ -230,7 +231,7 @@ impl Adapter for MiniMaxAdapter {
         // refresh_token 轮换：新 RT 必须保存，否则旧 RT 立即作废
         if let Some(r) = v.get("refresh_token").and_then(|t| t.as_str()) { out.refresh_token = Some(r.to_string()); }
         out.expires_at = v.get("expires_in").and_then(|e| e.as_u64())
-            .map(|secs| (chrono_now_plus(secs)));
+            .map(|secs| chrono_now_plus(secs));
         Ok(out)
     }
 }

@@ -45,6 +45,25 @@ const $ = (s) => document.querySelector(s);
 const $$ = (s) => [...document.querySelectorAll(s)];
 const esc = (v) => { const d = document.createElement('div'); d.textContent = v == null ? '' : String(v); return d.innerHTML; };
 function toast(msg, ms = 2800) { const t = $('#toast'); t.textContent = msg; t.style.display = 'block'; clearTimeout(t._h); t._h = setTimeout(() => t.style.display = 'none', ms); }
+
+// 居中确认弹框（替代原生 confirm/alert）
+function confirmBox(title, message, { okText = '确定', cancelText = '取消', danger = false, onlyOk = false } = {}) {
+  return new Promise(resolve => {
+    const mask = $('#confirm-mask');
+    if (!mask) { resolve(window.confirm(message)); return; }
+    $('#confirm-title').textContent = title;
+    $('#confirm-desc').textContent = message;
+    const yes = $('#confirm-yes'), no = $('#confirm-no');
+    yes.textContent = okText;
+    yes.className = 'primary' + (danger ? ' danger-ghost' : '');
+    no.textContent = cancelText;
+    no.style.display = onlyOk ? 'none' : '';
+    mask.style.display = 'flex';
+    const done = (v) => { mask.style.display = 'none'; yes.onclick = null; no.onclick = null; resolve(v); };
+    yes.onclick = () => done(true);
+    no.onclick = () => done(false);
+  });
+}
 function platName(p) { return (PLAT[p] || {}).name || p; }
 function platMeta(p) { return PLAT[p] || { color: '#456' }; }
 function picon(p, cls) {
@@ -88,9 +107,9 @@ function showPage(p) {
   curPage = p;
   $$('.page').forEach(s => s.classList.toggle('active', s.id === 'page-' + p));
   $$('#nav button').forEach(b => b.classList.toggle('selected', b.dataset.page === p));
-  // 一键签到/刷新 仅在 签到中心 与 账号管理 显示
+  // 顶部工具条仅签到中心保留；账号管理的刷新/签到在页面内页头
   const toolbar = document.querySelector('.account-toolbar');
-  if (toolbar) toolbar.style.display = (p === 'checkin' || p === 'accounts') ? 'flex' : 'none';
+  if (toolbar) toolbar.style.display = (p === 'checkin') ? 'flex' : 'none';
   if (p === 'statistics') refreshStatistics();
   if (p === 'overview') drawOverview();
 }
@@ -186,7 +205,7 @@ function renderAccounts() {
       '<span class="account-platform-count subtle">' + list.length + ' 个账号</span></div>' +
       '<div class="actions">' +
       (m.login !== 'none' ? '<button data-add="' + p + '" class="small primary">＋ 添加账号</button>' : '') +
-      (['trae','workbuddy','qoder','zcode','minimax'].includes(p) ? '<button data-import="' + p + '" class="small">扫描本机</button>' : '') +
+      (['trae','workbuddy','qoder','zcode','minimax','codearts','codearts-desktop'].includes(p) ? '<button data-import="' + p + '" class="small">扫描本机</button>' : '') +
       '</div></header>' +
       (list.length ? list.map(a => acctRow(a, p)).join('') : '<div class="empty" style="padding:14px">尚未添加账号 —— 点右上角「添加账号」开始</div>') +
       '</section>';
@@ -205,14 +224,17 @@ function renderAccounts() {
 }
 function acctRow(a, p) {
   const q = parseQuota(a);
+  const done = a.status === 'success' || a.status === 'already';
+  const stateText = done ? '今日已领取' : (a.status === 'failed' || a.status === 'auth-expired' ? '签到异常' : '今日未领取');
+  const stateCls = done ? 'done' : (a.status === 'failed' || a.status === 'auth-expired' ? 'bad' : '');
   return '<div class="account-group-row" data-p="' + esc(a.provider) + '" data-u="' + esc(a.uid) + '">' +
-    '<div class="single-account-identity"><strong>' + esc(a.name || platName(p)) + '</strong><small>' + esc(a.uid) + (a.expires ? ' · 凭据到期 ' + a.expires.slice(0, 10) : '') + '</small></div>' +
-    '<div class="single-account-balance"><strong>' + (q && q.remaining != null ? fmt(q.remaining) : '—') + '</strong><small>' + esc(a.message || '') + '</small></div>' +
-    '<div class="single-account-status">' + stInfo(a.status) + '</div>' +
+    '<div class="single-account-identity"><strong>' + esc(a.name || platName(p)) + ' <span class="acct-state ' + stateCls + '">(' + stateText + ')</span></strong><small>' + esc(a.uid) + (a.expires ? ' · 凭据到期 ' + a.expires.slice(0, 10) : '') + '</small></div>' +
+    '<div class="single-account-balance"><strong>' + (q && q.remaining != null ? fmt(q.remaining) : '—') + '</strong><small>可用余额' + (a.message ? ' · ' + esc(a.message) : '') + '</small></div>' +
     '<div class="account-row-actions acct-actions">' +
     '<label class="switch" title="自动签到"><input type="checkbox" data-auto ' + (a.auto ? 'checked' : '') + '><span class="track"><span class="knob"></span></span></label>' +
-    '<button class="small" data-act="checkin">签到</button>' +
+    '<button class="small" data-act="checkin"' + (done ? ' disabled title="今日已领取"' : '') + '>' + (done ? '今日已领取' : '签到') + '</button>' +
     '<button class="small" data-act="quota">额度</button>' +
+    (p === 'trae' ? '<button class="small" data-act="device" title="Trae 一个设备号一天只能签一个账号：为该账号设置独立设备号">设备号</button>' : '') +
     '<button class="small danger-ghost" data-act="del">删除</button>' +
     '</div></div>';
 }
@@ -241,8 +263,12 @@ function wire(el) {
         const q = await invoke('quota_refresh', { provider: p, uid });
         const bal = row.querySelector('.single-account-balance strong');
         if (bal) bal.textContent = q.remaining != null ? fmt(q.remaining) : '—';
+      } else if (el.dataset.act === 'device') {
+        el.disabled = false; el.textContent = old;
+        await openDeviceDialog(p, uid);
+        return;
       } else if (el.dataset.act === 'del') {
-        if (!confirm('删除账号 ' + uid.slice(0, 12) + '？历史记录保留。')) { el.disabled = false; return; }
+        if (!await confirmBox('删除账号', '删除账号 ' + uid.slice(0, 12) + '？历史记录保留。', { okText: '删除', danger: true })) { el.disabled = false; return; }
         await invoke('account_delete', { provider: p, uid });
         toast('已删除');
         await refreshAll();
@@ -250,6 +276,36 @@ function wire(el) {
     } catch (e) { toast('操作失败: ' + e, 4200); }
     el.disabled = false; el.textContent = old;
   });
+}
+
+// ===== Trae 设备号设置弹窗（居中模态） =====
+async function openDeviceDialog(p, uid) {
+  const mask = document.getElementById('dev-mask');
+  if (!mask) { toast('设备号设置不可用'); return; }
+  const body = document.getElementById('dev-body');
+  document.getElementById('dev-desc').textContent = 'Trae 一个设备号一天只能签一个账号，且必须是本机已注册的设备号（否则签到报 9074）。多账号请各用各的号；留空保存 = 自动从本机空闲设备号中挑选。';
+  body.innerHTML = '<div style="padding:14px 0"><span class="spin"></span> 正在读取设备号…</div>';
+  mask.style.display = 'flex';
+  let local = [];
+  try { local = await invoke('trae_local_devices'); } catch {}
+  body.innerHTML =
+    (local.length ? '<div style="font-size:12.5px;margin-bottom:8px">本机检测到 ' + local.length + ' 个已注册设备号：</div>' +
+      '<div style="display:grid;gap:6px;margin-bottom:12px">' +
+      local.map((d, i) => '<label style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer"><input type="radio" name="dev-pick" value="' + esc(d) + '"> <code style="font-size:12.5px">' + esc(d) + '</code><span class="subtle">本机设备 ' + (i + 1) + '</span></label>').join('') +
+      '<label style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer"><input type="radio" name="dev-pick" value=""> <span class="subtle">自动（签到时从空闲设备号中挑选）</span></label></div>'
+    : '<div class="subtle" style="margin-bottom:10px">未检测到本机 Trae 客户端设备号。可在装过 Trae 并登录过的电脑上，从 %APPDATA%\\Trae CN\\User\\globalStorage\\storage.json 里找 iCubeAuthInfo://icube-dc: 开头的键，冒号后的数字即设备号。</div>') +
+    '<input id="dev-manual" type="text" placeholder="手动输入设备号（8~20 位纯数字，可留空）" style="width:100%;padding:9px;border-radius:9px;border:1px solid var(--line);font:inherit;font-size:13px">';
+  document.getElementById('dev-cancel').onclick = () => { mask.style.display = 'none'; };
+  document.getElementById('dev-save').onclick = async () => {
+    const picked = (body.querySelector('input[name=dev-pick]:checked') || {}).value;
+    const manual = document.getElementById('dev-manual').value.trim();
+    const val = manual || picked || '';
+    try {
+      await invoke('trae_set_device', { provider: p, uid, deviceId: val });
+      toast(val ? '设备号已设置：' + val : '已清除，签到时自动挑选空闲设备号');
+      mask.style.display = 'none';
+    } catch (e) { toast('保存失败: ' + e, 4200); }
+  };
 }
 
 // ===== 签到中心 =====
@@ -380,6 +436,31 @@ async function refreshGateway() {
   } catch (e) { GW_STATUS = null; }
 }
 
+async function refreshGatewayAccounts() {
+  const box = document.getElementById('gw-acct-list');
+  if (!box) return;
+  const d = await invoke('gateway_accounts').catch(() => null);
+  if (!d || !d.accounts?.length) {
+    box.innerHTML = '<div class="empty" style="padding:12px">当前平台（' + esc(d?.platform || '') + '）没有可用账号 —— 请先在账号管理添加</div>';
+    return;
+  }
+  box.innerHTML = d.accounts.map(a => {
+    const bal = a.remaining != null ? (' · 余额 ' + fmt(a.remaining)) : '';
+    return '<button class="small gw-acct-pick" data-ref="' + esc(a.ref) + '" style="text-align:left;display:flex;align-items:center;gap:8px;' + (a.active ? 'border-color:var(--accent);background:var(--accent-soft)' : '') + '">' +
+      '<span style="font-weight:700;color:' + (a.active ? 'var(--accent)' : 'var(--subtle)') + '">' + (a.active ? '●' : '○') + '</span>' +
+      '<span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(a.name || a.uid) + bal + '</span>' +
+      (a.status === 'failed' ? '<span class="subtle" style="color:var(--red)">额度耗尽</span>' : '') + '</button>';
+  }).join('');
+  box.querySelectorAll('.gw-acct-pick').forEach(b => b.addEventListener('click', async () => {
+    b.disabled = true;
+    try {
+      await invoke('gateway_switch_account', { accountRef: b.dataset.ref });
+      toast('已手动切换账号');
+      await refreshGatewayAccounts();
+    } catch (e) { toast('切换失败: ' + e, 4200); b.disabled = false; }
+  }));
+}
+
 function bindGwSave(btnId, inputId, field) {
   const btn = document.getElementById(btnId);
   const input = document.getElementById(inputId);
@@ -416,27 +497,28 @@ function renderRouting() {
 
   el.innerHTML =
     // ===== 网关卡 =====
-    '<section class="surface" style="margin-bottom:14px;padding:18px 20px">' +
+    '<section class="surface route-card">' +
     '<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">' +
-    '<div style="flex:1;min-width:260px"><h3 style="font-size:14px">本地网关 · OpenAI 兼容接口</h3>' +
+    '<div style="flex:1;min-width:200px"><h3 style="font-size:14px">本地网关 · OpenAI 兼容接口</h3>' +
     '<div style="display:flex;align-items:center;gap:8px;margin-top:8px;flex-wrap:wrap">' +
     '<code style="background:var(--accent-soft);color:var(--accent);padding:8px 14px;border-radius:9px;font-size:13.5px;font-weight:600">' + esc(st.baseUrl) + '/v1</code>' +
     '<button class="small" id="gw-copy-url">复制</button>' +
     '<span class="subtle" style="font-size:11.5px">GET /v1/models · POST /v1/chat/completions</span></div>' +
     '<p class="subtle" style="font-size:11.5px;margin-top:8px">模型 id 用 <code>平台/模型</code>；裸模型 id 走当前平台。</p></div></div>' +
-    '<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;margin-top:14px;padding-top:14px;border-top:1px solid var(--line)">' +
-    '<label class="subtle" style="font-size:12px">端口（改后需重启应用）<div style="display:flex;gap:6px;margin-top:5px">' +
-    '<input id="gw-port" type="number" min="1" max="65535" value="' + st.port + '" style="width:100%;padding:8px;border-radius:9px;border:1px solid var(--line);font:inherit">' +
-    '<button id="gw-port-save" class="small primary">保存</button></div></label>' +
-    '<label class="subtle" style="font-size:12px">速率限制（RPM，0 = 不限）<div style="display:flex;gap:6px;margin-top:5px">' +
-    '<input id="gw-rpm" type="number" min="0" value="' + (st.rpm || 0) + '" style="width:100%;padding:8px;border-radius:9px;border:1px solid var(--line);font:inherit">' +
-    '<button id="gw-rpm-save" class="small primary">保存</button></div></label>' +
-    '<label class="subtle" style="font-size:12px">仅允许当前平台<div style="margin-top:8px"><label class="switch"><input type="checkbox" id="gw-strict" ' + (st.strict !== false ? 'checked' : '') + '><span class="track"><span class="knob"></span></span></label></div>' +
-    '<div class="subtle" style="margin-top:4px;font-size:11px">开启后跨平台请求将被 403 拒绝</div></label>' +
+    '<div class="route-grid">' +
+    '<div class="route-field"><label class="subtle route-field-label">端口 <span class="route-field-hint">改后需重启应用</span></label>' +
+    '<div style="display:flex;gap:6px"><input id="gw-port" type="number" min="1" max="65535" value="' + st.port + '" style="flex:1;min-width:0;padding:7px 10px;border-radius:8px;border:1px solid var(--line);font:inherit">' +
+    '<button id="gw-port-save" class="small primary">保存</button></div></div>' +
+    '<div class="route-field"><label class="subtle route-field-label">速率限制 <span class="route-field-hint">RPM · 0 = 不限</span></label>' +
+    '<div style="display:flex;gap:6px"><input id="gw-rpm" type="number" min="0" value="' + (st.rpm || 0) + '" style="flex:1;min-width:0;padding:7px 10px;border-radius:8px;border:1px solid var(--line);font:inherit">' +
+    '<button id="gw-rpm-save" class="small primary">保存</button></div></div>' +
+    '<div class="route-field"><label class="subtle route-field-label">仅允许当前平台</label>' +
+    '<div style="display:flex;align-items:center;gap:10px;margin-top:6px"><label class="switch"><input type="checkbox" id="gw-strict" ' + (st.strict !== false ? 'checked' : '') + '><span class="track"><span class="knob"></span></span></label>' +
+    '<span class="subtle" style="font-size:11px">开启后跨平台请求被 403 拒绝</span></div></div>' +
     '</div></section>' +
 
     // ===== 请求平台卡（全部整合进下拉框）=====
-    '<section class="surface" style="margin-bottom:14px;padding:18px 20px">' +
+    '<section class="surface route-card">' +
     '<div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap">' +
     '<h3 style="font-size:14px">请求平台 <span class="subtle" style="font-size:11.5px;font-weight:400">裸模型 id 的默认路由</span></h3>' +
     '<select id="route-plat-select" style="padding:8px 12px;border-radius:9px;border:1px solid var(--line);font:inherit;min-width:220px">' +
@@ -450,8 +532,16 @@ function renderRouting() {
     '<span class="tag" style="background:var(--accent);color:#fff">当前</span></div>' +
     '</section>' +
 
+    // ===== 账号切换卡 =====
+    '<section class="surface route-card">' +
+    '<div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap">' +
+    '<h3 style="font-size:14px">账号切换 <span class="subtle" style="font-size:11.5px;font-weight:400">当前平台 · 点击即切换本地账号</span></h3>' +
+    '<button id="gw-acct-next" class="small primary">↻ 一键切换下一个</button></div>' +
+    '<div id="gw-acct-list" style="display:grid;gap:6px;margin-top:12px"><span class="subtle">加载中…</span></div>' +
+    '</section>' +
+
     // ===== 模型测试卡 =====
-    '<section class="surface" style="margin-bottom:14px;padding:18px 20px">' +
+    '<section class="surface route-card">' +
     '<div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap">' +
     '<h3 style="font-size:14px">模型测试 <span class="subtle" style="font-size:11.5px;font-weight:400">请求经本地网关转发到对应平台</span></h3>' +
     '<button id="gw-test-refresh" class="small">刷新模型</button></div>' +
@@ -466,11 +556,25 @@ function renderRouting() {
     '</section>' +
 
     // ===== 请求日志卡 =====
-    '<section class="surface" style="padding:18px 20px">' +
+    '<section class="surface route-card">' +
     '<div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px"><h3 style="font-size:14px">请求日志' +
     '<span class="subtle" style="font-size:11.5px;font-weight:400"> · 最近 ' + Math.min(st.logs?.length || 0, 30) + ' 条 · 总计 ' + logStats.total + ' · <span style="color:var(--green,#16a34a)">成功 ' + logStats.ok + '</span> · <span style="color:var(--red,#dc2626)">失败 ' + logStats.fail + '</span></span></h3>' +
     ((logStats.total || 0) > 0 ? '<button id="gw-logs-clear" class="small danger-ghost">清空日志</button>' : '') + '</div>' +
     '<div style="margin-top:10px">' + logRows + '</div></section>';
+
+  // ===== 账号切换卡 =====
+  refreshGatewayAccounts();
+  el.querySelector('#gw-acct-next')?.addEventListener('click', async () => {
+    const d = await invoke('gateway_accounts').catch(() => null);
+    if (!d || !d.accounts?.length) { toast('当前平台没有可用账号'); return; }
+    const cur = d.accounts.findIndex(a => a.active);
+    const next = d.accounts[(cur + 1) % d.accounts.length];
+    try {
+      await invoke('gateway_switch_account', { accountRef: next.ref });
+      toast('已切换账号：' + next.name);
+      await refreshGatewayAccounts();
+    } catch (e) { toast('切换失败: ' + e, 4200); }
+  });
 
   // ===== 绑定 =====
   el.querySelector('#gw-copy-url')?.addEventListener('click', async () => {
@@ -491,7 +595,7 @@ function renderRouting() {
   });
   const clearBtn = el.querySelector('#gw-logs-clear');
   if (clearBtn) clearBtn.addEventListener('click', async () => {
-    if (!confirm('确定清空全部请求日志？此操作不可恢复。')) return;
+    if (!await confirmBox('清空请求日志', '确定清空全部请求日志？此操作不可恢复。', { okText: '清空', danger: true })) return;
     clearBtn.disabled = true;
     try {
       const r = await invoke('gateway_clear_logs');
@@ -611,6 +715,9 @@ function renderSettings() {
   settingsDraft = { ...SETTINGS };
   const body = $('#settings-body');
   const tab = document.querySelector('#settings-tabs button.active')?.dataset.tab || 'tasks';
+  // 保存/取消按钮只在「数据与版本」显示，其余页改动即保存
+  const footer = document.querySelector('.save-footer');
+  if (footer) footer.style.display = (tab === 'data') ? 'flex' : 'none';
   if (tab === 'tasks') {
     body.innerHTML = '<div class="task-settings"><div>' +
       '<div class="setting-row"><div><h3>自动签到</h3><p>每个平台仅为已启用自动签到的账号执行任务。</p></div>' + sw('auto', settingsDraft.auto) + '</div>' +
@@ -637,7 +744,7 @@ function renderSettings() {
     body.innerHTML =
       '<div class="setting-row"><div><h3>AI路由助手 <span id="ver-current">…</span></h3><p>Rust + Tauri 实现 · 数据库：credit.sqlite（本机）</p></div><span class="tag">本地版</span></div>' +
       '<div class="setting-row"><div><h3>软件更新</h3><p id="upd-status">检查 GitHub Releases 最新版本…</p></div>' +
-      '<div class="actions" style="display:flex;gap:6px;align-items:center">' +
+      '<div class="actions" style="display:flex;gap:6px;align-items:center;justify-content:flex-end;flex-shrink:0">' +
       '<span class="subtle" id="upd-progress"></span>' +
       '<button id="upd-check" class="small">重新检查</button>' +
       '<button id="upd-download" class="small primary" style="display:none">下载更新</button>' +
@@ -715,6 +822,8 @@ let TOOLS = null;
 let TOOLS_QUOTA_REFRESHED = false; // 防止 quota 刷新 → 重绘 → 再刷新 的死循环
 async function renderToolsTab(body) {
   body.innerHTML = '<div class="empty">加载平台信息…</div>';
+  // 后台探测 MiniMax 直链缓存，不阻塞渲染
+  invoke('tools_refresh_minimax_url').catch(() => {});
   if (!TOOLS) {
     try { TOOLS = await invoke('tools_info'); } catch (e) { body.innerHTML = '<div class="empty">加载失败: ' + esc(String(e)) + '</div>'; return; }
   }
@@ -800,7 +909,22 @@ function sw(key, checked) {
   return '<label class="switch"><input type="checkbox" data-setb="' + key + '" ' + (checked ? 'checked' : '') + '><span class="track"><span class="knob"></span></span></label>';
 }
 function wireSetting(el) {
-  el.addEventListener('change', () => { settingsDraft[el.dataset.setb] = el.checked; });
+  el.addEventListener('change', () => {
+    settingsDraft[el.dataset.setb] = el.checked;
+    autoSaveSettings();
+  });
+}
+// 非「数据与版本」页：改动即保存
+async function autoSaveSettings() {
+  const tab = document.querySelector('#settings-tabs button.active')?.dataset.tab || 'tasks';
+  if (tab === 'data') return;
+  try {
+    for (const [k, v] of Object.entries(settingsDraft)) {
+      if (SETTINGS[k] !== v) { await invoke('settings_set', { key: k, value: String(v) }); SETTINGS[k] = v; }
+    }
+    applyRefreshInterval();
+    toast('设置已保存');
+  } catch (e) { toast('保存失败: ' + e, 4200); }
 }
 $$('#settings-tabs button').forEach(b => b.addEventListener('click', () => {
   $$('#settings-tabs button').forEach(x => x.classList.toggle('active', x === b));
@@ -914,6 +1038,15 @@ window.piconFallback = piconFallback;
   if (min) min.addEventListener('click', () => { try { curWin()?.hide?.(); } catch {} });
   const close = document.getElementById('panel-close');
   if (close) close.addEventListener('click', () => { document.getElementById('quit-mask').style.display = 'flex'; });
+  // 右下角缩放手柄
+  const handle = document.getElementById('resize-handle');
+  if (handle) handle.addEventListener('mousedown', (e) => {
+    e.preventDefault(); e.stopPropagation();
+    const w = curWin();
+    if (!w) return;
+    try { if (typeof w.startResize === 'function') { w.startResize('SouthEast'); return; } } catch {}
+    try { if (typeof w.startResizeDragging === 'function') { w.startResizeDragging('SouthEast'); } } catch {}
+  });
 })();
 
 // ===== 关闭确认：退至后台 / 退出程序 =====

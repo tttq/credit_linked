@@ -17,7 +17,7 @@ fn test_normalize_messages() {
 #[test]
 fn test_wb_chat_body() {
     let msgs = serde_json::json!([{"role": "user", "content": [{"type": "text", "text": "hi"}]}]);
-    let body = credit_gateway::protocol::wb_chat_body(msgs.as_array().unwrap(), "sys", "glm-5.3-flash", Some(1024), Some("high"));
+    let body = credit_gateway::protocol::wb_chat_body(msgs.as_array().unwrap(), "sys", "glm-5.3-flash", Some(1024), Some("high"), "");
     assert_eq!(body["model"], "glm-5.3-flash");
     assert_eq!(body["stream"], true);
     assert_eq!(body["max_tokens"], 1024);

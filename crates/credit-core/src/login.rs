@@ -92,6 +92,22 @@ async fn wait_callback(listener: &TcpListener, timeout: std::time::Duration, pat
             let _ = s.write_all(format!("HTTP/1.1 404 Not Found\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}", body.len()).as_bytes()).await;
             continue; // 探测/其他路径：继续等真正的回调
         }
+        // 官方：secret 中转请求需 307 跳转到 redirect（校验域名白名单），只消费一次
+        let qmap = parse_query(&query);
+        if qmap.contains_key("secret") && !qmap.contains_key("code") {
+            let redirect = qmap.get("redirect").cloned().unwrap_or_default();
+            let allowed = redirect.starts_with("https://auth.huaweicloud.com/")
+                || redirect.starts_with("https://auth.cn-north-4.myhuaweicloud.com/")
+                || redirect.starts_with("https://console.huaweicloud.com/");
+            if allowed {
+                let body = "redirecting";
+                let _ = s.write_all(format!("HTTP/1.1 307 Temporary Redirect\r\nLocation: {redirect}\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}", body.len()).as_bytes()).await;
+            } else {
+                let body = "redirect host not allowed";
+                let _ = s.write_all(format!("HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}", body.len()).as_bytes()).await;
+            }
+            continue;
+        }
         let _ = s.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{reply}", reply.len()).as_bytes()).await;
         return Ok(query);
     }
@@ -304,7 +320,12 @@ async fn codearts_wait_task(
             name: String::new(),
             token: String::new(),
             refresh_token: d.get("refresh_token").and_then(|r| r.as_str()).map(|s| s.to_string()),
-            expires_at: cred.get("expiration").and_then(|e| e.as_str()).map(|s| s.to_string()),
+            expires_at: cred.get("expiration").and_then(|e| e.as_str()).map(|s| s.to_string())
+                .or_else(|| {
+                    // 官方：无 expiration 时按当前时间 +1h
+                    let exp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() + 3600;
+                    Some(format!("{exp}"))
+                }),
             meta: json!({
                 "access_key_id": ak, "secret_access_key": sk_, "security_token": st,
                 "privateJwk": private_jwk, "refresh_token": d.get("refresh_token").and_then(|r| r.as_str()).unwrap_or(""),

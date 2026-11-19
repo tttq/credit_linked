@@ -11,14 +11,17 @@
       {
         "label": "main",
         "title": "AI路由助手",
-        "width": 340,
-        "height": 460,
+        "width": 560,
+        "height": 680,
+        "minWidth": 360,
+        "minHeight": 420,
         "visible": false,
         "decorations": false,
         "transparent": true,
-        "resizable": false,
+        "resizable": true,
         "maximizable": false,
-        "minimizable": false
+        "minimizable": false,
+        "center": true
       }
     ],
     "security": {

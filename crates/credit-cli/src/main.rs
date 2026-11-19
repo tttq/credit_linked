@@ -193,7 +193,7 @@ fn seal_for_test(body: &[u8], salt: [u8; 32]) -> String {
     let k = Sha512::digest(&cat);
     let mut mac_and_body = Sha512::digest(body).to_vec();
     mac_and_body.extend_from_slice(body);
-    let mut enc = Aes128CbcEnc::new((&k[..16]).into(), (&k[16..32]).into());
+    let enc = Aes128CbcEnc::new((&k[..16]).into(), (&k[16..32]).into());
     let mut out = vec![0u8; mac_and_body.len() + 16];
     out[..mac_and_body.len()].copy_from_slice(&mac_and_body);
     let n = enc.encrypt_padded_mut::<Pkcs7>(&mut out, mac_and_body.len()).unwrap().len();

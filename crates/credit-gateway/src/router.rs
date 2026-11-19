@@ -133,7 +133,12 @@ impl Router {
                 .map(|r| r.status == "failed").unwrap_or(false);
             creds.push((c, failed));
         }
-        creds.sort_by_key(|(_, failed)| *failed);
+        // 用户手动「一键切换」选中的账号置顶（gw_account）；为空则纯自动排序
+        let pref = self.store.get_setting("gw_account", "").unwrap_or_default();
+        creds.sort_by_key(|(c, failed)| {
+            let preferred = !pref.is_empty() && pref == format!("{}:{}", c.provider, c.uid);
+            (!preferred, *failed)
+        });
         creds.into_iter().map(|(c, _)| c).collect()
     }
 

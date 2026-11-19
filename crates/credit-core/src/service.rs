@@ -24,6 +24,8 @@ pub struct CheckinOutcome {
 pub fn adapter_for(provider: &str) -> Option<Box<dyn Adapter>> {
     match provider {
         "trae" => Some(Box::new(super::adapters::trae::TraeAdapter { req_source: 1 })),
+        // trae-device：与 trae 相同，但签到走设备轮换路径（多账号各用各的已注册设备号）
+        "trae-device" => Some(Box::new(super::adapters::trae::TraeAdapter { req_source: 1 })),
         "workbuddy" => Some(Box::new(super::adapters::workbuddy::WorkBuddyAdapter { intl: false })),
         "workbuddy-intl" => Some(Box::new(super::adapters::workbuddy::WorkBuddyAdapter { intl: true })),
         "minimax" => Some(Box::new(super::adapters::minimax::MiniMaxAdapter)),
@@ -55,7 +57,75 @@ impl Service {
         if let Ok(auth) = serde_json::to_string(&nc) {
             let _ = self.store.upsert_account(provider, uid, &nc.name, "", &auth);
         }
+        if let Some(exp) = &nc.expires_at {
+            let _ = self.store.update_account_expires(provider, uid, Some(exp));
+        }
         Ok(nc)
+    }
+
+    /// trae 多账号设备号仲裁：上游 claim 校验 x-device-id 必须是已注册设备号，
+    /// 且一个设备号一天只能签一个账号（9074/9095）。规则：
+    /// ① 账号未配设备号 → 从本机已注册设备号里挑一个未被其他 trae 账号占用的；
+    /// ② 全被占用 → 本轮不动（保持原样，后续手动设置）；
+    /// ③ 两个账号撞了同一个号 → 后签的自动换成空闲号。
+    fn trae_pick_device(&self, provider: &str, uid: &str, cred: &mut Cred) {
+        if provider != "trae" { return; }
+        let cur = cred.meta.get("deviceId").and_then(|d| d.as_str()).unwrap_or("").to_string();
+        let others: Vec<String> = self.store.list_accounts().unwrap_or_default().into_iter()
+            .filter(|(p, u, _, _, _)| p == "trae" && u != uid)
+            .filter_map(|(_, _, _, _, auth)| serde_json::from_str::<Cred>(&auth).ok())
+            .filter_map(|c| c.meta.get("deviceId").and_then(|d| d.as_str()).map(|s| s.to_string()))
+            .filter(|s| !s.is_empty())
+            .collect();
+        let local = crate::adapters::trae_local::collect_local_device_ids();
+        let taken = |id: &str| !id.is_empty() && others.iter().any(|o| o == id);
+        // ① 未配置 → 挑空闲
+        if cur.is_empty() {
+            if let Some(free) = local.iter().find(|d| !taken(d)) {
+                cred.meta["deviceId"] = json!(free);
+            }
+            return;
+        }
+        // ② 撞号 → 换空闲（无空闲则保持，交给手动设置/9095 提示）
+        if taken(&cur) {
+            if let Some(free) = local.iter().find(|d| !taken(d) && *d != &cur) {
+                cred.meta["deviceId"] = json!(free);
+            }
+        }
+    }
+
+    /// 9074/9095 设备冲突自动恢复：换一个未被其他账号占用的本机设备号后重试一次。
+    async fn trae_rotate_device_retry(&self, provider: &str, uid: &str, name: &str, cred: &Cred, adapter: &dyn Adapter) -> Option<CheckinOutcome> {
+        if provider != "trae" { return None; }
+        let cur = cred.meta.get("deviceId").and_then(|d| d.as_str()).unwrap_or("").to_string();
+        let others: Vec<String> = self.store.list_accounts().unwrap_or_default().into_iter()
+            .filter(|(p, u, _, _, _)| p == "trae" && u != uid)
+            .filter_map(|(_, _, _, _, auth)| serde_json::from_str::<Cred>(&auth).ok())
+            .filter_map(|c| c.meta.get("deviceId").and_then(|d| d.as_str()).map(|s| s.to_string()))
+            .filter(|s| !s.is_empty())
+            .collect();
+        let local = crate::adapters::trae_local::collect_local_device_ids();
+        let free: Vec<&String> = local.iter().filter(|d| !d.is_empty() && **d != cur && !others.contains(d)).collect();
+        let Some(free) = free.first() else {
+            return Some(CheckinOutcome {
+                provider: provider.into(), uid: uid.into(), status: "needs-action".into(), amount: None,
+                message: Some("设备号冲突：Trae 一个设备号一天只能签一个账号，且须为本机已注册设备。请重新登录该账号，或在账号管理里为各账号分别设置不同设备号".into()),
+            });
+        };
+        let mut nc = cred.clone();
+        nc.meta["deviceId"] = json!(free);
+        if let Ok(auth) = serde_json::to_string(&nc) {
+            let _ = self.store.upsert_account(provider, uid, name, "", &auth);
+        }
+        let receipt = adapter.claim(&nc, &crate::adapters::CheckinState { claimable: true, ..Default::default() }).await;
+        Some(match receipt {
+            Ok(r) => {
+                let _ = self.store.record_history(provider, uid, name, &crate::adapters::day_cn(), &r.status, r.amount, r.message.as_deref(), &crate::adapters::now_iso());
+                let _ = self.store.update_account_status(provider, uid, &r.status, r.message.as_deref());
+                CheckinOutcome { provider: provider.into(), uid: uid.into(), status: r.status.clone(), amount: r.amount, message: r.message.clone() }
+            }
+            Err(e) => CheckinOutcome { provider: provider.into(), uid: uid.into(), status: "failed".into(), amount: None, message: Some(format!("换设备号重试仍失败: {e}")) },
+        })
     }
 
     pub async fn checkin_account(&self, provider: &str, uid: &str) -> Result<CheckinOutcome, PlatformError> {
@@ -65,6 +135,8 @@ impl Service {
         };
         let mut cred: Cred = serde_json::from_str(auth).map_err(|e| PlatformError::Local(format!("bad cred json: {e}")))?;
         let _ = secret_b64; // secret 字段保存加密凭据；本轮 cred 明文存 auth 列（单机 DPAPI 由 vault 处理）
+        // trae 多账号设备号仲裁（去重/挑空闲）在请求前完成
+        self.trae_pick_device(provider, uid, &mut cred);
         let adapter = adapter_for(provider).ok_or_else(|| PlatformError::Local(format!("no adapter for {provider}")))?;
         let cycle = crate::adapters::day_cn();
 
@@ -84,9 +156,21 @@ impl Service {
             Err(e) => return Err(e),
         };
         let receipt = adapter.claim(&cred, &st).await;
+        // trae 设备冲突（9074/9095）自动换号重试一次；成功后回写新设备号
         let outcome = match receipt {
             Ok(r) => CheckinOutcome { provider: provider.into(), uid: uid.into(), status: r.status.clone(), amount: r.amount, message: r.message.clone() },
-            Err(e) => CheckinOutcome { provider: provider.into(), uid: uid.into(), status: "failed".into(), amount: None, message: Some(e.to_string()) },
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("9074") || msg.contains("9095") {
+                    if let Some(o) = self.trae_rotate_device_retry(provider, uid, name, &cred, adapter.as_ref()).await {
+                        o
+                    } else {
+                        CheckinOutcome { provider: provider.into(), uid: uid.into(), status: "failed".into(), amount: None, message: Some(msg) }
+                    }
+                } else {
+                    CheckinOutcome { provider: provider.into(), uid: uid.into(), status: "failed".into(), amount: None, message: Some(msg) }
+                }
+            }
         };
         let _ = self.store.record_history(provider, uid, name, &cycle, &outcome.status, outcome.amount, outcome.message.as_deref(), &crate::adapters::now_iso());
         let _ = self.store.update_account_status(provider, uid, &outcome.status, outcome.message.as_deref());
@@ -211,8 +295,61 @@ impl Service {
                     token: live.access_token,
                     refresh_token: None,
                     expires_at: None,
-                    meta: json!({ "deviceMid": live.device_mid }),
+                    meta: json!({
+                        "deviceMid": live.device_mid,
+                        "zcodeJwt": live.zcode_jwt.unwrap_or_default(),
+                    }),
                 }
+            }
+            "codearts" | "codearts-desktop" => {
+                let desktop = platform == "codearts-desktop";
+                let Some(live) = crate::adapters::codearts_local::read_live_session(desktop) else {
+                    return Err(PlatformError::Local("未发现码道客户端登录信息（请先在码道客户端登录后再扫描，或改用「添加账号」走授权流程）".into()));
+                };
+                let sess = &live.session;
+                let ak = sess.get("accessKey").and_then(|a| a.as_str()).unwrap_or_default().to_string();
+                let sk = sess.get("secretKey").and_then(|a| a.as_str()).unwrap_or_default().to_string();
+                let st_ = sess.get("securityToken").and_then(|a| a.as_str()).unwrap_or_default().to_string();
+                if ak.is_empty() || sk.is_empty() {
+                    return Err(PlatformError::Local("码道会话缺少 accessKey/secretKey，请重新在客户端登录后再扫描".into()));
+                }
+                let uid = sess.get("userId").and_then(|a| a.as_str()).unwrap_or_default().to_string();
+                let name = sess.get("userName").and_then(|a| a.as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| if desktop { "码道桌面".into() } else { "华为云码道".into() });
+                // expiresAt 是 epoch 毫秒 → 转 ISO（显示用）
+                let expires_iso = sess.get("expiresAt").and_then(|e| e.as_i64()).map(|ms| {
+                    let days = ms / 1000 / 86400;
+                    let (y, mo, d) = crate::adapters::civil_from_days(days);
+                    format!("{y:04}-{mo:02}-{d:02}")
+                });
+                let mut cred = crate::adapters::Cred {
+                    provider: platform.into(),
+                    uid: uid.clone(),
+                    name: name.clone(),
+                    token: String::new(),
+                    // RT 入库：客户端回写的 RT 几乎总是最新可用的一条
+                    refresh_token: sess.get("refreshToken").and_then(|a| a.as_str()).map(|s| s.to_string()),
+                    expires_at: expires_iso,
+                    meta: json!({
+                        "access_key_id": ak, "secret_access_key": sk, "security_token": st_,
+                        // PKCE verifier + DPoP 私钥：refresh 续期必需
+                        "verifier": sess.pointer("/loginContext/pkcePair/codeVerifier").and_then(|a| a.as_str()).unwrap_or_default(),
+                        "privateJwk": sess.pointer("/loginContext/dpopKeyPair/privateKey").cloned().unwrap_or(Value::Null),
+                        "client": if desktop { "desktop" } else { "agent" },
+                    }),
+                };
+                if cred.uid.is_empty() {
+                    cred.uid = format!("local-{}", if desktop { "desktop" } else { "agent" });
+                }
+                // verify 校验（caller-identity；失败不阻塞导入）
+                let adapter = crate::adapters::codearts::CodeArtsAdapter { desktop };
+                if let Ok(id) = crate::adapters::Adapter::verify(&adapter, &cred).await {
+                    if let Some(n) = id.get("user").and_then(|u| u.get("name")).and_then(|n| n.as_str()) {
+                        cred.name = n.to_string();
+                    }
+                }
+                cred
             }
             other => return Err(PlatformError::Local(format!("platform {other} 暂不支持本机扫描导入（minimax/codearts 走登录流程，doubao 走窗口驱动）"))),
         };

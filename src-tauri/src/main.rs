@@ -10,8 +10,6 @@ use credit_gateway::Router;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tauri::{Manager, Emitter};
-#[cfg(windows)]
-use std::os::windows::process::CommandExt;
 
 fn svc() -> Result<Service, String> {
     Ok(Service { store: Arc::new(Store::open_default().map_err(|e| e.to_string())?) })
@@ -244,6 +242,9 @@ async fn login_poll(session_id: String) -> Result<serde_json::Value, String> {
         let s = svc()?;
         let auth = serde_json::to_string(c).map_err(|e| e.to_string())?;
         s.store.upsert_account(&c.provider, &c.uid, &c.name, "", &auth).map_err(|e| e.to_string())?;
+        if let Some(exp) = &c.expires_at {
+            let _ = s.store.update_account_expires(&c.provider, &c.uid, Some(exp));
+        }
         v["account"] = serde_json::json!({ "provider": c.provider, "uid": c.uid, "name": c.name });
     }
     Ok(v)
@@ -267,6 +268,33 @@ async fn account_delete(provider: String, uid: String) -> Result<(), String> {
 async fn account_toggle_auto(provider: String, uid: String, auto: bool) -> Result<(), String> {
     let s = svc()?;
     s.store.set_account_auto(&provider, &uid, auto).map_err(|e| e.to_string())
+}
+
+/// 本机 Trae 客户端已注册的全部设备号（去重）
+#[tauri::command]
+async fn trae_local_devices() -> Result<Vec<String>, String> {
+    Ok(credit_core::adapters::trae_local::collect_local_device_ids())
+}
+
+/// 设置某 trae 账号的设备号（空串 = 清除，签到时自动挑空闲号）
+#[tauri::command]
+async fn trae_set_device(provider: String, uid: String, device_id: String) -> Result<(), String> {
+    let s = svc()?;
+    let accounts = s.store.list_accounts().map_err(|e| e.to_string())?;
+    let Some((_, _, name, _, auth)) = accounts.iter().find(|(p, u, _, _, _)| p == &provider && u == &uid) else {
+        return Err("账号不存在".into());
+    };
+    let mut cred: credit_core::adapters::Cred = serde_json::from_str(auth).map_err(|e| e.to_string())?;
+    if device_id.is_empty() {
+        cred.meta.as_object_mut().map(|o| o.remove("deviceId"));
+    } else {
+        if !device_id.chars().all(|c| c.is_ascii_digit()) || device_id.len() < 8 || device_id.len() > 20 {
+            return Err("设备号应为 8~20 位纯数字（见本机 Trae 客户端 storage.json 的 iCubeAuthInfo://icube-dc: 键）".into());
+        }
+        cred.meta["deviceId"] = serde_json::json!(device_id);
+    }
+    s.store.upsert_account(&provider, &uid, name, "", &serde_json::to_string(&cred).map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())
 }
 
 fn p_name(s: &Service, p: &str, u: &str) -> String {
@@ -402,8 +430,8 @@ async fn auto_tick(app: &tauri::AppHandle) -> Result<(), String> {
     // 补跑判断（catchup）：错过时间（hhmm 已过 target 即 due=true，覆盖启动晚于计划时间的场景）
     let _ = get("catchup", "1");
     // 执行：auto=1 且今日未成功的账号
-    s.store.set_setting("last_auto_run_day", &today);
-    s.store.set_setting("last_auto_run_target", &target);
+    let _ = s.store.set_setting("last_auto_run_day", &today);
+    let _ = s.store.set_setting("last_auto_run_target", &target);
     let accounts = s.store.list_accounts().unwrap_or_default();
     let rows = s.store.list_accounts_full().unwrap_or_default();
     for (p, u, _, _, _) in accounts.iter() {
@@ -596,11 +624,23 @@ fn tool_installed(platform: &str) -> bool {
             "D:/ProgramFiles/develop/ZCode/ZCode.exe".into(),
             "C:/Program Files/ZCode/ZCode.exe".into(),
         ],
+        "codearts" | "codearts-desktop" => vec![
+            "D:/ProgramFiles/software/CodeArts/CodeArts.exe".into(),
+            "C:/Program Files/CodeArts/CodeArts.exe".into(),
+            "C:/Program Files (x86)/CodeArts/CodeArts.exe".into(),
+            format!("{local}/Programs/CodeArts/CodeArts.exe"),
+        ],
         _ => vec![],
     };
-    // 本机客户端凭据存在也算已安装（minimax ~/.minimax）
+    // 本机客户端凭据存在也算已安装（minimax ~/.minimax；码道 %APPDATA%/codearts）
     if platform == "minimax" && std::path::Path::new(&userprofile).join(".minimax/auth/prod/cn/mcode-public/auth.json").exists() {
         return true;
+    }
+    if platform.starts_with("codearts") {
+        let appdata = std::env::var("APPDATA").unwrap_or_default();
+        if std::path::Path::new(&appdata).join("codearts").join("Local State").exists() {
+            return true;
+        }
     }
     // 卸载器存在也代表已安装（安装器都会装 Uninstall *.exe）
     let uninstallers: Vec<String> = match platform {
@@ -631,6 +671,8 @@ fn tool_urls(platform: &str) -> (Option<String>, &'static str, &'static str) {
 }
 
 /// 从 MiniMax 官网首页解析当前最新版安装包直链（版本号随发布变化）
+static MINIMAX_URL_CACHE: std::sync::OnceLock<std::sync::Mutex<Option<String>>> = std::sync::OnceLock::new();
+
 async fn minimax_latest_url() -> Option<String> {
     let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(20)).build().ok()?;
     let body = client.get("https://code.minimax.cn/").send().await.ok()?.text().await.ok()?;
@@ -668,7 +710,11 @@ async fn tools_info() -> Result<serde_json::Value, String> {
         let mut direct = url.is_some();
         let mut resolved = url.clone().unwrap_or_default();
         if p == "minimax" {
-            if let Some(u) = minimax_latest_url().await { resolved = u; direct = true; }
+            // 不阻塞等待网络：优先用已缓存直链，首次缺失时保持"打开下载页"兜底
+            let cache = MINIMAX_URL_CACHE.get_or_init(|| std::sync::Mutex::new(None));
+            if let Some(u) = cache.lock().unwrap().clone() {
+                resolved = u; direct = true;
+            }
         }
         let qs = quota_sum.get(p);
         let (codearts_total, codearts_count) = if p == "codearts" {
@@ -690,6 +736,16 @@ async fn tools_info() -> Result<serde_json::Value, String> {
         }));
     }
     Ok(serde_json::json!({ "items": out, "downloads": DOWNLOADS.lock().unwrap().clone(), "installDir": install_dir }))
+}
+
+/// 后台探测 MiniMax 最新版直链并缓存（不阻塞工具页渲染）
+#[tauri::command]
+async fn tools_refresh_minimax_url() -> Result<(), String> {
+    if let Some(u) = minimax_latest_url().await {
+        let cache = MINIMAX_URL_CACHE.get_or_init(|| std::sync::Mutex::new(None));
+        *cache.lock().unwrap() = Some(u);
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -738,7 +794,7 @@ async fn tools_download(app: tauri::AppHandle, platform: String, install_dir: St
 
 /// 静默安装（NSIS: /S；Inno: /VERYSILENT /SUPPRESSMSGBOXES）—— 成功后提示用户重启工具
 #[tauri::command]
-async fn tools_install(platform: String, file: String) -> Result<serde_json::Value, String> {
+async fn tools_install(_platform: String, file: String) -> Result<serde_json::Value, String> {
     use std::process::Command;
     let lower = file.to_lowercase();
     let (args, kind) = if lower.contains("setup") || lower.ends_with(".exe") {
@@ -761,7 +817,6 @@ async fn tools_open_page(platform: String) -> Result<serde_json::Value, String> 
 /// 平台客户端进程名与候选启动路径（与 tool_installed 相同来源）
 fn client_process_info(platform: &str) -> (&'static str, Vec<String>) {
     let local = std::env::var("LOCALAPPDATA").unwrap_or_default();
-    let up = std::env::var("USERPROFILE").unwrap_or_default();
     match platform {
         "qoder" => ("Qoder CN", vec![
             "D:\\ProgramFiles\\develop\\Qoder CN\\Qoder CN.exe".into(),
@@ -824,7 +879,59 @@ async fn gateway_set_platform(platform: String) -> Result<serde_json::Value, Str
     Ok(serde_json::json!({ "ok": true, "current": p.as_str(), "label": p.display() }))
 }
 
+/// 列出当前请求平台的账号（供「一键切换账号」使用）
 #[tauri::command]
+async fn gateway_accounts() -> Result<serde_json::Value, String> {
+    let router = gw_router()?;
+    let p = router.current_platform();
+    let provider = p.account_provider();
+    let s = svc()?;
+    let full = s.store.list_accounts_full().unwrap_or_default();
+    let rows = s.store.list_accounts().map_err(|e| e.to_string())?;
+    let chosen = s.store.get_setting("gw_account", "").unwrap_or_default();
+    let accounts: Vec<serde_json::Value> = rows.into_iter()
+        .filter(|(prov, _, _, _, _)| prov == provider)
+        .map(|(prov, uid, name, _, _)| {
+            let row = full.iter().find(|r| r.provider == prov && r.uid == uid);
+            let quota: Option<serde_json::Value> = row.and_then(|r| {
+                r.quota.as_ref().and_then(|q| serde_json::from_str(q).ok())
+            });
+            let remaining = quota.as_ref().and_then(|q| q.get("remaining").and_then(|v| v.as_f64()));
+            serde_json::json!({
+                "ref": format!("{prov}:{uid}"), "provider": prov, "uid": uid,
+                "name": name, "status": row.map(|r| r.status.as_str()).unwrap_or(""),
+                "remaining": remaining,
+                "active": chosen == format!("{prov}:{uid}"),
+            })
+        }).collect();
+    Ok(serde_json::json!({
+        "platform": p.as_str(), "provider": provider,
+        "active": chosen, "accounts": accounts,
+    }))
+}
+
+/// 手动切换当前请求平台的账号：-ref 为空 = 自动（按默认排序）
+#[tauri::command]
+async fn gateway_switch_account(account_ref: Option<String>) -> Result<serde_json::Value, String> {
+    let router = gw_router()?;
+    let p = router.current_platform();
+    let provider = p.account_provider();
+    let s = svc()?;
+    let rows = s.store.list_accounts().map_err(|e| e.to_string())?;
+    let valid: Vec<String> = rows.iter()
+        .filter(|(prov, _, _, _, _)| prov == provider)
+        .map(|(prov, uid, _, _, _)| format!("{prov}:{uid}"))
+        .collect();
+    let chosen = account_ref.unwrap_or_default();
+    if !chosen.is_empty() && !valid.contains(&chosen) {
+        return Err(format!("账号 {chosen} 不属于平台 {}（{}）", p.display(), provider));
+    }
+    s.store.set_setting("gw_account", &chosen).map_err(|e| e.to_string())?;
+    Ok(serde_json::json!({ "ok": true, "platform": p.as_str(), "active": chosen, "available": valid.len() }))
+}
+
+#[tauri::command]
+#[allow(non_snake_case)] // modelPattern 是前端 invoke 的参数名契约
 async fn gateway_add_rule(modelPattern: String, platform: String, account: String, weight: i64, enabled: bool) -> Result<serde_json::Value, String> {
     let router = gw_router()?;
     let rule = credit_gateway::RouteRule {
@@ -853,17 +960,17 @@ async fn gateway_delete_rule(id: String) -> Result<(), String> {
     if router.delete_rule(&id) { Ok(()) } else { Err("规则不存在".into()) }
 }
 
-/// 把主窗口定位到主屏工作区右下角（微软电脑管家式）
-fn position_panel_bottom_right(w: &tauri::WebviewWindow) {
+/// 把主窗口定位到主屏中央
+fn center_panel(w: &tauri::WebviewWindow) {
     let monitor = w.current_monitor().ok().flatten();
     if let (Some(monitor), Ok(size)) = (monitor, w.inner_size()) {
         let (mw, mh) = (monitor.size().width as f64, monitor.size().height as f64);
         let (mx, my) = (monitor.position().x as f64, monitor.position().y as f64);
-        let (ww, wh) = (size.width as f64, size.height as f64);
         let scale = monitor.scale_factor();
-        let margin = 12.0 * scale;
-        let x = mx + mw - ww - margin;
-        let y = my + mh - wh - margin;
+        // inner_size 是逻辑像素，乘缩放得到物理像素；显示器尺寸已是物理像素
+        let (ww, wh) = (size.width as f64 * scale, size.height as f64 * scale);
+        let x = mx + (mw - ww) / 2.0;
+        let y = my + (mh - wh) / 2.0;
         let _ = w.set_position(tauri::PhysicalPosition::new(x as i32, y as i32));
     }
 }
@@ -921,13 +1028,13 @@ fn main() {
                 }
             });
 
-            // 右下角小面板（微软电脑管家式）：启动即定位到屏幕右下角并显示
+            // 启动即定位到屏幕中央并显示（之后可由用户自由拖动）
             if let Some(w) = app.get_webview_window("main") {
-                position_panel_bottom_right(&w);
+                center_panel(&w);
                 let _ = w.show();
             }
 
-            // 托盘图标：左键单击在屏幕右下角弹出小面板；菜单 = 打开 / 退出
+            // 托盘图标：左键单击唤出面板（保留用户拖动后的位置）；菜单 = 打开 / 退出
             use tauri::menu::{Menu, MenuItem};
             use tauri::tray::TrayIconBuilder;
             let show_item = MenuItem::with_id(app, "show", "打开 AI路由助手", true, None::<&str>)?;
@@ -945,7 +1052,6 @@ fn main() {
                     match event.id.as_ref() {
                         "show" => {
                             if let Some(w) = app.get_webview_window("main") {
-                                position_panel_bottom_right(&w);
                                 w.show().ok();
                                 w.unminimize().ok();
                                 w.set_focus().ok();
@@ -959,7 +1065,6 @@ fn main() {
                     if let tauri::tray::TrayIconEvent::Click { button: tauri::tray::MouseButton::Left, button_state: tauri::tray::MouseButtonState::Up, .. } = event {
                         let app = tray.app_handle();
                         if let Some(w) = app.get_webview_window("main") {
-                            position_panel_bottom_right(&w);
                             w.show().ok();
                             w.unminimize().ok();
                             w.set_focus().ok();
@@ -975,11 +1080,11 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             snapshot, import, checkin, quota_refresh, history,
             login_start, login_poll, login_cancel,
-            account_delete, account_toggle_auto,
+            account_delete, account_toggle_auto, trae_local_devices, trae_set_device,
             statistics, daily_income, settings_get, settings_set, account_list_all, open_url,
             login_open_window, login_close_window,
             gateway_status, gateway_set_platform, gateway_add_rule, gateway_update_rule, gateway_delete_rule,
-            gateway_set_limits, gateway_clear_logs, tools_info, tools_download, tools_install, tools_open_page, quota_refresh_all, quit_app, platform_ensure_running, check_update, download_update, install_update,
+            gateway_set_limits, gateway_clear_logs, gateway_accounts, gateway_switch_account, tools_info, tools_refresh_minimax_url, tools_download, tools_install, tools_open_page, quota_refresh_all, quit_app, platform_ensure_running, check_update, download_update, install_update,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

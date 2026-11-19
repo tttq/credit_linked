@@ -556,15 +556,6 @@ pub fn parse_anthropic_chunk(v: &Value) -> Vec<crate::upstream::StreamEvent> {
             }
         }
         "ping" => {}
-        "message_start" => {
-            if let Some(u) = v.pointer("/message/usage") {
-                let input = u.get("input_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
-                let output = u.get("output_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
-                if input > 0 || output > 0 {
-                    out.push(StreamEvent::Usage { input, output, total: Some(input + output) });
-                }
-            }
-        }
         _ => {}
     }
     out

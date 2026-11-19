@@ -91,3 +91,33 @@ pub fn request_source_for_dir(dir: &PathBuf) -> i64 {
     let name = dir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
     if name.to_uppercase().contains("SOLO") { 2 } else { 1 }
 }
+
+/// 收集本机全部 Trae 安装目录下已注册的设备号（多安装/多目录去重）。
+/// 上游 claim 校验 x-device-id 必须是服务器注册过的设备号（否则 9074），
+/// 且一个设备号一天只能签一个账号（9095）——多账号需各用各的号。
+pub fn collect_local_device_ids() -> Vec<String> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Ok(over) = std::env::var("TRADE_HOME") {
+        let p = PathBuf::from(&over);
+        if p.join("User/globalStorage/storage.json").exists() {
+            dirs.push(p);
+        }
+    }
+    for name in APP_NAMES {
+        let d = app_data_root().join(name);
+        if d.join("User/globalStorage/storage.json").exists() && !dirs.contains(&d) {
+            dirs.push(d);
+        }
+    }
+    let mut out: Vec<String> = Vec::new();
+    for d in dirs {
+        if let Some(s) = read_storage_json(&d) {
+            if let Some(id) = device_id_of(&s) {
+                if !out.contains(&id) {
+                    out.push(id);
+                }
+            }
+        }
+    }
+    out
+}

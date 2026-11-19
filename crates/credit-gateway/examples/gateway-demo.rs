@@ -10,6 +10,10 @@ async fn main() -> anyhow::Result<()> {
         store: store.clone(),
         router: credit_gateway::Router::new(store),
         api_key: String::new(),
+        rate_window: std::sync::Mutex::new(std::collections::VecDeque::new()),
+        port: 8756,
+        device_salt: std::sync::Mutex::new(String::new()),
+        device_token: std::sync::Mutex::new(None),
     });
     let addr: SocketAddr = "127.0.0.1:8756".parse()?;
     println!("gateway demo listening on http://{addr}");

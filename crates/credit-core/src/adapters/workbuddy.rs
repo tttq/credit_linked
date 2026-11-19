@@ -174,7 +174,6 @@ impl Adapter for WorkBuddyAdapter {
     }
 }
 
-fn edm(_s: &str) -> i64 { 0 }
 fn chrono_like_ms(s: &str) -> Result<i64, ()> {
     // 简化 ISO 解析：仅支持 "YYYY-MM-DDTHH:MM:SS(.fff)?Z" 与无 Z
     let (date, time) = s.split_once('T').ok_or(())?;
@@ -190,13 +189,4 @@ fn chrono_like_ms(s: &str) -> Result<i64, ()> {
     let mi: i64 = tp[1].parse().map_err(|_| ())?;
     let sec: i64 = tp.get(2).and_then(|x| x.split('.').next()).and_then(|x| x.parse().ok()).unwrap_or(0);
     Ok(crate::adapters::days_from_civil(y, mo, d) * 86400 + h * 3600 + mi * 60 + sec)
-}
-fn days_from_civil_unused_unused(y: i64, m: i64, d: i64) -> i64 {
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400;
-    let mp = if m > 2 { m - 3 } else { m + 9 };
-    let doy = (153 * mp + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146097 + doe - 719468
 }

@@ -12,7 +12,7 @@ use p256::{SecretKey, ecdsa::signature::Signer, ecdsa::SigningKey};
 use crate::adapters::*;
 use crate::adapters::trae::urlencoding_lite;
 use crate::error::PlatformError;
-use crate::net::http::platform_fetch;
+use crate::net::http::business;
 use reqwest::Method;
 
 pub const STS_BASE: &str = "https://sts.cn-north-4.myhuaweicloud.com";
@@ -81,7 +81,6 @@ pub async fn sts_token(body_pairs: &[(&str, &str)], private_jwk: &Value) -> Resu
     let v: Value = resp.json().await.map_err(|e| PlatformError::Format(e.to_string()))?;
     Ok(v)
 }
-
 // ===== SDK-HMAC-SHA256 请求签名 =====
 
 pub fn decode_percent(s: &str) -> String {
@@ -166,7 +165,7 @@ pub fn hex_lower(b: &[u8]) -> String {
 
 fn channel(desktop: bool) -> &'static str { if desktop { "DESKTOP" } else { "IDE" } }
 
-pub async fn ops_request(c: &Cred, desktop: bool, method: Method, path: &str, query: &str, body: Value, identity: bool) -> Result<Value, PlatformError> {
+pub async fn ops_request(c: &Cred, _desktop: bool, method: Method, path: &str, query: &str, body: Value, identity: bool) -> Result<Value, PlatformError> {
     let base = if identity { STS_BASE } else { API_BASE };
     let url = format!("{base}{path}");
     let ak = c.meta.get("access_key_id").and_then(|a| a.as_str()).unwrap_or_default();
@@ -174,23 +173,17 @@ pub async fn ops_request(c: &Cred, desktop: bool, method: Method, path: &str, qu
     let st = c.meta.get("security_token").and_then(|a| a.as_str());
     let body_str = if body.is_null() { String::new() } else { serde_json::to_string(&body).unwrap_or_default() };
     let mut base_headers: Vec<(String, String)> = vec![("content-type".into(), "application/json".into())];
-    // 官方客户端（asar）：X-Security-Token 每请求携带（HWS 网关校验会话有效性）
+    // 客户端真实头集（desktop 逆向）：X-Security-Token + Agent-Type + X-Language（+ x-snap-traceid）
     if let Some(tok) = st {
         if !tok.is_empty() {
-            base_headers.push(("X-Security-Token".into(), tok.to_string()));
+            base_headers.push(("x-security-token".into(), tok.to_string()));
         }
     }
-    if desktop {
-        base_headers.push(("agent-type".into(), "PromptCenter".into()));
-        base_headers.push(("x-language".into(), "zh-cn".into()));
-    } else {
-        base_headers.push(("app-id".into(), "CodeAgent3.0".into()));
-        base_headers.push(("agent-type".into(), "PromptCenter".into()));
-        base_headers.push(("plugin-name".into(), "codemate_vscode".into()));
-        base_headers.push(("plugin-version".into(), "26.9.902".into()));
-        base_headers.push(("ide-name".into(), "VSCode".into()));
-        base_headers.push(("ide-version".into(), "26.9.902".into()));
-        base_headers.push(("x-ot-client-type".into(), "IDE".into()));
+    base_headers.push(("agent-type".into(), "PromptCenter".into()));
+    base_headers.push(("x-language".into(), "zh-cn".into()));
+    // delivery/claim 等 GET 请求客户端带 trace id（uuid）且参与签名
+    if !identity {
+        base_headers.push(("x-snap-traceid".into(), uuid::Uuid::new_v4().to_string()));
     }
     let host_of_url = url.split("://").nth(1).unwrap_or("").split('/').next().unwrap_or("").to_string();
     let (auth, sign_headers) = sign_codearts(ak, sk, method.as_str(), &host_of_url, path, query, &base_headers, &body_str, st);
@@ -206,35 +199,18 @@ pub async fn ops_request(c: &Cred, desktop: bool, method: Method, path: &str, qu
     }
     let resp = req.send().await.map_err(|e| PlatformError::Network(e.to_string()))?;
     match resp.status().as_u16() { 401 => return Err(PlatformError::Auth), 429 => return Err(PlatformError::Rate), 403 => return Err(PlatformError::Forbidden), _ => {} }
-    resp.json::<Value>().await.map_err(|e| PlatformError::Format(e.to_string()))
-}
-
-fn iso_ms(s: &str) -> Option<i64> {
-    // ISO8601 → epoch ms（无完整解析器，覆盖平台返回的 Z / +08:00 两种形态）
-    let s = s.trim();
-    let (body, off_ms) = if let Some(p) = s.rfind(['+', '-']) {
-        let off = &s[p..];
-        let sign = if off.starts_with('-') { -1 } else { 1 };
-        let hh: i64 = off.get(1..3)?.parse().ok()?;
-        let mm: i64 = off.get(4..6)?.parse().ok()?;
-        (&s[..p], sign * (hh * 3600 + mm * 60) * 1000)
-    } else {
-        (s, 0)
-    };
-    let digits: String = body.chars().filter(|ch| ch.is_ascii_digit()).collect();
-    if digits.len() < 14 { return None; }
-    let y: i64 = digits.get(0..4)?.parse().ok()?;
-    let mo: i64 = digits.get(4..6)?.parse().ok()?;
-    let d: i64 = digits.get(6..8)?.parse().ok()?;
-    let hh: i64 = digits.get(8..10)?.parse().ok()?;
-    let mi: i64 = digits.get(10..12)?.parse().ok()?;
-    let ss: i64 = digits.get(12..14)?.parse().ok()?;
-    let days = crate::adapters::days_from_civil(y, mo, d);
-    Some((days * 86400 + hh * 3600 + mi * 60 + ss) * 1000 - off_ms)
-}
-
-fn idempotent_key(uid: &str, day: &str, campaign_id: &str) -> String {
-    hex_lower(&Sha256::digest(format!("{uid}:{day}:{campaign_id}").as_bytes()))
+    let v: Value = resp.json().await.map_err(|e| PlatformError::Format(e.to_string()))?;
+    // HWS 网关常在 HTTP 200 里返回 error_code（如 APIG.0602 security token 过期）
+    let ec = v.get("error_code").and_then(|e| e.as_str()).unwrap_or("");
+    let em = v.get("error_msg").and_then(|e| e.as_str()).unwrap_or("");
+    if !ec.is_empty() {
+        if ec.contains("0602") || ec.contains("0603") || ec.contains("1806")
+            || em.contains("token") && em.contains("expired") || em.contains("expired") {
+            return Err(PlatformError::Auth);
+        }
+        return Err(PlatformError::Format(format!("CodeArts {ec}: {em}")));
+    }
+    business(v)
 }
 
 #[async_trait::async_trait]
@@ -251,29 +227,22 @@ impl Adapter for CodeArtsAdapter {
         let q = format!("channel={}", channel(self.desktop));
         let v = ops_request(c, self.desktop, Method::GET, "/v1/ops/delivery", &q, Value::Null, false).await?;
         let items = v.pointer("/data/items").or_else(|| v.get("items")).and_then(|i| i.as_array()).cloned().unwrap_or_default();
-        // vendor daily(): USER_LOGIN + campaignId + (triggerMode 空或 MANUAL_CLAIM) + 时间窗内
-        let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64 * 1000;
+        // 客户端真实判定（desktop 逆向）：campaignId 非空 && claimable !== false；
+        // 未领 = status == ELIGIBLE；已入账 = status ∈ {CLAIMED, CONFIRMED, CONSUMED}。
+        // 不做 triggerMode/时间窗过滤（desktop 无这些字段；USER_LOGIN 只是旧映射，
+        // 桌面签到活动 type = DAILY_CLAIM）。
         let daily: Vec<Value> = items.into_iter().filter(|x| {
-            let typ = x.get("type").and_then(|t| t.as_str()).unwrap_or("");
-            let cid = match x.get("campaignId") {
+            let cid = match x.get("campaignId").or_else(|| x.get("campaign_id")) {
                 Some(Value::String(s)) => s.clone(),
                 Some(Value::Number(n)) => n.to_string(),
                 _ => String::new(),
             };
-            if typ != "USER_LOGIN" || cid.is_empty() { return false; }
-            let tm = x.pointer("/extra/triggerMode").and_then(|t| t.as_str()).unwrap_or("");
-            if !tm.is_empty() && tm != "MANUAL_CLAIM" { return false; }
-            let start = x.pointer("/extra/startTime").and_then(|s| s.as_str()).and_then(|s| iso_ms(s));
-            let end = x.pointer("/extra/endTime").and_then(|s| s.as_str()).and_then(|s| iso_ms(s));
-            !(start.map(|s| s > now_ms).unwrap_or(false)) && !(end.map(|e| e <= now_ms).unwrap_or(false))
+            if cid.is_empty() { return false; }
+            x.get("claimable").and_then(|b| b.as_bool()) != Some(false)
         }).collect();
-        let granted_status = |s: &str| if self.desktop {
-            ["CLAIMED", "CONFIRMED", "CONSUMED"].contains(&s)
-        } else {
-            ["CONFIRMED", "CONSUMED"].contains(&s)
-        };
+        let granted_status = |s: &str| ["CLAIMED", "CONFIRMED", "CONSUMED"].contains(&s);
         let checked = !daily.is_empty() && daily.iter().all(|x| granted_status(x.get("status").and_then(|t| t.as_str()).unwrap_or("")));
-        let claimable = daily.iter().any(|x| x.get("status").and_then(|t| t.as_str()) == Some("ELIGIBLE") && x.get("claimable").and_then(|b| b.as_bool()) == Some(true));
+        let claimable = daily.iter().any(|x| x.get("status").and_then(|t| t.as_str()) == Some("ELIGIBLE"));
         Ok(CheckinState { checked, claimable, raw: json!({ "items": daily }), ..Default::default() })
     }
 
@@ -285,10 +254,11 @@ impl Adapter for CodeArtsAdapter {
         if items.is_empty() {
             return Ok(Receipt { status: "no-activity".into(), amount: None, message: None });
         }
-        let day = crate::adapters::day_cn();
+        // 幂等键对齐客户端：claim_{campaignId}_{epoch_ms}（sha256 稳定键会被服务端幂等去重误伤重试）
+        let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
         let mut amount: Option<f64> = None;
         for it in &items {
-            let cid = match it.get("campaignId") {
+            let cid = match it.get("campaignId").or_else(|| it.get("campaign_id")) {
                 Some(Value::String(s)) => s.clone(),
                 Some(Value::Number(n)) => n.to_string(),
                 _ => String::new(),
@@ -297,24 +267,28 @@ impl Adapter for CodeArtsAdapter {
             let body = json!({
                 "campaignId": cid,
                 "channel": channel(self.desktop),
-                "idempotentKey": idempotent_key(&c.uid, &day, &cid),
+                "idempotentKey": format!("claim_{cid}_{now_ms}"),
             });
             let d = ops_request(c, self.desktop, Method::POST, "/v1/ops/claim", "", body, false).await?;
-            let amt = d.pointer("/data/amount").and_then(|a| a.as_f64())
+            // amount 桌面版从 delivery item 的 benefitAmount 取（claim 回执不带金额）
+            let amt = it.get("benefitAmount").and_then(|a| a.as_f64())
+                .or_else(|| d.pointer("/data/amount").and_then(|a| a.as_f64()))
                 .or_else(|| d.pointer("/data/benefitAmount").and_then(|a| a.as_f64()))
                 .or_else(|| d.get("amount").and_then(|a| a.as_f64()))
-                .or_else(|| d.get("benefitAmount").and_then(|a| a.as_f64()))
-                .or_else(|| it.get("benefitAmount").and_then(|a| a.as_f64()))
                 .unwrap_or(0.0);
             amount = Some(amount.unwrap_or(0.0) + amt);
-            // confirm
-            let confirm_body = if self.desktop {
-                let bid = d.get("id").or_else(|| d.get("userBenefitId")).cloned().unwrap_or(Value::Null);
-                json!({ "userBenefitId": bid })
-            } else {
-                json!({ "campaignId": cid })
-            };
-            let _ = ops_request(c, self.desktop, Method::POST, "/v1/ops/confirm", "", confirm_body, false).await?;
+            // confirm：仅当 claim 回执带 id/userBenefitId 才发（与客户端一致；失败不阻塞）
+            let bid = d.pointer("/data/id").or_else(|| d.get("id"))
+                .or_else(|| d.pointer("/data/userBenefitId")).or_else(|| d.get("userBenefitId"))
+                .cloned().unwrap_or(Value::Null);
+            if !bid.is_null() {
+                let confirm_body = if self.desktop {
+                    json!({ "userBenefitId": bid })
+                } else {
+                    json!({ "campaignId": cid })
+                };
+                let _ = ops_request(c, self.desktop, Method::POST, "/v1/ops/confirm", "", confirm_body, false).await?;
+            }
         }
         Ok(Receipt { status: "success".into(), amount, message: None })
     }
@@ -337,20 +311,28 @@ impl Adapter for CodeArtsAdapter {
     async fn refresh(&self, c: &Cred) -> Result<Cred, PlatformError> {
         let Some(rt) = c.meta.get("refresh_token").and_then(|r| r.as_str()) else { return Err(PlatformError::Auth) };
         let jwk = c.meta.get("privateJwk").cloned().unwrap_or(Value::Null);
-        let v = sts_token(&[
+        let verifier = c.meta.get("verifier").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let mut pairs = vec![
             ("grant_type", "refresh_token"),
             ("refresh_token", rt),
-            ("client_id", if self.desktop { "codearts" } else { "codearts-agent" }),
-        ], &jwk).await?;
+            // 客户端逆向：client_id 恒为 "codearts"（product.json 固定值，desktop/agent 相同）
+            ("client_id", "codearts"),
+        ];
+        // 官方实现要求带 code_verifier（PKCE 续期），否则服务端拒绝/轮换失效
+        if !verifier.is_empty() {
+            pairs.push(("code_verifier", &verifier));
+        }
+        let v = sts_token(&pairs, &jwk).await?;
         // 错误响应（refresh_token 轮换作废等）
         if let Some(ec) = v.get("error_code").and_then(|e| e.as_str()) {
             let msg = v.get("error_msg").and_then(|m| m.as_str()).unwrap_or("STS refresh failed");
-            let auth = ec.contains("1806") || msg.contains("refresh token");
-            return Err(if auth {
-                PlatformError::Auth
-            } else {
-                PlatformError::Format(format!("STS {ec}: {msg}"))
-            });
+            if ec.contains("1806") || msg.contains("refresh token") {
+                // RT 一次性且已作废（被客户端/其它实例轮换消费）——唯一出路是重新授权
+                return Err(PlatformError::Identity(format!(
+                    "码道授权已失效（refresh token 已被使用 {ec}）：请在「账号管理」删除该账号后重新「添加账号」授权，或先在码道客户端登录后点「扫描本机」"
+                )));
+            }
+            return Err(PlatformError::Format(format!("STS {ec}: {msg}")));
         }
         let mut out = c.clone();
         if let Some(cred) = v.get("credentials") {
@@ -362,7 +344,8 @@ impl Adapter for CodeArtsAdapter {
         if let Some(nrt) = v.get("refresh_token").and_then(|r| r.as_str()) {
             out.meta["refresh_token"] = json!(nrt);
         }
-        if let Some(exp) = v.get("expires_at").and_then(|e| e.as_str()) {
+        // 响应结构：{ credentials: { …, expiration(ISO) }, refresh_token }
+        if let Some(exp) = v.pointer("/credentials/expiration").and_then(|e| e.as_str()) {
             out.expires_at = Some(exp.to_string());
         }
         Ok(out)

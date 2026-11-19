@@ -251,19 +251,11 @@ async fn list_models(
             Platform::Minimax => upstream::minimax_fetch_models(&cred).await,
             Platform::Qoder => upstream::qoder_fetch_models(&cred).await,
             Platform::CodeArts => {
-                // STS 过期时自动 refresh（RT 轮换保存已内置）
-                use credit_core::adapters::Adapter;
-                let adapter = credit_core::adapters::codearts::CodeArtsAdapter { desktop: false };
-                let cred_fresh = match adapter.refresh(&cred).await {
-                    Ok(nc) => {
-                        if let Ok(js) = serde_json::to_string(&nc) {
-                            let _ = st.store.upsert_account(platform.as_str(), &cred.uid, &nc.name, "", &js);
-                        }
-                        nc
-                    }
-                    Err(_) => cred.clone(),
-                };
-                upstream::codearts_fetch_models(&cred_fresh, false).await
+                // 惰性 refresh：仅当前 STS 疑似过期才轮换 RT（RT 一次性，无条件 refresh 会
+                // 把 token 提前消耗掉，导致签到/额度链路 1806 失效）。先用现有 STS 请求，
+                // 401/过期时由上层 refreshed_cred 链路恢复。
+                let _ = &cred;
+                upstream::codearts_fetch_models(&cred, false).await
             }
         };
         let Ok(models) = models else { continue };
@@ -406,10 +398,27 @@ async fn chat_completions(
                 }
                 Err((code, msg)) => {
                     let is_channel_block = msg.contains("11128") || msg.contains("Illegal API invocation");
-                    let failover_worthy = code == "auth" || code == "rate" || code == "network" || code == "upstream";
+                    // 额度耗尽也视作可切换（各平台错误文案不一）
+                    let quota_exhausted = msg.contains("额度") || msg.contains("不足") || msg.contains("exhaust")
+                        || msg.contains("quota") || msg.contains("credit") || msg.contains("insufficient")
+                        || msg.contains("429") || msg.contains("rate_limit");
+                    let failover_worthy = code == "auth" || code == "rate" || code == "network" || code == "upstream" || quota_exhausted;
                     if failover_worthy && !is_channel_block {
                         // 渠道拦截不算账号故障（账号本身正常，别标 failed）
                         let _ = st.store.update_account_status(&cred.provider, &cred.uid, "failed", Some(msg.as_str()));
+                        // 自动切换：当前账号不可用时，把选中账号切到同平台下一个可用账号
+                        let cur_ref = format!("{}:{}", cred.provider, cred.uid);
+                        let selected = st.store.get_setting("gw_account", "").unwrap_or_default();
+                        if selected == cur_ref || selected.is_empty() {
+                            if let Some(next) = creds.iter().find(|c| {
+                                let r = format!("{}:{}", c.provider, c.uid);
+                                r != cur_ref && !c.token.is_empty()
+                            }) {
+                                let next_ref = format!("{}:{}", next.provider, next.uid);
+                                let _ = st.store.set_setting("gw_account", &next_ref);
+                                eprintln!("[gateway] 账号 {} 不可用，自动切换到 {}", cur_ref, next_ref);
+                            }
+                        }
                     }
                     last_error = Some((code, msg.clone()));
                     if !failover_worthy {

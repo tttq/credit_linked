@@ -15,10 +15,11 @@
   --bg: #f7f7fb;
 }
 * { box-sizing: border-box; margin: 0; padding: 0; }
-body { color: var(--text); background: transparent; height: 100vh; overflow: hidden; }
-/* 右下角小面板（微软电脑管家式）：整个应用就是一块浮在屏幕右下角的小卡片 */
+html, body { height: 100%; }
+body { color: var(--text); background: transparent; overflow: hidden; }
+/* 浮动小面板：铺满窗口，随窗口缩放自适应；内容区各自滚动 */
 #shell {
-  display: flex; flex-direction: column; height: 100vh; overflow: hidden;
+  display: flex; flex-direction: column; height: 100%; width: 100%; min-height: 0; overflow: hidden;
   background: rgba(250, 250, 254, .97);
   border: 1px solid #e4e2f0; border-radius: 16px;
   box-shadow: 0 14px 44px rgba(40, 35, 80, .22);
@@ -60,7 +61,6 @@ nav#nav button.selected { background: var(--accent-soft); color: var(--accent); 
   .progress-hero { gap: 22px; padding: 18px 20px; }
   .progress-hero strong { font-size: 30px; }
 }
-.account-toolbar { height: 56px; display: flex; align-items: center; gap: 12px; flex-shrink: 0; }
 .account-toolbar .spacer { flex: 1; }
 button, .button { cursor: pointer; border: 1px solid var(--line); background: #fff; color: var(--text); border-radius: 9px; padding: 8px 14px; font: inherit; font-size: 13px; transition: all .15s; }
 button:hover { border-color: var(--accent); color: var(--accent); }
@@ -134,16 +134,19 @@ select, input[type="number"], input[type="time"] { font: inherit; }
 .account-capability.multi { color: var(--accent); background: color-mix(in srgb, var(--accent) 9%, transparent); }
 .account-platform-count { font-size: 11px; white-space: nowrap; }
 .account-platform-header>.actions { flex-shrink: 0; gap: 6px; display: flex; }
-.account-group-row { display: grid; grid-template-columns: minmax(110px, 1fr) auto; grid-template-areas: "id st" "id act"; align-items: center; gap: 4px 10px; padding: 10px 12px; }
+.account-group-row { display: grid; grid-template-columns: minmax(110px, 1fr) auto; grid-template-areas: "id bal" "act act"; align-items: center; gap: 6px 10px; padding: 10px 12px; }
 .account-group-row+.account-group-row { border-top: 1px solid var(--line); }
 .single-account-identity { grid-area: id; min-width: 0; }
 .single-account-identity>strong { display: block; font-size: 13px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 .single-account-identity>small { display: block; margin-top: 3px; font-size: 11px; color: var(--subtle); overflow-wrap: anywhere; }
-.single-account-balance { grid-area: st; text-align: right; }
+.acct-state { font-size: 11px; font-weight: 500; color: var(--subtle); white-space: nowrap; }
+.acct-state.done { color: var(--green); }
+.acct-state.bad { color: var(--red); }
+.single-account-balance { grid-area: bal; text-align: right; }
 .single-account-balance strong { font-size: 14px; }
 .single-account-balance small { display: block; margin-top: 2px; font-size: 10.5px; color: var(--subtle); max-width: 130px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
-.single-account-status { grid-area: st; justify-self: end; }
-.account-row-actions { grid-area: act; display: flex; gap: 5px; justify-content: flex-start; align-items: center; flex-wrap: wrap; }
+.account-row-actions { grid-area: act; display: flex; gap: 5px; justify-self: end; align-items: center; flex-wrap: wrap; }
+.single-account-status { display: none; }
 .status { display: inline-flex; gap: 6px; align-items: center; font-size: 12px; white-space: nowrap; }
 .status .dot { width: 7px; height: 7px; border-radius: 50%; }
 .st-ok { color: var(--green); } .st-ok .dot { background: var(--green); }
@@ -185,25 +188,27 @@ select, input[type="number"], input[type="time"] { font: inherit; }
 .schedule-strip strong { font-size: 20px; margin: 0 4px; letter-spacing: -.5px; }
 
 /* 积分统计 */
-.statistics-toolbar { display: flex; justify-content: space-between; align-items: center; margin: 0 0 12px; gap: 12px; }
+.statistics-toolbar { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 10px; margin: 0 0 14px; }
 .statistics-provider { display: flex; align-items: center; gap: 7px; }
 .statistics-provider img, .statistics-provider .picon { width: 22px; height: 22px; border-radius: 6px; }
 .statistics-provider .picon { display: flex; align-items: center; justify-content: center; color: #fff; font-weight: 700; font-size: 12px; background: var(--accent); }
-.statistics-provider select { min-width: 170px; padding: 7px 10px; color: var(--text); background: var(--surface); border: 1px solid var(--line); border-radius: 9px; font: inherit; font-size: 13px; }
-.metrics { display: grid; grid-template-columns: repeat(3, 1fr); padding: 14px 18px; margin: 10px 0 12px; }
-.metrics>div+div { border-left: 1px solid var(--line); padding-left: 16px; }
-.metrics p { font-size: 11px; color: var(--subtle); margin-bottom: 5px; }
-.metrics strong { font-size: 19px; font-weight: 650; }
-.statistics-panels { display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr); gap: 8px; align-items: start; }
-.chart-section { padding: 12px 14px; }
-.chart-wrap-sm { width: 100%; height: 200px; }
+.statistics-provider select { min-width: 180px; padding: 7px 10px; color: var(--text); background: var(--surface); border: 1px solid var(--line); border-radius: 9px; font: inherit; font-size: 13px; }
+.metrics { display: grid; grid-template-columns: repeat(3, 1fr); padding: 14px 18px; margin: 0 0 14px; gap: 8px; }
+.metrics>div { text-align: center; }
+.metrics>div+div { border-left: 1px solid var(--line); }
+.metrics p { font-size: 11px; color: var(--subtle); margin-bottom: 6px; }
+.metrics strong { font-size: 20px; font-weight: 650; }
+.statistics-panels { display: grid; grid-template-columns: 1fr; gap: 12px; align-items: stretch; }
+.chart-section { padding: 14px 16px; }
+.chart-wrap-sm { width: 100%; height: 220px; }
 .statistics-ledger { border-radius: 12px; overflow: hidden; background: var(--surface); border: 1px solid var(--line); }
-.statistics-ledger>h3 { font-size: 13px; padding: 10px 12px 6px; }
+.statistics-ledger>h3 { font-size: 13px; padding: 10px 12px 8px; }
 .statistics-ledger>h3>small { font-size: 11px; font-weight: 400; margin-left: 4px; color: var(--subtle); }
-.table-wrap { padding: 0 4px 4px; max-height: 300px; overflow: auto; }
-table { width: 100%; border-collapse: collapse; font-size: 11.5px; }
-th { text-align: left; color: var(--subtle); font-weight: 500; padding: 6px 7px; border-bottom: 1px solid var(--line); font-size: 11px; white-space: nowrap; }
-td { padding: 6px 7px; border-bottom: 1px solid var(--line); }
+.table-wrap { padding: 0 6px 6px; max-height: 260px; overflow: auto; }
+.statistics-empty { text-align: center; color: var(--subtle); padding: 24px 0; font-size: 12px; }
+table { width: 100%; border-collapse: collapse; font-size: 12px; }
+th { text-align: left; color: var(--subtle); font-weight: 500; padding: 7px 8px; border-bottom: 1px solid var(--line); font-size: 11px; white-space: nowrap; position: sticky; top: 0; background: var(--surface); }
+td { padding: 7px 8px; border-bottom: 1px solid var(--line); }
 
 /* 设置 */
 .settings-panel { padding: 6px 18px 18px; }
@@ -218,8 +223,13 @@ td { padding: 6px 7px; border-bottom: 1px solid var(--line); }
 select { padding: 6px 9px; border-radius: 8px; border: 1px solid var(--line); background: #fff; font: inherit; font-size: 12.5px; }
 
 /* 账号路由占位 */
-.route-matrix { margin-top: 12px; }
-.route-row { display: flex; align-items: center; gap: 10px; padding: 10px 14px; border-bottom: 1px solid var(--line); }
+.route-matrix { margin-top: 0; display: grid; gap: 12px; }
+.route-card { padding: 14px 16px !important; }
+.route-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 14px; margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--line); }
+.route-field { min-width: 0; }
+.route-field-label { display: block; font-size: 11.5px; font-weight: 600; margin-bottom: 6px; }
+.route-field-hint { font-weight: 400; opacity: .8; }
+.route-row { display: flex; align-items: center; gap: 10px; padding: 9px 12px; border-bottom: 1px solid var(--line); }
 .route-row:last-child { border-bottom: 0; }
 .route-row img, .route-row .picon { width: 26px; height: 26px; border-radius: 7px; flex-shrink: 0; }
 .route-row img[src$=".svg"] { width: 26px; height: 26px; object-fit: contain; }
@@ -236,6 +246,9 @@ img { max-width: 100%; }
 .spin { display: inline-block; width: 13px; height: 13px; border: 2px solid var(--line); border-top-color: var(--accent); border-radius: 50%; animation: r .7s linear infinite; vertical-align: -2px; }
 @keyframes r { to { transform: rotate(360deg); } }
 #toast { position: fixed; bottom: 14px; left: 50%; transform: translateX(-50%); background: #25252f; color: #fff; padding: 9px 14px; border-radius: 9px; font-size: 12px; display: none; z-index: 99; box-shadow: 0 8px 28px rgba(0,0,0,.25); max-width: 88%; }
+/* 右下角缩放手柄（无边框窗口） */
+#resize-handle { position: fixed; right: 0; bottom: 0; width: 18px; height: 18px; z-index: 60; cursor: nwse-resize; }
+#resize-handle::after { content: ''; position: absolute; right: 3px; bottom: 3px; width: 9px; height: 9px; border-right: 2px solid #b9b4d8; border-bottom: 2px solid #b9b4d8; border-radius: 0 0 3px 0; }
 </style>
 </head>
 <body>
@@ -281,6 +294,7 @@ img { max-width: 100%; }
         <div><h1>账号管理</h1><p class="subtle" id="accounts-sub"></p></div>
         <div class="actions">
           <button id="btn-quota-all2">刷新余额</button>
+          <button id="btn-checkin-all2" class="primary">一键签到</button>
         </div>
       </div>
       <div class="account-platform-list" id="account-list"></div>
@@ -289,7 +303,6 @@ img { max-width: 100%; }
     <section class="page" id="page-checkin">
       <div class="page-header">
         <div><h1>签到中心</h1><p class="subtle">按账号查看领取进度；支持多个独立授权账号，逐个执行。</p></div>
-        <div class="actions"><button id="btn-checkin-all2" class="primary">一键签到</button></div>
       </div>
       <div class="progress-hero" id="progress-hero"></div>
       <div class="schedule-strip"><strong id="sched-time">--:--</strong><span>计划签到时间（北京时间）</span><span class="subtle" style="margin-left:auto">所有平台统一按北京时间执行</span></div>
@@ -346,6 +359,7 @@ img { max-width: 100%; }
     </section>
   </main>
 </div>
+<div id="resize-handle" data-tauri-drag-region></div>
 
 <!-- 登录模态 -->
 <div class="modal-mask" id="login-mask">
@@ -367,6 +381,29 @@ img { max-width: 100%; }
       <button id="quit-cancel">取消</button>
       <button id="quit-to-tray">退至后台</button>
       <button id="quit-exit" class="primary">退出程序</button>
+    </div>
+  </div>
+</div>
+<!-- 设备号设置模态（居中弹出） -->
+<div class="modal-mask" id="dev-mask" style="display:none">
+  <div class="modal">
+    <h3>设置设备号</h3>
+    <div class="desc" id="dev-desc"></div>
+    <div id="dev-body"></div>
+    <div class="foot">
+      <button id="dev-cancel">取消</button>
+      <button id="dev-save" class="primary">保存</button>
+    </div>
+  </div>
+</div>
+<!-- 通用确认/错误弹框（居中） -->
+<div class="modal-mask" id="confirm-mask" style="display:none">
+  <div class="modal" style="max-width:420px">
+    <h3 id="confirm-title">提示</h3>
+    <div class="desc" id="confirm-desc"></div>
+    <div class="foot">
+      <button id="confirm-no">取消</button>
+      <button id="confirm-yes" class="primary">确定</button>
     </div>
   </div>
 </div>

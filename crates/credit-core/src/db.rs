@@ -180,6 +180,13 @@ pub fn set_account_auto(&self, provider: &str, uid: &str, auto: bool) -> anyhow:
     Ok(())
 }
 
+/// 更新凭据到期时间（CodeArts STS 等）
+pub fn update_account_expires(&self, provider: &str, uid: &str, expires: Option<&str>) -> anyhow::Result<()> {
+    let conn = self.conn.lock().unwrap();
+    conn.execute("UPDATE accounts SET expires=?3 WHERE provider=?1 AND uid=?2", rusqlite::params![provider, uid, expires])?;
+    Ok(())
+}
+
 /// 完整账号行（UI 展示用）。
 pub fn list_accounts_full(&self) -> anyhow::Result<Vec<AccountRow>> {
     let conn = self.conn.lock().unwrap();

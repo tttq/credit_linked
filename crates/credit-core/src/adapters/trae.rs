@@ -219,7 +219,20 @@ pub struct TraeLogin {
 }
 
 pub fn start_login() -> TraeLogin {
-    let identity = new_device_identity();
+    // 每次登录生成全新独立设备身份：多账号场景下各账号得到各自的 device_id，
+    // ExchangeToken 时注册到服务端，后续签到按账号各自的设备号执行（规避
+    // 「一设备一天一签」限制）。若本机 Trae 客户端有已注册设备号则优先探测。
+    let identity = {
+        let local = crate::adapters::trae_local::collect_local_device_ids();
+        match local.first() {
+            Some(id) => {
+                let mut base = new_device_identity();
+                base.device_id = id.clone();
+                base
+            }
+            None => new_device_identity(),
+        }
+    };
     let mut vb = [0u8; 48];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut vb);
     let verifier = B64URL.encode(vb);
