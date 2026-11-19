@@ -56,6 +56,8 @@ jobs:
         shell: bash
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Linux AppImage 打包在无 FUSE 的 CI 环境需要解包运行 linuxdeploy
+          APPIMAGE_EXTRACT_AND_RUN: 1
         run: |
           set -o pipefail
           cargo tauri build --verbose ${{ matrix.args }} 2>&1 | tee build.log || {

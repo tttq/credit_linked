@@ -14,9 +14,12 @@ anyhow.workspace = true
 
 # regex 用于解析 MiniMax 官网最新版直链
 regex = "1"
-# winreg 用于检测本机已安装软件（Uninstall 注册表），替代慢的 powershell 子进程
-winreg = "0.55"
 reqwest = { workspace = true, features = ["json"] }
+
+# winreg 仅 Windows 可用（检测本机已安装软件：Uninstall 注册表），必须按 target 隔离，
+# 否则 Linux/macOS 构建会出现 "OS not supported" 编译错误
+[target.'cfg(windows)'.dependencies]
+winreg = "0.55"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

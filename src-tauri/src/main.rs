@@ -574,6 +574,7 @@ async fn gateway_clear_logs() -> Result<serde_json::Value, String> {
 
 /// 检测平台客户端本机是否已安装（注册表 Uninstall 键直查，无子进程，毫秒级）
 /// 返回 (display_name, install_location, uninstall_cmd) 列表
+#[cfg(windows)]
 fn registry_installed_entries() -> Vec<(String, String, String)> {
     use winreg::enums::*;
     use winreg::RegKey;
@@ -597,6 +598,12 @@ fn registry_installed_entries() -> Vec<(String, String, String)> {
         }
     }
     out
+}
+
+/// 非 Windows：无注册表，返回空（走路径探测/手动导入兜底）
+#[cfg(not(windows))]
+fn registry_installed_entries() -> Vec<(String, String, String)> {
+    Vec::new()
 }
 
 /// 卸载器目录里找主程序（Uninstall 旁通常就是主 exe）

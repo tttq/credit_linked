@@ -25,9 +25,12 @@ async-trait.workspace = true
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = ["Win32_Security_Cryptography", "Win32_Foundation"] }
 
-[target.'cfg(unix)'.dependencies]
-# macOS Keychain / Linux libsecret via keyring crate
+# 系统凭据存储按平台区分后端特性（keyring 3 必须显式启用对应平台后端，否则编译报错）
+[target.'cfg(target_os = "linux")'.dependencies]
 keyring = { version = "3", features = ["linux-native"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3", features = ["apple-native"] }
 
 [dev-dependencies]
 hex = "0.4"
