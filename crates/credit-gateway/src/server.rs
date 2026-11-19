@@ -825,40 +825,60 @@ impl Drop for StreamGuard {
     }
 }
 
-/// 修复上游工具参数分片伪影：部分上游（实测 Qoder gfmodel）会在参数结尾多发一个 `""`，
-/// 例如 `{"file_path":"...","limit":100"` + `""` + `}` 拼成 `{"limit":100""}`，
+/// 修复上游工具参数伪影：部分上游（实测 Qoder gfmodel）流式分词时会在**每个值后面**多吐一个
+/// `""`，例如 `{"limit":75"","offset":50""}`、`{"limit":100""}`。
 /// 客户端会因非法 JSON 报 "Expected ',' or '}' after property value"（工具调用直接失败）。
-/// 这里在整体下发前校验并修复；修不好则原样返回。
+/// 处理原则：`""` 前一个有效字符是 `: , [ {` 时是合法的空字符串，保留；
+/// 若前一个字符是数字/true/false/null/`}`/`]`（完整值后紧跟引号）说明两个引号都是伪影，删掉；
+/// 其它情况（字符串结尾多一个引号）删掉一个。校验通过即返回，修不好则原样返回。
 fn sanitize_tool_arguments(raw: &str) -> String {
     let raw = raw.trim();
     if raw.is_empty() || serde_json::from_str::<serde_json::Value>(raw).is_ok() {
         return raw.to_string();
     }
     let mut cur = raw.to_string();
-    for _ in 0..8 {
-        let before = cur.clone();
-        // 紧邻 } / ] 前的多余引号对：{"limit":100""} → {"limit":100}
-        cur = cur.replace("\"\"}", "}").replace("\"\"]", "]");
+    for _ in 0..16 {
         if serde_json::from_str::<serde_json::Value>(&cur).is_ok() {
             return cur;
         }
-        if cur == before {
+        let chars: Vec<char> = cur.chars().collect();
+        let mut out = String::with_capacity(cur.len());
+        let mut changed = false;
+        let mut i = 0;
+        while i < chars.len() {
+            if i + 1 < chars.len() && chars[i] == '"' && chars[i + 1] == '"' {
+                let prev = out.chars().rev().find(|c| !c.is_whitespace());
+                match prev {
+                    // 合法空字符串（"key":"" / [""] / ,""）
+                    Some(':') | Some(',') | Some('[') | Some('{') | None => {
+                        out.push('"');
+                        out.push('"');
+                    }
+                    // 完整值后紧跟引号（如 75"" / true"" / }"" ）：两个都丢掉
+                    Some(c) if c.is_ascii_digit() || c == '}' || c == ']'
+                        || c == 'e' || c == 'l' => {}
+                    // 字符串结尾多一个引号：只丢一个
+                    _ => {
+                        out.push('"');
+                    }
+                }
+                changed = true;
+                i += 2;
+                continue;
+            }
+            out.push(chars[i]);
+            i += 1;
+        }
+        if !changed {
             break;
         }
+        cur = out;
     }
-    // 结尾多余一个引号：{...100"} → {...100}
-    if let Some(stripped) = cur.strip_suffix("\"}") {
-        let candidate = format!("{stripped}}}");
-        if serde_json::from_str::<serde_json::Value>(&candidate).is_ok() {
-            return candidate;
-        }
+    if serde_json::from_str::<serde_json::Value>(&cur).is_ok() {
+        cur
+    } else {
+        raw.to_string()
     }
-    // 最后尝试整体去掉一处重复引号
-    let cand = cur.replace("\"\"", "\"");
-    if serde_json::from_str::<serde_json::Value>(&cand).is_ok() {
-        return cand;
-    }
-    raw.to_string()
 }
 
 /// SSE 流式响应（OpenAI chat.completion.chunk 线格式）
@@ -1198,36 +1218,54 @@ async fn healthz() -> Response {
     Json(json!({ "ok": true })).into_response()
 }
 
+
 #[cfg(test)]
 mod tool_args_tests {
     use super::sanitize_tool_arguments;
 
+    fn parse(s: &str) -> serde_json::Value {
+        serde_json::from_str(s).expect("修复后必须合法")
+    }
+
     #[test]
-    fn repairs_duplicated_quotes_before_brace() {
-        // Qoder 实测伪影：{"limit":100""}
-        let raw = "{\"file_path\":\"E:\\\\a.md\",\"limit\":100\"\"}";
-        let fixed = sanitize_tool_arguments(raw);
-        let v: serde_json::Value = serde_json::from_str(&fixed).expect("修复后必须合法");
+    fn repairs_quotes_after_last_number() {
+        // 实测伪影：{"limit":100""}
+        let raw = r#"{"file_path":"E:\\a.md","limit":100""}"#;
+        let v = parse(&sanitize_tool_arguments(raw));
         assert_eq!(v["limit"], 100);
         assert_eq!(v["file_path"], "E:\\a.md");
     }
 
     #[test]
+    fn repairs_quotes_after_middle_number() {
+        // 实测伪影：{"limit":75"","offset":50""}
+        let raw = r#"{"file_path":"E:\\auto_change\\credit-rs\\crates\\credit-gateway\\src\\protocol.rs","limit":75"","offset":50""}"#;
+        let v = parse(&sanitize_tool_arguments(raw));
+        assert_eq!(v["limit"], 75);
+        assert_eq!(v["offset"], 50);
+    }
+
+    #[test]
+    fn repairs_quote_after_string_value() {
+        let raw = r#"{"city":"北京""}"#;
+        let v = parse(&sanitize_tool_arguments(raw));
+        assert_eq!(v["city"], "北京");
+    }
+
+    #[test]
     fn keeps_valid_json_unchanged() {
-        let raw = "{\"city\":\"北京\",\"temp\":18}";
+        let raw = r#"{"city":"北京","temp":18}"#;
         assert_eq!(sanitize_tool_arguments(raw), raw);
     }
 
     #[test]
-    fn repairs_trailing_quote() {
-        let raw = "{\"limit\":100\"}";
-        let fixed = sanitize_tool_arguments(raw);
-        let v: serde_json::Value = serde_json::from_str(&fixed).expect("修复后必须合法");
-        assert_eq!(v["limit"], 100);
+    fn keeps_legit_empty_string() {
+        let raw = r#"{"query":"","limit":10}"#;
+        assert_eq!(sanitize_tool_arguments(raw), raw);
     }
 
     #[test]
-    fn repairs_empty_tool_args() {
+    fn empty_and_object_args() {
         assert_eq!(sanitize_tool_arguments(""), "");
         assert_eq!(sanitize_tool_arguments("{}"), "{}");
     }
