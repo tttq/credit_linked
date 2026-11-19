@@ -15,6 +15,7 @@ async fn main() -> anyhow::Result<()> {
         device_salt: std::sync::Mutex::new(String::new()),
         device_token: std::sync::Mutex::new(None),
         models_cache: std::sync::Mutex::new(None),
+        models_info: std::sync::Mutex::new(std::collections::HashMap::new()),
     });
     let addr: SocketAddr = "127.0.0.1:8756".parse()?;
     println!("gateway demo listening on http://{addr}");

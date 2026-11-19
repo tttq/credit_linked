@@ -9,6 +9,7 @@ use serde_json::Value;
 
 use crate::error::PlatformError;
 
+/// 平台 host 白名单：platform_fetch 只允许访问这些域名（配合 https 强制）。
 pub const HOSTS: [&str; 17] = [
     "zcode.z.ai",
     "bigmodel.cn",
@@ -48,6 +49,8 @@ fn client() -> &'static Client {
     })
 }
 
+/// 平台请求统一入口：校验 https + 白名单 → 发送（禁重定向/15s 超时）→
+/// 401/429/403 映射为对应错误 → 响应强制按 JSON 解析。
 pub async fn platform_fetch(
     url: &str,
     method: Method,

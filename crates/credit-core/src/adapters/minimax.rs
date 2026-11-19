@@ -13,10 +13,15 @@ use crate::error::PlatformError;
 use crate::net::http::platform_fetch;
 use reqwest::Method;
 
+/// OAuth2 Device Authorization 端点（发起设备码登录）
 pub const DEVICE_CODE_URL: &str = "https://account.minimax.cn/oauth2/device/code";
+/// OAuth2 token 端点（设备码轮询与 refresh_token 续期共用）
 pub const TOKEN_URL: &str = "https://account.minimax.cn/oauth2/token";
+/// 业务 API host（签到/额度/profile）
 pub const AGENT_BASE: &str = "https://agent.minimax.cn";
+/// 公共 OAuth client_id（本机 CLI 同款）
 pub const CLIENT_ID: &str = "mcode-public";
+/// 业务请求恒定 query 后缀（时区偏移/桌面端标识）
 pub const SUFFIX: &str = "?timezone_offset=28800&is_desktop=1&client=desktop";
 
 #[allow(dead_code)]
@@ -71,8 +76,10 @@ fn chrono_now_plus(secs: u64) -> String {
     format!("{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
 }
 
+/// 设备码登录起始上下文（device_code + 验证 URI + PKCE verifier）
 pub struct MiniStart { pub device_code: String, pub verification_uri: String, pub interval_secs: u64, pub verifier: String }
 
+/// 发起设备码登录：请求 device_code 与验证 URI（校验 origin 防钓鱼）
 pub async fn start_device_login() -> Result<MiniStart, PlatformError> {
     let mut vb = [0u8; 32];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut vb);
@@ -99,8 +106,10 @@ pub async fn start_device_login() -> Result<MiniStart, PlatformError> {
     })
 }
 
+/// 轮询结果：Pending（含下次轮询间隔）或 Ready（access_token + 完整响应）
 pub enum MiniPoll { Pending { interval_secs: u64 }, Ready(Value, Value) }
 
+/// 轮询 token 端点：authorization_pending/slow_down 视为未完成，继续等
 pub async fn poll_device_login(st: &MiniStart) -> Result<MiniPoll, PlatformError> {
     let v = post_form(TOKEN_URL, None, &[
         ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
@@ -111,12 +120,13 @@ pub async fn poll_device_login(st: &MiniStart) -> Result<MiniPoll, PlatformError
     match v {
         Err(PlatformError::Format(_)) | Err(PlatformError::Business { .. }) => {
             // 400 分支在 post_form 里表现为非 JSON 或业务错误；轮询端点 400 带 error 字段
-            return Ok(MiniPoll::Pending { interval_secs: st.interval_secs });
+            Ok(MiniPoll::Pending { interval_secs: st.interval_secs })
         }
-        Err(e) => return Err(e),
+        Err(e) => Err(e),
         Ok(v) => {
             if let Some(err) = v.get("error").and_then(|e| e.as_str()) {
                 let mut interval = st.interval_secs;
+                // RFC 8628 slow_down：按规范把轮询间隔加大 5s
                 if err == "slow_down" { interval += 5; }
                 return Ok(MiniPoll::Pending { interval_secs: interval });
             }
@@ -127,29 +137,27 @@ pub async fn poll_device_login(st: &MiniStart) -> Result<MiniPoll, PlatformError
 }
 
 async fn api_get(c: &Cred, path: &str) -> Result<Value, PlatformError> {
-    let hs = vec![
-        ("Authorization".to_string(), format!("Bearer {}", c.token)),
-        ("Content-Type".to_string(), "application/json".to_string()),
-    ];
+    let hs = [("Authorization".to_string(), format!("Bearer {}", c.token)),
+        ("Content-Type".to_string(), "application/json".to_string())];
     let hs: Vec<(&str, String)> = hs.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
     platform_fetch(&format!("{AGENT_BASE}{path}"), Method::GET, None, &hs).await
 }
 
 async fn api_post(c: &Cred, path: &str, body: Option<Value>) -> Result<Value, PlatformError> {
-    let hs = vec![
-        ("Authorization".to_string(), format!("Bearer {}", c.token)),
-        ("Content-Type".to_string(), "application/json".to_string()),
-    ];
+    let hs = [("Authorization".to_string(), format!("Bearer {}", c.token)),
+        ("Content-Type".to_string(), "application/json".to_string())];
     let hs: Vec<(&str, String)> = hs.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
     platform_fetch(&format!("{AGENT_BASE}{path}"), Method::POST, body, &hs).await
 }
 
+/// MiniMax Code 适配器（agent.minimax.cn 业务 API）
 pub struct MiniMaxAdapter;
 
 #[async_trait::async_trait]
 impl Adapter for MiniMaxAdapter {
     fn provider(&self) -> &'static str { "minimax" }
 
+    /// 校验 token：GET profile；base_resp.status_code!=0 → 业务错误
     async fn verify(&self, c: &Cred) -> Result<Value, PlatformError> {
         let v = api_get(c, "/matrix/api/v1/user/profile").await?;
         let d = v;
@@ -160,6 +168,7 @@ impl Adapter for MiniMaxAdapter {
         Ok(d.get("data").cloned().unwrap_or(d.clone()))
     }
 
+    /// 查签到状态：取 data.days 中 is_today 那天的记录作为 raw
     async fn state(&self, c: &Cred) -> Result<CheckinState, PlatformError> {
         let v = api_get(c, &format!("/minimax-cloud/api/v1/signin/status{SUFFIX}")).await?;
         let status = v.get("base_resp").and_then(|b| b.get("status_code")).and_then(|s| s.as_i64());
@@ -171,6 +180,7 @@ impl Adapter for MiniMaxAdapter {
         Ok(CheckinState { checked: st == 3, claimable: st == 2, raw: today, ..Default::default() })
     }
 
+    /// 领取签到：claim_result 1=成功 2=今日已领，其余按 pending 处理
     async fn claim(&self, c: &Cred, st: &CheckinState) -> Result<Receipt, PlatformError> {
         if st.checked {
             return Ok(Receipt { status: "already".into(), amount: None, message: Some("今日已领取".into()) });
@@ -189,6 +199,7 @@ impl Adapter for MiniMaxAdapter {
         })
     }
 
+    /// 查会员额度（get_membership_info），剩余积分取 op_credit_summary
     async fn quota(&self, c: &Cred) -> Result<Quota, PlatformError> {
         let v = api_post(c, "/matrix/api/v1/commerce/get_membership_info", Some(json!({}))).await?;
         let status = v.get("base_resp").and_then(|b| b.get("status_code")).and_then(|s| s.as_i64());
@@ -203,6 +214,7 @@ impl Adapter for MiniMaxAdapter {
         Ok(Quota { remaining, parts: Value::Null, sampled_at: now_iso() })
     }
 
+    /// refresh_token 续期；invalid_grant = RT 已轮换作废，需重新登录
     async fn refresh(&self, c: &Cred) -> Result<Cred, PlatformError> {
         let Some(rt) = &c.refresh_token else { return Err(PlatformError::Auth) };
         let v = post_form(TOKEN_URL, None, &[
@@ -231,7 +243,7 @@ impl Adapter for MiniMaxAdapter {
         // refresh_token 轮换：新 RT 必须保存，否则旧 RT 立即作废
         if let Some(r) = v.get("refresh_token").and_then(|t| t.as_str()) { out.refresh_token = Some(r.to_string()); }
         out.expires_at = v.get("expires_in").and_then(|e| e.as_u64())
-            .map(|secs| chrono_now_plus(secs));
+            .map(chrono_now_plus);
         Ok(out)
     }
 }

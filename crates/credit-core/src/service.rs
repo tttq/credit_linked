@@ -9,10 +9,12 @@ use crate::adapters::*;
 use crate::db::Store;
 use crate::error::PlatformError;
 
+/// 桌面服务：持有存储句柄，提供签到/额度/导入/统计等主编排入口。
 pub struct Service {
     pub store: Arc<Store>,
 }
 
+/// 单账号签到结果：provider/uid 标识账号，status/amount/message 与 history 落库字段对齐。
 pub struct CheckinOutcome {
     pub provider: String,
     pub uid: String,
@@ -21,6 +23,7 @@ pub struct CheckinOutcome {
     pub message: Option<String>,
 }
 
+/// 按平台标识构造对应 Adapter；未支持的平台返回 None。
 pub fn adapter_for(provider: &str) -> Option<Box<dyn Adapter>> {
     match provider {
         "trae" => Some(Box::new(super::adapters::trae::TraeAdapter { req_source: 1 })),
@@ -94,7 +97,9 @@ impl Service {
         }
     }
 
-    /// 9074/9095 设备冲突自动恢复：换一个未被其他账号占用的本机设备号后重试一次。
+    /// 9074/9095 设备冲突自动恢复（trae）：按候选顺序换设备号重试 claim，成功即记忆该设备号。
+    /// 候选顺序：本机空闲已注册设备号（最可能被服务端接受）→ 随机生成的新设备号。
+    /// 只有签到成功才把新设备号写入账号凭据（下次直接使用）；失败不落库，避免污染原配置。
     async fn trae_rotate_device_retry(&self, provider: &str, uid: &str, name: &str, cred: &Cred, adapter: &dyn Adapter) -> Option<CheckinOutcome> {
         if provider != "trae" { return None; }
         let cur = cred.meta.get("deviceId").and_then(|d| d.as_str()).unwrap_or("").to_string();
@@ -105,29 +110,34 @@ impl Service {
             .filter(|s| !s.is_empty())
             .collect();
         let local = crate::adapters::trae_local::collect_local_device_ids();
-        let free: Vec<&String> = local.iter().filter(|d| !d.is_empty() && **d != cur && !others.contains(d)).collect();
-        let Some(free) = free.first() else {
-            return Some(CheckinOutcome {
-                provider: provider.into(), uid: uid.into(), status: "needs-action".into(), amount: None,
-                message: Some("设备号冲突：Trae 一个设备号一天只能签一个账号，且须为本机已注册设备。请重新登录该账号，或在账号管理里为各账号分别设置不同设备号".into()),
-            });
-        };
-        let mut nc = cred.clone();
-        nc.meta["deviceId"] = json!(free);
-        if let Ok(auth) = serde_json::to_string(&nc) {
-            let _ = self.store.upsert_account(provider, uid, name, "", &auth);
-        }
-        let receipt = adapter.claim(&nc, &crate::adapters::CheckinState { claimable: true, ..Default::default() }).await;
-        Some(match receipt {
-            Ok(r) => {
+        let mut candidates: Vec<String> = local.iter()
+            .filter(|d| !d.is_empty() && **d != cur && !others.contains(d))
+            .cloned()
+            .collect();
+        // 无空闲已注册号时，随机一个 16 位数字设备号兜底尝试
+        candidates.push(crate::adapters::trae::new_device_identity().device_id);
+        for dev in candidates {
+            let mut nc = cred.clone();
+            nc.meta["deviceId"] = json!(dev);
+            let receipt = adapter.claim(&nc, &crate::adapters::CheckinState { claimable: true, ..Default::default() }).await;
+            if let Ok(r) = receipt {
+                // 签到成功：记住该设备号，下次签到直接使用
+                if let Ok(auth) = serde_json::to_string(&nc) {
+                    let _ = self.store.upsert_account(provider, uid, name, "", &auth);
+                }
                 let _ = self.store.record_history(provider, uid, name, &crate::adapters::day_cn(), &r.status, r.amount, r.message.as_deref(), &crate::adapters::now_iso());
                 let _ = self.store.update_account_status(provider, uid, &r.status, r.message.as_deref());
-                CheckinOutcome { provider: provider.into(), uid: uid.into(), status: r.status.clone(), amount: r.amount, message: r.message.clone() }
+                return Some(CheckinOutcome { provider: provider.into(), uid: uid.into(), status: r.status.clone(), amount: r.amount, message: r.message.clone() });
             }
-            Err(e) => CheckinOutcome { provider: provider.into(), uid: uid.into(), status: "failed".into(), amount: None, message: Some(format!("换设备号重试仍失败: {e}")) },
+        }
+        Some(CheckinOutcome {
+            provider: provider.into(), uid: uid.into(), status: "needs-action".into(), amount: None,
+            message: Some("设备号冲突：已尝试本机空闲设备号与随机设备号均失败。Trae 一个设备号一天只能签一个账号，请重新登录该账号，或在账号管理里为各账号分别设置不同设备号".into()),
         })
     }
 
+    /// 对单账号执行完整签到：当日已签直接幂等返回 → trae 设备号仲裁 → state/claim 链路 →
+    /// 结果与状态落库（平台侧失败也转为 outcome 落库，不向上抛）。
     pub async fn checkin_account(&self, provider: &str, uid: &str) -> Result<CheckinOutcome, PlatformError> {
         let accounts = self.store.list_accounts().map_err(|e| PlatformError::Local(e.to_string()))?;
         let Some((_, _, name, secret_b64, auth)) = accounts.iter().find(|(p, u, _, _, _)| p == provider && u == uid) else {
@@ -140,29 +150,46 @@ impl Service {
         let adapter = adapter_for(provider).ok_or_else(|| PlatformError::Local(format!("no adapter for {provider}")))?;
         let cycle = crate::adapters::day_cn();
 
-        // 当日已成功/已领 → 直接 already（幂等）
+        // 当日已成功/已领 → 直接 already（幂等）；同时纠正状态列可能的残留失败态
         if let Ok(rows) = self.store.history_today(provider, uid, &cycle) {
             if !rows.is_empty() {
+                let _ = self.store.update_account_status(provider, uid, "already", Some("今日已完成"));
                 return Ok(CheckinOutcome { provider: provider.into(), uid: uid.into(), status: "already".into(), amount: None, message: Some("今日已完成".into()) });
             }
         }
 
-        let st = match adapter.state(&cred).await {
+        let outcome = match self.state_and_claim(provider, uid, &mut cred, adapter.as_ref()).await {
+            Ok(o) => o,
+            Err(e) => {
+                // 平台链路失败也落库：Auth 类记 auth-expired（与 UI 徽标对应），其余记 failed
+                let status = if matches!(e, PlatformError::Auth) { "auth-expired" } else { "failed" };
+                CheckinOutcome { provider: provider.into(), uid: uid.into(), status: status.into(), amount: None, message: Some(e.to_string()) }
+            }
+        };
+        let _ = self.store.record_history(provider, uid, name, &cycle, &outcome.status, outcome.amount, outcome.message.as_deref(), &crate::adapters::now_iso());
+        let _ = self.store.update_account_status(provider, uid, &outcome.status, outcome.message.as_deref());
+        Ok(outcome)
+    }
+
+    /// 签到公共链路：state →（Auth 时走刷新链恢复）→ claim →（设备冲突时换号重试）。
+    /// 只有"账号不存在/凭据损坏"等本地错误向上抛；平台侧失败统一转成 outcome 由调用方落库。
+    async fn state_and_claim(&self, provider: &str, uid: &str, cred: &mut Cred, adapter: &dyn Adapter) -> Result<CheckinOutcome, PlatformError> {
+        let st = match adapter.state(cred).await {
             Ok(s) => s,
             Err(PlatformError::Auth) if cred.refresh_token.is_some() => {
-                cred = self.refreshed_cred(provider, uid, &cred).await?;
-                adapter.state(&cred).await?
+                *cred = self.refreshed_cred(provider, uid, cred).await?;
+                adapter.state(cred).await?
             }
             Err(e) => return Err(e),
         };
-        let receipt = adapter.claim(&cred, &st).await;
-        // trae 设备冲突（9074/9095）自动换号重试一次；成功后回写新设备号
-        let outcome = match receipt {
+        let receipt = adapter.claim(cred, &st).await;
+        // trae 设备冲突（9074/9095）自动换号重试；成功后记忆新设备号
+        Ok(match receipt {
             Ok(r) => CheckinOutcome { provider: provider.into(), uid: uid.into(), status: r.status.clone(), amount: r.amount, message: r.message.clone() },
             Err(e) => {
                 let msg = e.to_string();
                 if msg.contains("9074") || msg.contains("9095") {
-                    if let Some(o) = self.trae_rotate_device_retry(provider, uid, name, &cred, adapter.as_ref()).await {
+                    if let Some(o) = self.trae_rotate_device_retry(provider, uid, &cred.name, cred, adapter).await {
                         o
                     } else {
                         CheckinOutcome { provider: provider.into(), uid: uid.into(), status: "failed".into(), amount: None, message: Some(msg) }
@@ -171,12 +198,10 @@ impl Service {
                     CheckinOutcome { provider: provider.into(), uid: uid.into(), status: "failed".into(), amount: None, message: Some(msg) }
                 }
             }
-        };
-        let _ = self.store.record_history(provider, uid, name, &cycle, &outcome.status, outcome.amount, outcome.message.as_deref(), &crate::adapters::now_iso());
-        let _ = self.store.update_account_status(provider, uid, &outcome.status, outcome.message.as_deref());
-        Ok(outcome)
+        })
     }
 
+    /// 查询单账号额度：Auth 失效且有 refresh_token 时先恢复凭据再重试；结果持久化供启动展示。
     pub async fn quota_account(&self, provider: &str, uid: &str) -> Result<Quota, PlatformError> {
         let accounts = self.store.list_accounts().map_err(|e| PlatformError::Local(e.to_string()))?;
         let Some((_, _, _, _, auth)) = accounts.iter().find(|(p, u, _, _, _)| p == provider && u == uid) else {
@@ -199,6 +224,7 @@ impl Service {
         Ok(q)
     }
 
+    /// 账号概要 JSON（provider/uid/name 列表）。
     pub fn state_summary(&self) -> Value {
         let accounts = self.store.list_accounts().unwrap_or_default();
         json!({
@@ -206,8 +232,24 @@ impl Service {
         })
     }
 
+    /// 状态对账：以当日 history（success/already）为准纠正状态列残留。
+    /// 兜底场景：此前设备冲突失败/历史版本未回写，导致"已签"账号仍显示签到失败。
+    pub fn reconcile_statuses(&self) {
+        let cycle = crate::adapters::day_cn();
+        let Ok(accounts) = self.store.list_accounts_full() else { return };
+        for a in accounts {
+            if matches!(a.status.as_str(), "success" | "already") { continue; }
+            if let Ok(rows) = self.store.history_today(&a.provider, &a.uid, &cycle) {
+                if !rows.is_empty() {
+                    let _ = self.store.update_account_status(&a.provider, &a.uid, "already", Some("今日已完成"));
+                }
+            }
+        }
+    }
+
     /// UI 快照：账号全行 + 最近历史。
     pub fn ui_snapshot(&self) -> Value {
+        self.reconcile_statuses();
         let accounts = self.store.list_accounts_full().unwrap_or_default();
         let history = self.store.list_history(50).unwrap_or_default();
         json!({
@@ -470,6 +512,7 @@ fn shift_day(day: &str, delta: i64) -> String {
 }
 }
 
+/// 从 Trae JWT payload 取 /data/id 作为 uid（解析失败返回空串）。
 fn jwt_uid_of(token: &str) -> String {
     use base64::Engine;
     let parts: Vec<&str> = token.split('.').collect();

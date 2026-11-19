@@ -24,14 +24,22 @@ pub const WB_CHAT_UA: &str = "WorkBuddy/5.11.3 WorkBuddy/5.11.3 CLI/2.63.2";
 /// WorkBuddy 产品配置通道 UA（/v3/config 逐字对齐官方客户端）
 pub const WB_PRODUCT_UA: &str = "WorkBuddy/5.8.3 WorkBuddy/5.8.3 CLI/2.161.0";
 
+/// WorkBuddy 国内 chat 网关
 pub const WB_CN_CHAT_BASE: &str = "https://copilot.tencent.com";
+/// WorkBuddy 国际 chat 网关
 pub const WB_GLOBAL_BASE: &str = "https://www.workbuddy.ai";
+/// WorkBuddy 国际备用域（*.codebuddy.ai 域名走此站）
 pub const WB_CODEBUDDY_AI_BASE: &str = "https://www.codebuddy.ai";
 
+/// Trae 国内 SOLO chat 网关
 pub const TRAE_CN_CHAT_BASE: &str = "https://trae-api-cn.mchost.guru";
+/// Trae 企业租户 chat 网关（路由必须带 session_id）
 pub const TRAE_ENTERPRISE_HOST: &str = "https://console.enterprise.trae.cn";
+/// Trae 国际（新加坡）chat 网关
 pub const TRAE_AI_CHAT_BASE: &str = "https://coresg-normal.trae.ai";
+/// Trae 国内模型目录（remote web 通道）
 pub const TRAE_CN_REMOTE_BASE: &str = "https://solo.trae.cn/api/remote/v1";
+/// Trae 国际模型目录（remote web 通道）
 pub const TRAE_AI_REMOTE_BASE: &str = "https://coresg-normal.trae.ai/api/remote/v1";
 
 /// Trae 固定 x-app-id（两个网关同值，实测验证）
@@ -45,6 +53,7 @@ pub const TRAE_DIRECTORY_FUNCTIONS_CN: [&str; 12] = [
     "chat_v3", "solo_coder", "builder_v3", "chat", "inline_chat",
     "solo_agent_lite", "solo_design_lite", "solo_design_remote",
 ];
+/// 远程模型目录 functions（AI/国际桶；与 CN 桶当前同集）
 pub const TRAE_DIRECTORY_FUNCTIONS_AI: [&str; 12] = [
     "solo_agent", "solo_agent_remote", "solo_work_remote", "solo_work_lite",
     "chat_v3", "solo_coder", "builder_v3", "chat", "inline_chat",
@@ -66,6 +75,7 @@ pub enum Platform {
 }
 
 impl Platform {
+    /// 平台字符串 → Platform（账号路由与请求 "平台/模型" 前缀解析用）
     pub fn parse(s: &str) -> Option<Platform> {
         match s {
             "workbuddy" => Some(Platform::WorkBuddy),
@@ -81,6 +91,7 @@ impl Platform {
         }
     }
 
+    /// Platform → 规范字符串（settings 存储与 API 展示用）
     pub fn as_str(&self) -> &'static str {
         match self {
             Platform::WorkBuddy => "workbuddy",
@@ -95,11 +106,13 @@ impl Platform {
         }
     }
 
+    /// 全部平台（管理面清单顺序）
     pub fn all() -> [Platform; 9] {
         [Platform::WorkBuddy, Platform::WorkBuddyIntl, Platform::Trae, Platform::TraeEnterprise, Platform::TraeIntl,
          Platform::Zcode, Platform::Minimax, Platform::Qoder, Platform::CodeArts]
     }
 
+    /// 中文显示名（UI 用）
     pub fn display(&self) -> &'static str {
         match self {
             Platform::WorkBuddy => "WorkBuddy 国内版",

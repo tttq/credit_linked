@@ -10,6 +10,7 @@ use sha2::{Digest, Sha256};
 
 use crate::crypto::aes_gcm::gcm_decrypt;
 
+/// 会话目录：各平台 CodeBuddyExtension/Data/Public/auth
 pub fn auth_dir() -> std::path::PathBuf {
     // Windows: %LOCALAPPDATA%/CodeBuddyExtension/Data/Public/auth
     // macOS:   ~/Library/Application Support/CodeBuddyExtension/Data/Public/auth
@@ -18,6 +19,7 @@ pub fn auth_dir() -> std::path::PathBuf {
     base.join("CodeBuddyExtension").join("Data").join("Public").join("auth")
 }
 
+/// 会话文件路径（intl 版后缀 -ai）
 pub fn session_file(intl: bool) -> std::path::PathBuf {
     auth_dir().join(if intl { "workbuddy-desktop-ai.info" } else { "workbuddy-desktop.info" })
 }
@@ -72,7 +74,7 @@ fn open_envelope(enc_obj: &Value, key: &[u8]) -> Option<Value> {
 /// client_exe 定位交给上层；这里只负责 spawn+哈希（跨平台 ELECTRON_RUN_AS_NODE）。
 pub fn master_key_from_client(client_exe: &std::path::Path) -> anyhow::Result<[u8; 32]> {
     const SCRIPT: &str = "const b=process._linkedBinding('electron_browser_workbuddy_storage');const p=JSON.parse(b.loggerGet());process.stdout.write(p.atRestSecretKey)";
-    let out = std::process::Command::new(client_exe)
+    let out = crate::proc_util::hide_console(std::process::Command::new(client_exe))
         .env("ELECTRON_RUN_AS_NODE", "1")
         .arg("-e")
         .arg(SCRIPT)
@@ -118,8 +120,46 @@ pub fn client_exe_candidates() -> Vec<std::path::PathBuf> {
     ].into_iter().map(std::path::PathBuf::from).collect()
 }
 
+/// 找本机 WorkBuddy/CodeBuddy 客户端 exe（已安装才返回）
 pub fn find_client_exe() -> Option<std::path::PathBuf> {
     client_exe_candidates().into_iter().find(|p| p.exists())
+}
+
+/// 会话文件原始字节指纹（客户端刷新 token 会重写文件；不解密，轮询零开销）
+pub fn session_fingerprint(intl: bool) -> Option<String> {
+    let bytes = std::fs::read(session_file(intl)).ok()?;
+    Some(Sha256::digest(&bytes).iter().map(|b| format!("{b:02x}")).collect::<String>()[..16].to_string())
+}
+
+/// 启动本机 WorkBuddy 客户端（已运行则单实例应用聚焦现有窗口）。
+/// 返回 Some(路径) = 已尝试拉起；None = 未安装。
+pub fn launch_client() -> Option<std::path::PathBuf> {
+    let exe = find_client_exe()?;
+    // GUI 应用：完全分离 stdio（否则子进程继承父进程管道句柄会导致父端读取挂起）
+    let _ = std::process::Command::new(&exe)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    Some(exe)
+}
+
+/// 等待客户端刷新会话（文件指纹变化），最多 timeout。返回 Some = 已刷新。
+pub fn wait_for_session_change(intl: bool, old_fp: Option<&str>, timeout: std::time::Duration) -> Option<Value> {
+    let start = std::time::Instant::now();
+    loop {
+        let cur_fp = session_fingerprint(intl);
+        let changed = match (old_fp, cur_fp.as_deref()) {
+            (Some(old), Some(cur)) => cur != old,
+            (None, Some(_)) => true,
+            _ => false,
+        };
+        if changed {
+            return read_session_full(intl).ok().flatten();
+        }
+        if start.elapsed() >= timeout { return None; }
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+    }
 }
 
 fn value_has_envelope(v: &Value) -> bool {

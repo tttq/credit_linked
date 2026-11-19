@@ -11,6 +11,7 @@ use crate::error::PlatformError;
 use crate::net::http::{business, platform_fetch};
 use reqwest::Method;
 
+/// WorkBuddy/CodeBuddy 适配器；intl=true 走国际版域名（workbuddy.ai）与 provider 名
 pub struct WorkBuddyAdapter {
     pub intl: bool,
 }
@@ -71,11 +72,13 @@ async fn verify(c: &Cred) -> Result<(), PlatformError> {
 impl Adapter for WorkBuddyAdapter {
     fn provider(&self) -> &'static str { if self.intl { "workbuddy-intl" } else { "workbuddy" } }
 
+    /// 校验：先过 /v2/plugin/account 强校验（12153→Auth、uid 不一致→Identity）
     async fn verify(&self, c: &Cred) -> Result<Value, PlatformError> {
         verify(c).await?;
         Ok(json!({ "uid": c.uid }))
     }
 
+    /// 查签到活动状态；intl 字段与国内不同（task_completed/eligible 另算 requires_manual）
     async fn state(&self, c: &Cred) -> Result<CheckinState, PlatformError> {
         let path = if self.intl { "/billing/meter/checkin-activity-status" } else { "/v2/billing/meter/checkin-activity-status" };
         let d = business(request(c, path, Some(json!({}))).await?)?;
@@ -103,6 +106,7 @@ impl Adapter for WorkBuddyAdapter {
         Ok(CheckinState { checked, claimable: !checked && active, raw: d, ..Default::default() })
     }
 
+    /// 领取每日签到；业务码 40901 → Conditions（活动条件未满足）
     async fn claim(&self, c: &Cred, st: &CheckinState) -> Result<Receipt, PlatformError> {
         verify(c).await?;
         if st.checked {
@@ -111,7 +115,7 @@ impl Adapter for WorkBuddyAdapter {
         if !st.claimable {
             return Ok(Receipt { status: if st.requires_manual == Some(true) { "needs-action".into() } else { "no-activity".into() }, amount: None, message: None });
         }
-        let path = if self.intl { "/v2/billing/meter/daily-checkin" } else { "/v2/billing/meter/daily-checkin" };
+        let path = "/v2/billing/meter/daily-checkin";
         let d = business(request(c, path, Some(json!({}))).await?).map_err(|e| match &e {
             PlatformError::Business { code, .. } if code.as_i64() == Some(40901) => PlatformError::Conditions,
             _ => e,
@@ -122,8 +126,9 @@ impl Adapter for WorkBuddyAdapter {
         Ok(Receipt { status: "success".into(), amount, message: None })
     }
 
+    /// 查资源包：Response.Data.Accounts 逐项拆 parts（周期套餐取 CycleCapacity 前缀字段）
     async fn quota(&self, c: &Cred) -> Result<Quota, PlatformError> {
-        let path = if self.intl { "/v2/billing/meter/get-user-resource" } else { "/v2/billing/meter/get-user-resource" };
+        let path = "/v2/billing/meter/get-user-resource";
         let d = business(request(c, path, Some(json!({}))).await?)?;
         let accounts = d.get("Response").and_then(|r| r.get("Data")).and_then(|x| x.get("Accounts")).and_then(|a| a.as_array())
             .ok_or_else(|| PlatformError::Format("cannot parse workbuddy quota".into()))?;
@@ -131,9 +136,10 @@ impl Adapter for WorkBuddyAdapter {
         for p in accounts {
             let end = p.get("CycleEndTime").and_then(|v| v.as_str());
             let deduct = p.get("DeductionEndTime").and_then(|v| v.as_str());
+            // DeductionEndTime 比 CycleEndTime 晚超 2 天 → 视为周期性套餐（下面按 CycleCapacity 取数）
             let recurring = match (end, deduct) {
-                (Some(e), Some(dd)) => match (chrono_like_ms(e), chrono_like_ms(dd)) {
-                    (Ok(ed), Ok(ddm)) => ddm - ed > 2 * 86400 * 1000,
+                (Some(e), Some(dd)) => match (chrono_like_secs(e), chrono_like_secs(dd)) {
+                    (Ok(ed), Ok(ddm)) => ddm - ed > 2 * 86400,
                     _ => false,
                 },
                 _ => false,
@@ -154,6 +160,7 @@ impl Adapter for WorkBuddyAdapter {
         Ok(Quota { remaining: if parts.is_empty() { None } else { Some(sum) }, parts: Value::Array(parts), sampled_at: now_iso() })
     }
 
+    /// 用 refresh_token 到 copilot.tencent.com 刷新端点换新 access/refresh token
     async fn refresh(&self, c: &Cred) -> Result<Cred, PlatformError> {
         let Some(rt) = &c.refresh_token else { return Err(PlatformError::Auth) };
         let url = "https://copilot.tencent.com/v2/plugin/auth/token/refresh";
@@ -174,7 +181,8 @@ impl Adapter for WorkBuddyAdapter {
     }
 }
 
-fn chrono_like_ms(s: &str) -> Result<i64, ()> {
+/// 极简 ISO8601 解析（返回 epoch 秒；仅支持 Z/无 Z 两种格式，供套餐周期判断）
+fn chrono_like_secs(s: &str) -> Result<i64, ()> {
     // 简化 ISO 解析：仅支持 "YYYY-MM-DDTHH:MM:SS(.fff)?Z" 与无 Z
     let (date, time) = s.split_once('T').ok_or(())?;
     let dp: Vec<&str> = date.split('-').collect();

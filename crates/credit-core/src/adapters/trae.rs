@@ -16,13 +16,20 @@ use crate::error::PlatformError;
 use crate::net::http::{business, platform_fetch};
 use reqwest::Method;
 
+/// 登录/换码共用的官方 OAuth client_id（CN 区桌面客户端固定值）
 pub const CLIENT_ID_CN: &str = "ono9krqynydwx5";
+/// 控制台站点域名（登录/授权页所在）
 pub const CONSOLE_BASE_CN: &str = "https://www.trae.cn";
+/// 登录参数上报的桌面客户端版本号
 pub const APP_VERSION: &str = "3.4.9";
+/// 登录参数上报的 IDE 插件版本号
 pub const PLUGIN_VERSION: &str = "2.3.97430";
+/// 授权页 auth_from 渠道标识
 pub const AUTH_FROM: &str = "trae";
+/// 授权页 x_app_type（发行通道）
 pub const APP_TYPE: &str = "stable";
 
+/// Trae 签到/额度适配器；req_source 区分桌面客户端(1)与 SOLO(2)，签到 body 需注入
 pub struct TraeAdapter {
     pub req_source: i64,
 }
@@ -68,11 +75,13 @@ async fn request(c: &Cred, path: &str, method: Method, body: Option<Value>) -> R
 impl Adapter for TraeAdapter {
     fn provider(&self) -> &'static str { "trae" }
 
+    /// 校验凭据：GET /user/info（business 错误透传给上层）
     async fn verify(&self, c: &Cred) -> Result<Value, PlatformError> {
         let d = business(request(c, "/trae/api/v2/ug/user/info", Method::GET, None).await?)?;
         Ok(d)
     }
 
+    /// 查签到状态：checked_in 字段可能是 bool 或数字（0/非 0）
     async fn state(&self, c: &Cred) -> Result<CheckinState, PlatformError> {
         let d = business(request(c, "/trae/api/v2/ug/checkin_credits/status", Method::POST, Some(json!({ "req_source": self.req_source }))).await?)?;
         let flag = d.get("checked_in").or_else(|| d.get("today_checked_in"));
@@ -90,6 +99,7 @@ impl Adapter for TraeAdapter {
         })
     }
 
+    /// 领取签到积分；业务码 9074=设备受限(Restricted)、9095=设备今日已签
     async fn claim(&self, c: &Cred, st: &CheckinState) -> Result<Receipt, PlatformError> {
         if st.checked {
             return Ok(Receipt { status: "already".into(), amount: None, message: Some("本周期此前已领取".into()) });
@@ -115,6 +125,7 @@ impl Adapter for TraeAdapter {
         })
     }
 
+    /// 查积分包：逐 entitlement pack 拆 parts，usage_summary 兜底整体 remaining
     async fn quota(&self, c: &Cred) -> Result<Quota, PlatformError> {
         let d = business(request(c, "/trae/api/v2/pay/ide_user_ent_usage", Method::POST, Some(json!({ "require_usage": true, "req_source": 2 }))).await?)?;
         let mut parts: Vec<Value> = Vec::new();
@@ -146,6 +157,7 @@ impl Adapter for TraeAdapter {
                 }
             }
         }
+        // 剔除 expiresAt 为空字符串的包（无到期信息）
         parts.retain(|p| !p["expiresAt"].is_string() || p["expiresAt"].as_str().map(|s| !s.is_empty()).unwrap_or(true));
         let sum: f64 = parts.iter().filter_map(|p| p["remaining"].as_f64()).sum();
         Ok(Quota {
@@ -155,6 +167,7 @@ impl Adapter for TraeAdapter {
         })
     }
 
+    /// 续期：有设备私钥走 v3 DeviceProof 签名端点，否则回退旧契约端点
     async fn refresh(&self, c: &Cred) -> Result<Cred, PlatformError> {
         // Trae 官方续期（对齐 dsh-connect-trae refresh.ts）：
         //   POST {host}/trae/api/v3/oauth/ExchangeToken
@@ -241,6 +254,7 @@ impl Adapter for TraeAdapter {
 // ===== 登录流程（对齐 vendor/traeAuth.mjs） =====
 
 #[derive(Clone)]
+/// 登录期新生成的设备身份：设备号 + machineId + EC P-256 密钥对（ExchangeToken 注册用）
 pub struct TraeIdentity {
     pub device_id: String,
     pub machine_id: String,
@@ -278,6 +292,7 @@ pub fn new_device_identity() -> TraeIdentity {
 }
 
 #[derive(Clone)]
+/// 一次登录会话：PKCE verifier + 回调端口 + 授权 URL
 pub struct TraeLogin {
     pub trace_id: String,
     pub verifier: String,
@@ -286,6 +301,7 @@ pub struct TraeLogin {
     pub url: String,
 }
 
+/// 发起登录：优先复用本机已注册设备号，生成 PKCE 并拼出 console 登录页 URL
 pub fn start_login() -> TraeLogin {
     // 每次登录生成全新独立设备身份：多账号场景下各账号得到各自的 device_id，
     // ExchangeToken 时注册到服务端，后续签到按账号各自的设备号执行（规避
@@ -336,7 +352,7 @@ pub fn rebuild_login_url(l: &TraeLogin) -> String {
 /// 回调查询解析：剥 ? 后按 & 切 → 整体反复解码（≤3 次）→ 第一个 = 切键值
 pub fn parse_callback_query(raw: &str) -> std::collections::HashMap<String, String> {
     let mut out = std::collections::HashMap::new();
-    let qs = raw.split('?').last().unwrap_or(raw);
+    let qs = raw.split('?').next_back().unwrap_or(raw);
     for pair in qs.split('&') {
         if pair.is_empty() { continue; }
         let mut decoded = pair.to_string();
@@ -352,8 +368,10 @@ pub fn parse_callback_query(raw: &str) -> std::collections::HashMap<String, Stri
     out
 }
 
+/// 允许换码的主机白名单（回调查询里的 host 必须命中其一）
 pub const EXCHANGE_HOSTS: [&str; 4] = ["api.trae.cn", "api.trae.com.cn", "api.marscode.cn", "www.trae.cn"];
 
+/// 归一化回调 host 并匹配白名单；未命中返回 None
 pub fn resolve_exchange_host(host: &str) -> Option<&'static str> {
     let h = host.trim_start_matches("https://").trim_start_matches("http://");
     let h = h.split('/').next().unwrap_or(h).split(':').next().unwrap_or(h);
@@ -430,6 +448,7 @@ fn jwt_uid(token: &str) -> String {
     v.get("data").and_then(|d| d.get("id")).and_then(|i| i.as_str()).unwrap_or("").to_string()
 }
 
+/// 轻量 percent-encoding（仅字母数字与 -_.~ 不转义），避免引 URL 库依赖
 pub fn urlencoding_lite(s: &str) -> String {
     let mut out = String::with_capacity(s.len() * 2);
     for b in s.bytes() {
@@ -461,14 +480,17 @@ fn decode_percent(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// 设备品牌（登录 URL 的 x_device_brand；取 COMPUTERNAME）
 pub fn device_model() -> String {
     std::env::var("COMPUTERNAME").unwrap_or_else(|_| "PC".into())
 }
 
+/// 系统版本（x_os_version；取 OS 环境变量）
 pub fn os_version() -> String {
     std::env::var("OS").unwrap_or_else(|_| "Windows".into())
 }
 
+/// 用户名（DeviceInfo.DeviceName；取 USERNAME）
 pub fn username() -> String {
     std::env::var("USERNAME").unwrap_or_else(|_| "user".into())
 }

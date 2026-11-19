@@ -9,8 +9,10 @@ use crate::error::PlatformError;
 use crate::net::http::{business, platform_fetch};
 use reqwest::Method;
 
+/// 业务 API host（zcode.z.ai）
 pub const BASE: &str = "https://zcode.z.ai";
 
+/// ZCode（智谱）适配器；billing 类端点专用 zcodejwttoken（见 request/billing_request）
 pub struct ZcodeAdapter;
 
 /// 业务请求：plan/billing 类端点只认 zcodejwttoken（OAuth access_token 会 401），
@@ -48,11 +50,13 @@ async fn request_with(c: &Cred, path: &str, method: Method, body: Option<Value>,
 impl Adapter for ZcodeAdapter {
     fn provider(&self) -> &'static str { "zcode" }
 
+    /// 校验 token：GET /client/configs（走 OAuth access_token）
     async fn verify(&self, c: &Cred) -> Result<Value, PlatformError> {
         let d = business(request(c, "/api/v1/client/configs", Method::GET, None).await?)?;
         Ok(d)
     }
 
+    /// 查活动：/billing/preview 的 plans + captcha 门（命中则 requires_manual）
     async fn state(&self, c: &Cred) -> Result<CheckinState, PlatformError> {
         // 活动来源（逆向确认）：GET /billing/preview?app_version=…&platform=… 的 data.plans[]
         // （configs.startPlanPreview 只是免费套餐展示配置，可领性以 preview 为准）
@@ -62,7 +66,7 @@ impl Adapter for ZcodeAdapter {
         // captcha 门（仅提示用）：enabled 且 skip_model_request!==true 时 claim 需要验证码
         let cfg = business(request(c, "/api/v1/client/configs?app_version=3.18.2&platform=win32-x64", Method::GET, None).await?).unwrap_or(Value::Null);
         let captcha_block = cfg.pointer("/configs/captcha/enabled").and_then(|b| b.as_bool()).unwrap_or(false)
-            && cfg.pointer("/configs/captcha/skip_model_request").and_then(|b| b.as_bool()).unwrap_or(false) == false;
+            && !cfg.pointer("/configs/captcha/skip_model_request").and_then(|b| b.as_bool()).unwrap_or(false);
         Ok(CheckinState {
             checked: false,
             claimable: !plans.is_empty() && !captcha_block,
@@ -72,6 +76,7 @@ impl Adapter for ZcodeAdapter {
         })
     }
 
+    /// 逐 plan 领取：code==0 且 data.plan 非空为成功，失败回 already（附下次可领时间）
     async fn claim(&self, c: &Cred, st: &CheckinState) -> Result<Receipt, PlatformError> {
         let plans = st.raw.get("plans").and_then(|p| p.as_array()).cloned().unwrap_or_default();
         if plans.is_empty() {
@@ -118,6 +123,7 @@ impl Adapter for ZcodeAdapter {
         Err(last_err.unwrap_or(PlatformError::Format("no claimable plan".into())))
     }
 
+    /// 查余额：remaining = Σ balances[].remaining_units，逐项拆 parts
     async fn quota(&self, c: &Cred) -> Result<Quota, PlatformError> {
         let d = balance(c).await?;
         // 客户端公式：remaining = Σ balances[].remaining_units；total = Σ total_units
@@ -138,11 +144,13 @@ impl Adapter for ZcodeAdapter {
         Ok(Quota { remaining: Some(remaining.max(0.0)), parts, sampled_at: now_iso() })
     }
 
+    /// 不支持续期：token 过期只能重新 OAuth 授权
     async fn refresh(&self, _c: &Cred) -> Result<Cred, PlatformError> {
         Err(PlatformError::Auth)
     }
 }
 
+/// 余额查询（/billing/balance，只认 zcodejwttoken）
 pub async fn balance(c: &Cred) -> Result<Value, PlatformError> {
     // 真实端点（逆向）：/billing/balance?app_version=…，响应 { plans, balances }，只认 zcodejwttoken
     let v = billing_request(c, "/api/v1/zcode-plan/billing/balance?app_version=3.18.2", Method::GET, None).await?;

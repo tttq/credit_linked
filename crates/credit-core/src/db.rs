@@ -4,11 +4,16 @@ use rusqlite::Connection;
 use std::path::Path;
 use std::sync::Mutex;
 
+/// SQLite 存储句柄：内部连接由互斥锁保护，公开方法均为短事务/单语句。
 pub struct Store {
     conn: Mutex<Connection>,
 }
 
+/// 账号原始行：(provider, uid, name, secret, auth)
+pub type RawAccountRow = (String, String, String, String, String);
+
 impl Store {
+    /// 打开（必要时创建）数据库：启用 WAL/外键/3s busy 超时，并按序执行 v1→v3 迁移。
     pub fn open(path: &Path) -> anyhow::Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -23,6 +28,7 @@ impl Store {
         Ok(Self { conn: Mutex::new(conn) })
     }
 
+    /// 用默认目录（%APPDATA%/credit-rs/credit.sqlite）打开；独立于原版 Electron 应用目录。
     pub fn open_default() -> anyhow::Result<Self> {
         // 独立目录，绝不与原版 Electron 应用（%APPDATA%/credit-tauri(旧版)）共享
         let dir = dirs::data_dir()
@@ -109,6 +115,7 @@ impl Store {
         Ok(())
     }
 
+    /// 新增或更新账号凭据：auth 为序列化 Cred JSON，同 (provider, uid) 覆盖 name/secret/auth。
     pub fn upsert_account(&self, provider: &str, uid: &str, name: &str, secret: &str, meta: &str) -> anyhow::Result<()> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -121,7 +128,8 @@ impl Store {
         Ok(())
     }
 
-    pub fn list_accounts(&self) -> anyhow::Result<Vec<(String, String, String, String, String)>> {
+    /// 全部账号的原始五元组（内部链路用；UI 展示用 list_accounts_full）。
+    pub fn list_accounts(&self) -> anyhow::Result<Vec<RawAccountRow>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare("SELECT provider, uid, name, secret, auth FROM accounts")?;
         let rows = stmt.query_map([], |r| {
@@ -130,6 +138,9 @@ impl Store {
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
+    /// 记录一条签到历史（account_id = provider:uid）。
+    // 列数与 history 表字段一一对应，不拆结构体
+    #[allow(clippy::too_many_arguments)]
     pub fn record_history(&self, provider: &str, uid: &str, name: &str, cycle: &str, status: &str, amount: Option<f64>, message: Option<&str>, at: &str) -> anyhow::Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
@@ -139,6 +150,7 @@ impl Store {
         Ok(())
     }
 
+    /// 查询账号当日（cycle）已成功/已领过的历史，供签到幂等判重。
     pub fn history_today(&self, provider: &str, uid: &str, cycle: &str) -> anyhow::Result<Vec<(String, Option<f64>)>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare("SELECT status, amount FROM history WHERE account_id=?1 AND cycle=?2 AND status IN ('success','already')")?;
@@ -148,18 +160,21 @@ impl Store {
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
+    /// 读 KV 设置；无值返回 default。
     pub fn get_setting(&self, key: &str, default: &str) -> anyhow::Result<String> {
         let conn = self.conn.lock().unwrap();
         let v: Option<String> = conn.query_row("SELECT value FROM settings WHERE key=?1", [key], |r| r.get(0)).ok();
         Ok(v.unwrap_or_else(|| default.to_string()))
     }
 
+    /// 写 KV 设置（upsert）。
     pub fn set_setting(&self, key: &str, value: &str) -> anyhow::Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute("INSERT INTO settings (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value=?2", [key, value])?;
         Ok(())
     }
 
+    /// 更新账号状态列与提示消息（idle/success/already/failed/auth-expired 等，UI 徽标用）。
     pub fn update_account_status(&self, provider: &str, uid: &str, status: &str, message: Option<&str>) -> anyhow::Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
@@ -176,8 +191,7 @@ pub fn delete_account(&self, provider: &str, uid: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// 开关自动签到。
-/// 持久化最近一次额度查询结果（JSON 字符串）。
+/// 持久化最近一次额度查询结果（JSON 字符串），启动后直接展示无需重拉。
 pub fn update_account_quota(&self, provider: &str, uid: &str, quota_json: &str) -> anyhow::Result<()> {
     let conn = self.conn.lock().unwrap();
     conn.execute(
@@ -187,6 +201,7 @@ pub fn update_account_quota(&self, provider: &str, uid: &str, quota_json: &str) 
     Ok(())
 }
 
+/// 开关自动签到（auto 列）。
 pub fn set_account_auto(&self, provider: &str, uid: &str, auto: bool) -> anyhow::Result<()> {
     let conn = self.conn.lock().unwrap();
     conn.execute("UPDATE accounts SET auto=?3 WHERE provider=?1 AND uid=?2", rusqlite::params![provider, uid, auto as i64])?;
@@ -338,6 +353,7 @@ pub fn list_history(&self, limit: i64) -> anyhow::Result<Vec<HistoryRow>> {
     }
 }
 
+/// 网关请求日志行（UI 展示用）。
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct GatewayLogRow {
     pub id: i64,
@@ -353,6 +369,7 @@ pub struct GatewayLogRow {
     pub duration_ms: Option<i64>,
 }
 
+/// 账号全行（UI 展示用：状态/消息/到期/自动开关/额度快照）。
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct AccountRow {
     pub provider: String,
@@ -366,6 +383,7 @@ pub struct AccountRow {
     pub quota: Option<String>,
 }
 
+/// 签到历史行（UI 展示用）。
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct HistoryRow {
     pub provider: String,

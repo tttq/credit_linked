@@ -85,6 +85,7 @@ pub struct CodeArtsLive {
     pub session: Value,
 }
 
+/// 读指定版本（desktop/agent）的本机码道会话
 pub fn read_live_session(desktop: bool) -> Option<CodeArtsLive> {
     for dir in candidate_dirs() {
         let name = dir.file_name().and_then(|n| n.to_str()).unwrap_or("").to_lowercase();

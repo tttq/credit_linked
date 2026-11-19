@@ -9,6 +9,7 @@ use crate::error::PlatformError;
 use crate::net::http::{business, platform_fetch};
 use reqwest::Method;
 
+/// Qoder 适配器；intl=true 走 openapi.qoder.sh（国际），否则 .com.cn（国内）
 pub struct QoderAdapter { pub intl: bool }
 
 fn host(intl: bool) -> &'static str { if intl { "https://openapi.qoder.sh" } else { "https://openapi.qoder.com.cn" } }
@@ -45,6 +46,7 @@ async fn request(c: &Cred, path: &str, method: Method, body: Option<Value>) -> R
 impl Adapter for QoderAdapter {
     fn provider(&self) -> &'static str { if self.intl { "qoder-intl" } else { "qoder" } }
 
+    /// 校验 token：GET /api/v1/userinfo；uid 与凭据不一致 → Identity
     async fn verify(&self, c: &Cred) -> Result<Value, PlatformError> {
         let d = business(request(c, "/api/v1/userinfo", Method::GET, None).await?)?;
         let uid = d.get("id").or_else(|| d.get("userId")).or_else(|| d.get("user_id")).and_then(|u| u.to_string().trim_matches('"').to_string().into());
@@ -56,6 +58,7 @@ impl Adapter for QoderAdapter {
         Ok(d)
     }
 
+    /// 查活动：campaigns 按时间窗过滤；可领 = CLAIM_BENEFIT+CLAIMABLE，全部 CLAIMED 即已签
     async fn state(&self, c: &Cred) -> Result<CheckinState, PlatformError> {
         let d = business(request(c, "/sash/api/v1/me/campaigns?clientType=10&forceRefresh=true", Method::GET, None).await?)?;
         let campaigns = d.get("campaigns").and_then(|x| x.as_array()).cloned().unwrap_or_default();
@@ -79,6 +82,7 @@ impl Adapter for QoderAdapter {
         })
     }
 
+    /// 逐活动领奖；回执 status 非 CLAIMED/空 → failed（透出平台文案）
     async fn claim(&self, c: &Cred, st: &CheckinState) -> Result<Receipt, PlatformError> {
         if st.checked {
             return Ok(Receipt { status: "already".into(), amount: None, message: Some("本周期此前已领取".into()) });
@@ -104,6 +108,7 @@ impl Adapter for QoderAdapter {
         Ok(Receipt { status: "success".into(), amount, message: None })
     }
 
+    /// 查额度：userQuota/addOnQuota/orgResourcePackage 三个来源各拆一个 part
     async fn quota(&self, c: &Cred) -> Result<Quota, PlatformError> {
         let d = business(request(c, "/api/v2/quota/usage", Method::GET, None).await?)?;
         let mut parts = Vec::new();

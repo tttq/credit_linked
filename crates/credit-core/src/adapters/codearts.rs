@@ -15,13 +15,17 @@ use crate::error::PlatformError;
 use crate::net::http::business;
 use reqwest::Method;
 
+/// 华为云 STS 端点（token 签发/续期 + caller-identity 校验）
 pub const STS_BASE: &str = "https://sts.cn-north-4.myhuaweicloud.com";
+/// 码道业务 API host（ops delivery/claim/confirm、用量统计）
 pub const API_BASE: &str = "https://snap-access.cn-north-4.myhuaweicloud.com";
 
+/// 码道适配器；desktop=true 走 DESKTOP 渠道（否则 IDE）
 pub struct CodeArtsAdapter { pub desktop: bool }
 
 // ===== DPoP =====
 
+/// 构造 DPoP proof JWT：ES256（p1363 r||s 签名），payload 带 htu/htm/iat/jti
 pub fn dpop_header(private_jwk: &Value, htu: &str) -> Result<String, PlatformError> {
     let sk = SigningKey::from(JwkDec::from_jwk(private_jwk)?);
     let header = B64URL.encode(json!({
@@ -45,6 +49,7 @@ impl JwkDec {
     }
 }
 
+/// 由签名私钥导出公钥 JWK（内嵌进 DPoP header）
 pub fn public_jwk_of(sk: &SigningKey) -> Value {
     let vk = sk.verifying_key();
     let enc = vk.to_encoded_point(false); // uncompressed: 04||X||Y
@@ -54,9 +59,11 @@ pub fn public_jwk_of(sk: &SigningKey) -> Value {
     json!({ "kty": "EC", "crv": "P-256", "x": x, "y": y })
 }
 
+/// base64url 解码（失败转 PlatformError::Format）
 pub fn b64url_decode(s: &str) -> Result<Vec<u8>, PlatformError> {
     B64URL.decode(s).map_err(|e| PlatformError::Format(format!("b64url: {e}")))
 }
+/// base64url 编码
 pub fn b64url_encode(b: &[u8]) -> String { B64URL.encode(b) }
 
 fn now_secs() -> u64 {
@@ -70,10 +77,8 @@ pub async fn sts_token(body_pairs: &[(&str, &str)], private_jwk: &Value) -> Resu
     let url = format!("{STS_BASE}/v1/oauth2/tokens");
     let dpop = dpop_header(private_jwk, &url)?;
     let body = body_pairs.iter().map(|(k, v)| format!("{}={}", crate::adapters::trae::urlencoding_lite(k), crate::adapters::trae::urlencoding_lite(v))).collect::<Vec<_>>().join("&");
-    let _hs = vec![
-        ("Content-Type", "application/x-www-form-urlencoded".to_string()),
-        ("DPoP", dpop.clone()),
-    ];
+    let _hs = [("Content-Type", "application/x-www-form-urlencoded".to_string()),
+        ("DPoP", dpop.clone())];
     let client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).timeout(std::time::Duration::from_secs(15)).build().unwrap();
     let resp = client.post(&url).header("Content-Type", "application/x-www-form-urlencoded").header("DPoP", dpop).body(body)
         .send().await.map_err(|e| PlatformError::Network(e.to_string()))?;
@@ -83,14 +88,15 @@ pub async fn sts_token(body_pairs: &[(&str, &str)], private_jwk: &Value) -> Resu
 }
 // ===== SDK-HMAC-SHA256 请求签名 =====
 
+/// percent 解码（供 path 规范化 encode(decode(seg)) 使用）
 pub fn decode_percent(s: &str) -> String {
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
     while i < b.len() {
         if b[i] == b'%' && i + 2 < b.len() + 1 && i + 2 <= b.len() - 1 + 1 && i + 2 < b.len() {
-            let h = (b[i + 1] as char).to_digit(16).unwrap_or(99) as u32;
-            let l = (b[i + 2] as char).to_digit(16).unwrap_or(99) as u32;
+            let h = (b[i + 1] as char).to_digit(16).unwrap_or(99);
+            let l = (b[i + 2] as char).to_digit(16).unwrap_or(99);
             if h < 16 && l < 16 { out.push(((h << 4) | l) as u8); i += 3; continue; }
         }
         out.push(b[i]); i += 1;
@@ -98,6 +104,9 @@ pub fn decode_percent(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+// 参数与 HWS 签名要素一一对应，不拆结构体
+#[allow(clippy::too_many_arguments)]
+/// SDK-HMAC-SHA256 请求签名：返回 Authorization 头与需随请求携带的 header 集
 pub fn sign_codearts(
     ak: &str, sk: &str, method: &str, host: &str, url_path: &str, query: &str,
     headers: &[(String, String)], body: &str, security_token: Option<&str>,
@@ -114,7 +123,7 @@ pub fn sign_codearts(
         sign_headers.push(("x-security-token".into(), st.to_string()));
     }
     // canonical: 小写化 header 名并排序
-    sign_headers.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+    sign_headers.sort_by_key(|a| a.0.to_lowercase());
     let canonical_headers: String = sign_headers.iter()
         .map(|(k, v)| format!("{}:{}\n", k.to_lowercase(), v.trim()))
         .collect();
@@ -157,6 +166,7 @@ fn gmt_iso8601() -> String {
     format!("{y:04}{mo:02}{d:02}T{:02}{:02}{:02}Z", rem / 3600, (rem % 3600) / 60, rem % 60)
 }
 
+/// 小写 hex 编码
 pub fn hex_lower(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
@@ -165,6 +175,7 @@ pub fn hex_lower(b: &[u8]) -> String {
 
 fn channel(desktop: bool) -> &'static str { if desktop { "DESKTOP" } else { "IDE" } }
 
+/// 统一业务请求：HWS 签名发请求；HTTP 200 里的网关 error_code 按语义映射（06xx/1806/过期→Auth）
 pub async fn ops_request(c: &Cred, _desktop: bool, method: Method, path: &str, query: &str, body: Value, identity: bool) -> Result<Value, PlatformError> {
     let base = if identity { STS_BASE } else { API_BASE };
     let url = format!("{base}{path}");
@@ -217,12 +228,14 @@ pub async fn ops_request(c: &Cred, _desktop: bool, method: Method, path: &str, q
 impl Adapter for CodeArtsAdapter {
     fn provider(&self) -> &'static str { if self.desktop { "codearts-desktop" } else { "codearts" } }
 
+    /// 校验 AK/SK/STS 临时凭据：caller-identity 查询当前凭据归属（走 STS 域签名）
     async fn verify(&self, c: &Cred) -> Result<Value, PlatformError> {
         // GET /v5/caller-identity（on STS）
         let v = ops_request(c, self.desktop, Method::GET, "/v5/caller-identity", "", Value::Null, true).await?;
         Ok(v)
     }
 
+    /// 查签到活动：/v1/ops/delivery 过滤 campaignId 非空且 claimable!==false 的项
     async fn state(&self, c: &Cred) -> Result<CheckinState, PlatformError> {
         let q = format!("channel={}", channel(self.desktop));
         let v = ops_request(c, self.desktop, Method::GET, "/v1/ops/delivery", &q, Value::Null, false).await?;
@@ -246,6 +259,7 @@ impl Adapter for CodeArtsAdapter {
         Ok(CheckinState { checked, claimable, raw: json!({ "items": daily }), ..Default::default() })
     }
 
+    /// 逐 campaign 领取：幂等键 claim_{id}_{epoch_ms}，成功后按回执补 confirm（失败不阻塞）
     async fn claim(&self, c: &Cred, st: &CheckinState) -> Result<Receipt, PlatformError> {
         if st.checked {
             return Ok(Receipt { status: "already".into(), amount: None, message: None });
@@ -293,6 +307,7 @@ impl Adapter for CodeArtsAdapter {
         Ok(Receipt { status: "success".into(), amount, message: None })
     }
 
+    /// 查用量：/snap-manager/v1/statistics/plugin 取 usageTotalPackageCredit 指标
     async fn quota(&self, c: &Cred) -> Result<Quota, PlatformError> {
         let v = ops_request(c, self.desktop, Method::GET, "/snap-manager/v1/statistics/plugin", "", Value::Null, false).await?;
         let metrics = v.get("metrics").and_then(|m| m.as_array()).cloned().unwrap_or_default();
@@ -308,6 +323,7 @@ impl Adapter for CodeArtsAdapter {
         Ok(Quota { remaining: remain, parts: json!([]), sampled_at: now_iso() })
     }
 
+    /// STS refresh_token 续期（须带 PKCE verifier）；RT 一次性轮换，作废需重新授权
     async fn refresh(&self, c: &Cred) -> Result<Cred, PlatformError> {
         let Some(rt) = c.meta.get("refresh_token").and_then(|r| r.as_str()) else { return Err(PlatformError::Auth) };
         let jwk = c.meta.get("privateJwk").cloned().unwrap_or(Value::Null);

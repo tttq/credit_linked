@@ -4,6 +4,7 @@
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
 
+/// AES-256-GCM 解密（ct_with_tag = 密文 + 16B 认证标签，可带 AAD；失败返回错误说明）。
 pub fn gcm_decrypt(key: &[u8], nonce: &[u8], ct_with_tag: &[u8], aad: &[u8]) -> Result<Vec<u8>, String> {
     if key.len() != 32 {
         return Err("key must be 32B".into());
@@ -17,6 +18,7 @@ pub fn gcm_decrypt(key: &[u8], nonce: &[u8], ct_with_tag: &[u8], aad: &[u8]) -> 
         .map_err(|e| format!("gcm: {e}"))
 }
 
+/// AES-256-GCM 加密（输出 = 密文 + 16B 认证标签）。
 pub fn gcm_seal(key: &[u8], nonce: &[u8], pt: &[u8], aad: &[u8]) -> Result<Vec<u8>, String> {
     if key.len() != 32 || nonce.len() != 12 {
         return Err("bad params".into());

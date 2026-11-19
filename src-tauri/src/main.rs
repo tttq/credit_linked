@@ -11,22 +11,26 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tauri::{Manager, Emitter};
 
+/// 打开默认数据库构造 Service（各命令共用入口）
 fn svc() -> Result<Service, String> {
     Ok(Service { store: Arc::new(Store::open_default().map_err(|e| e.to_string())?) })
 }
 
+/// UI 快照：账号、签到状态与额度汇总（首页一次性数据）
 #[tauri::command]
 async fn snapshot() -> Result<serde_json::Value, String> {
     let s = svc()?;
     Ok(s.ui_snapshot())
 }
 
+/// 扫描本机导入平台账号（intl = 国际版）
 #[tauri::command]
 async fn import(platform: String, intl: bool) -> Result<serde_json::Value, String> {
     let s = svc()?;
     s.import_account(&platform, intl).await.map_err(|e| e.to_string())
 }
 
+/// 签到：单账号，或 all = 全部账号逐个执行（单个失败不影响其余）
 #[tauri::command]
 async fn checkin(provider: String, uid: String, all: bool) -> Result<serde_json::Value, String> {
     let s = svc()?;
@@ -51,6 +55,7 @@ async fn checkin(provider: String, uid: String, all: bool) -> Result<serde_json:
     Ok(serde_json::json!({ "results": out }))
 }
 
+/// 刷新单账号额度并持久化
 #[tauri::command]
 async fn quota_refresh(provider: String, uid: String) -> Result<serde_json::Value, String> {
     let s = svc()?;
@@ -78,9 +83,9 @@ async fn quota_refresh_all() -> Result<serde_json::Value, String> {
     Ok(serde_json::json!({ "ok": true, "refreshed": ok, "failed": fail }))
 }
 
-/// 用户确认退出：直接结束进程
 // ===== 自动更新 =====
 
+/// 自动更新检查的 GitHub 仓库
 const UPDATE_REPO: &str = "tttq/credit_linked";
 
 /// 查询 GitHub Releases 最新版本，与当前版本比较
@@ -152,7 +157,7 @@ async fn check_update() -> Result<serde_json::Value, String> {
 /// 下载更新安装包到临时目录（前端显示进度；完成后用户手动点「重启安装」）
 #[tauri::command]
 async fn download_update(app: tauri::AppHandle, url: String) -> Result<serde_json::Value, String> {
-    let file_name = url.split('/').last().unwrap_or("update-setup.exe").to_string();
+    let file_name = url.split('/').next_back().unwrap_or("update-setup.exe").to_string();
     let dir = std::env::temp_dir().join("credit-rs-update");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let path = dir.join(&file_name);
@@ -170,7 +175,7 @@ async fn download_update(app: tauri::AppHandle, url: String) -> Result<serde_jso
     while let Some(chunk) = resp.chunk().await.map_err(|e| e.to_string())? {
         file.write_all(&chunk).map_err(|e| e.to_string())?;
         downloaded += chunk.len() as u64;
-        let pct = if total > 0 { (downloaded * 100 / total) as u64 } else { 0 };
+        let pct = downloaded.checked_mul(100).and_then(|n| n.checked_div(total)).unwrap_or(0);
         if pct >= last_emit + 5 {
             last_emit = pct;
             let _ = app.emit("update-download", serde_json::json!({ "progress": pct, "downloaded": downloaded, "total": total }));
@@ -212,12 +217,14 @@ async fn install_update(file: String) -> Result<serde_json::Value, String> {
     Ok(serde_json::json!({ "ok": true }))
 }
 
+/// 退出应用
 #[tauri::command]
 async fn quit_app(app: tauri::AppHandle) -> Result<(), String> {
     app.exit(0);
     Ok(())
 }
 
+/// 查询签到历史（默认最近 50 条）
 #[tauri::command]
 async fn history(limit: Option<i64>) -> Result<serde_json::Value, String> {
     let s = svc()?;
@@ -227,12 +234,14 @@ async fn history(limit: Option<i64>) -> Result<serde_json::Value, String> {
 
 // ===== 登录 =====
 
+/// 发起平台授权登录（返回 sessionId / 授权 URL / 有效期）
 #[tauri::command]
 async fn login_start(provider: String) -> Result<serde_json::Value, String> {
     let (sid, url, exp) = credit_core::login::start_login(&provider).await.map_err(|e| e.to_string())?;
     Ok(serde_json::json!({ "sessionId": sid, "url": url, "expiresIn": exp }))
 }
 
+/// 轮询登录结果；拿到凭据时自动入库（同 provider+uid 覆盖）
 #[tauri::command]
 async fn login_poll(session_id: String) -> Result<serde_json::Value, String> {
     let out = credit_core::login::poll_login(&session_id).await.map_err(|e| e.to_string())?;
@@ -250,6 +259,7 @@ async fn login_poll(session_id: String) -> Result<serde_json::Value, String> {
     Ok(v)
 }
 
+/// 取消全部进行中的登录会话
 #[tauri::command]
 async fn login_cancel() -> Result<(), String> {
     credit_core::login::cancel_all();
@@ -258,12 +268,14 @@ async fn login_cancel() -> Result<(), String> {
 
 // ===== 账号管理 =====
 
+/// 删除账号
 #[tauri::command]
 async fn account_delete(provider: String, uid: String) -> Result<(), String> {
     let s = svc()?;
     s.store.delete_account(&provider, &uid).map_err(|e| e.to_string())
 }
 
+/// 开/关账号自动签到
 #[tauri::command]
 async fn account_toggle_auto(provider: String, uid: String, auto: bool) -> Result<(), String> {
     let s = svc()?;
@@ -334,24 +346,28 @@ async fn trae_set_device(provider: String, uid: String, device_id: String) -> Re
         .map_err(|e| e.to_string())
 }
 
+/// 查账号显示名（不存在返回空串）
 fn p_name(s: &Service, p: &str, u: &str) -> String {
     s.store.list_accounts().ok().and_then(|accs| {
         accs.into_iter().find(|(ap, au, _, _, _)| ap == p && au == u).map(|(_, _, n, _, _)| n)
     }).unwrap_or_default()
 }
 
+/// 签到/收益统计（可按平台、账号、周期 day/week/month 过滤）
 #[tauri::command]
 async fn statistics(provider: Option<String>, uid: Option<String>, period: Option<String>) -> Result<serde_json::Value, String> {
     let s = svc()?;
     Ok(s.statistics(provider.as_deref(), uid.as_deref(), period.unwrap_or_else(|| "day".into()).as_str()))
 }
 
+/// 近 N 天每日收益（默认 7 天）
 #[tauri::command]
 async fn daily_income(days: Option<i64>) -> Result<serde_json::Value, String> {
     let s = svc()?;
     Ok(s.daily_income(days.unwrap_or(7)))
 }
 
+/// 读取应用设置（自动签到/定时/开机自启/随机时间等）
 #[tauri::command]
 async fn settings_get() -> Result<serde_json::Value, String> {
     let s = svc()?;
@@ -369,15 +385,19 @@ async fn settings_get() -> Result<serde_json::Value, String> {
         "lastRunDay": get("last_auto_run_day", ""),
         "lastRunTarget": get("last_auto_run_target", ""),
         "lastAutoError": get("last_auto_error", ""),
+        "locale": get("locale", ""),
+        "theme": get("theme", ""),
     }))
 }
 
+/// 写单项设置
 #[tauri::command]
 async fn settings_set(key: String, value: String) -> Result<(), String> {
     let s = svc()?;
     s.store.set_setting(&key, &value).map_err(|e| e.to_string())
 }
 
+/// 全量账号行（含状态/额度/最近签到时间，账号管理表用）
 #[tauri::command]
 async fn account_list_all() -> Result<serde_json::Value, String> {
     let s = svc()?;
@@ -385,11 +405,13 @@ async fn account_list_all() -> Result<serde_json::Value, String> {
     serde_json::to_value(rows).map_err(|e| e.to_string())
 }
 
+/// 用系统默认浏览器打开 URL
 #[tauri::command]
 async fn open_url(url: String) -> Result<(), String> {
     // 跨平台用系统默认浏览器打开授权页
     #[cfg(windows)]
-    std::process::Command::new("cmd").args(["/C", "start", "", &url]).spawn().map_err(|e| e.to_string())?;
+    credit_core::proc_util::hide_console(std::process::Command::new("cmd"))
+        .args(["/C", "start", "", &url]).spawn().map_err(|e| e.to_string())?;
     #[cfg(target_os = "macos")]
     std::process::Command::new("open").arg(&url).spawn().map_err(|e| e.to_string())?;
     #[cfg(target_os = "linux")]
@@ -399,6 +421,7 @@ async fn open_url(url: String) -> Result<(), String> {
 
 // ===== 应用内授权子窗口（iframe 会被平台 X-Frame-Options 拒绝，改用 Tauri 子窗口内嵌授权） =====
 
+/// 打开授权子窗口承载平台授权页（iframe 被 X-Frame-Options 拒绝时的替代方案）
 #[tauri::command]
 async fn login_open_window(app: tauri::AppHandle, session_id: String, url: String, provider: String) -> Result<(), String> {
     use tauri::{WebviewUrl, WebviewWindowBuilder};
@@ -425,6 +448,7 @@ async fn login_open_window(app: tauri::AppHandle, session_id: String, url: Strin
     Ok(())
 }
 
+/// 关闭指定会话的授权子窗口
 #[tauri::command]
 async fn login_close_window(app: tauri::AppHandle, session_id: String) -> Result<(), String> {
     let label = format!("auth-{}", session_id.replace('-', ""));
@@ -437,6 +461,7 @@ async fn login_close_window(app: tauri::AppHandle, session_id: String) -> Result
 
 // ===== 自动签到调度器（消费设置：auto/time/catchup） =====
 
+/// 调度 tick：到计划时间（含随机偏移/补跑）后对开启自动且今日未签的账号执行签到
 async fn auto_tick(app: &tauri::AppHandle) -> Result<(), String> {
     let s = match svc() { Ok(s) => s, Err(e) => return Err(format!("svc: {e}")) };
     let get = |k: &str, d: &str| s.store.get_setting(k, d).unwrap_or_else(|_| d.to_string());
@@ -490,10 +515,12 @@ async fn auto_tick(app: &tauri::AppHandle) -> Result<(), String> {
 /// 网关端口（settings 表 gateway.port 可覆盖）
 const GATEWAY_DEFAULT_PORT: u16 = 8756;
 
+/// 构造网关路由器（独立 Store 连接）
 fn gw_router() -> Result<Router, String> {
     Ok(Router::new(Arc::new(Store::open_default().map_err(|e| e.to_string())?)))
 }
 
+/// 网关状态 + 最近 100 条请求日志（账号路由页数据源）
 #[tauri::command]
 async fn gateway_status() -> Result<serde_json::Value, String> {
     let router = gw_router()?;
@@ -622,6 +649,7 @@ fn installed_by_uninstaller(platform: &str, entries: &[(String, String, String)]
     })
 }
 
+/// 检测平台客户端是否已安装：手动导入目录 → 注册表 → 常见路径 → 凭据文件
 fn tool_installed(platform: &str) -> bool {
     // 用户手动导入的安装目录优先（settings: toolDir:<platform> = 主 exe 所在目录）
     if let Ok(s) = svc() {
@@ -747,6 +775,7 @@ fn tool_urls(platform: &str) -> (Option<String>, &'static str, &'static str) {
 /// 从 MiniMax 官网首页解析当前最新版安装包直链（版本号随发布变化）
 static MINIMAX_URL_CACHE: std::sync::OnceLock<std::sync::Mutex<Option<String>>> = std::sync::OnceLock::new();
 
+/// 抓取 MiniMax 官网首页并解析最新版安装包直链（失败返回 None）
 async fn minimax_latest_url() -> Option<String> {
     let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(20)).build().ok()?;
     let body = client.get("https://code.minimax.cn/").send().await.ok()?.text().await.ok()?;
@@ -754,6 +783,7 @@ async fn minimax_latest_url() -> Option<String> {
     re.find(&body).map(|m| m.as_str().to_string())
 }
 
+/// MiniMax 安装包直链提取正则（CDN x64 Setup exe）
 fn regex_lite_minimax() -> regex::Regex {
     regex::Regex::new(r#"https://file\.cdn\.minimax\.io/public/minimax-agent-prod/release/MiniMax%20Code%20Setup%20[^"'\s]+?x64\.exe"#).unwrap()
 }
@@ -761,6 +791,7 @@ fn regex_lite_minimax() -> regex::Regex {
 /// 下载进度快照（全局）
 static DOWNLOADS: std::sync::Mutex<Vec<serde_json::Value>> = std::sync::Mutex::new(Vec::new());
 
+/// 平台工具页数据：安装状态/下载直链/各平台额度汇总/下载进度快照
 #[tauri::command]
 async fn tools_info() -> Result<serde_json::Value, String> {
     let s = svc()?;
@@ -853,6 +884,7 @@ async fn tools_refresh_minimax_url() -> Result<(), String> {
     Ok(())
 }
 
+/// 下载平台安装包（进度写入 DOWNLOADS 并 emit tool-download 事件给前端）
 #[tauri::command]
 async fn tools_download(app: tauri::AppHandle, platform: String, install_dir: String) -> Result<serde_json::Value, String> {
     let (url, mode, page) = tool_urls(&platform);
@@ -861,7 +893,7 @@ async fn tools_download(app: tauri::AppHandle, platform: String, install_dir: St
         None if platform == "minimax" => minimax_latest_url().await.ok_or("未获取到 MiniMax 最新版直链，请打开官网下载页")?,
         None => return Ok(serde_json::json!({ "ok": false, "openPage": page, "mode": mode })),
     };
-    let file_name = url.split('/').last().unwrap_or("installer.exe").to_string();
+    let file_name = url.split('/').next_back().unwrap_or("installer.exe").to_string();
     let dir = if install_dir.trim().is_empty() { std::env::temp_dir().join("credit-rs-installers").to_string_lossy().to_string() } else { install_dir };
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let path = std::path::Path::new(&dir).join(&file_name);
@@ -883,7 +915,7 @@ async fn tools_download(app: tauri::AppHandle, platform: String, install_dir: St
     while let Some(chunk) = resp.chunk().await.map_err(|e| e.to_string())? {
         file.write_all(&chunk).map_err(|e| e.to_string())?;
         downloaded += chunk.len() as u64;
-        let pct = if total > 0 { (downloaded * 100 / total) as u64 } else { 0 };
+        let pct = downloaded.checked_mul(100).and_then(|n| n.checked_div(total)).unwrap_or(0);
         if pct >= last_emit + 5 {
             last_emit = pct;
             let ev = serde_json::json!({ "platform": platform, "status": "downloading", "file": path_str, "progress": pct });
@@ -956,9 +988,10 @@ async fn platform_ensure_running(platform: String) -> Result<serde_json::Value, 
     if proc_name.is_empty() {
         return Ok(serde_json::json!({ "ok": false, "reason": "unknown platform" }));
     }
-    // 进程检测（tasklist 按映像名）
-    let running = Command::new("tasklist")
-        .args(["/FI", &format!("IMAGENAME eq {}", exe_paths.first().map(|p| p.rsplit('\\').next().unwrap_or(&proc_name)).unwrap_or(&proc_name)), "/FO", "CSV", "/NH"])
+    // 进程检测（tasklist 按映像名；控制台进程加 CREATE_NO_WINDOW 防黑框）
+    let mut tl = Command::new("tasklist");
+    tl.args(["/FI", &format!("IMAGENAME eq {}", exe_paths.first().map(|p| p.rsplit('\\').next().unwrap_or(proc_name)).unwrap_or(proc_name)), "/FO", "CSV", "/NH"]);
+    let running = credit_core::proc_util::hide_console(tl)
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).contains(proc_name))
         .unwrap_or(false);
@@ -976,6 +1009,7 @@ async fn platform_ensure_running(platform: String) -> Result<serde_json::Value, 
     }
 }
 
+/// 切换网关当前平台（保留 codearts/desktop 通道原串）
 #[tauri::command]
 async fn gateway_set_platform(platform: String) -> Result<serde_json::Value, String> {
     // 保留原始通道字符串（codearts vs codearts-desktop 都映射 Platform::CodeArts）
@@ -1040,6 +1074,7 @@ async fn gateway_switch_account(account_ref: Option<String>) -> Result<serde_jso
     Ok(serde_json::json!({ "ok": true, "platform": raw, "active": chosen, "available": valid.len() }))
 }
 
+/// 新增路由规则（modelPattern 前缀匹配）
 #[tauri::command]
 #[allow(non_snake_case)] // modelPattern 是前端 invoke 的参数名契约
 async fn gateway_add_rule(modelPattern: String, platform: String, account: String, weight: i64, enabled: bool) -> Result<serde_json::Value, String> {
@@ -1057,6 +1092,7 @@ async fn gateway_add_rule(modelPattern: String, platform: String, account: Strin
     serde_json::to_value(saved).map_err(|e| e.to_string())
 }
 
+/// 更新路由规则（id 不存在报错）
 #[tauri::command]
 async fn gateway_update_rule(rule: serde_json::Value) -> Result<(), String> {
     let router = gw_router()?;
@@ -1064,6 +1100,7 @@ async fn gateway_update_rule(rule: serde_json::Value) -> Result<(), String> {
     if router.update_rule(r) { Ok(()) } else { Err("规则不存在".into()) }
 }
 
+/// 删除路由规则（id 不存在报错）
 #[tauri::command]
 async fn gateway_delete_rule(id: String) -> Result<(), String> {
     let router = gw_router()?;
@@ -1085,6 +1122,7 @@ fn center_panel(w: &tauri::WebviewWindow) {
     }
 }
 
+/// Tauri 应用入口：panic 日志 / 主窗口关闭拦截 / 自动签到循环 / 网关启动 / 托盘 / 命令注册
 fn main() {
     // panic 日志（崩溃排查）
     std::panic::set_hook(Box::new(|info| {
@@ -1132,6 +1170,7 @@ fn main() {
                     device_salt: std::sync::Mutex::new(credit_gateway::server::device_salt_init()),
                     device_token: std::sync::Mutex::new(None),
                     models_cache: std::sync::Mutex::new(None),
+                    models_info: std::sync::Mutex::new(std::collections::HashMap::new()),
                 });
                 let addr = SocketAddr::from(([127, 0, 0, 1], port));
                 if let Err(e) = credit_gateway::serve(state, addr).await {

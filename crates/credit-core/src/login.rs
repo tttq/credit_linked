@@ -16,6 +16,7 @@ use tokio::net::TcpListener;
 
 // ===== 会话数据 =====
 
+/// 登录会话数据：按平台区分进行中状态；Done 表示后台回调任务已写回结果。
 #[derive(Clone)]
 pub enum FlowData {
     /// trae: 回调监听已在后台任务中跑，完成/失败后写回 shared。
@@ -32,6 +33,7 @@ pub enum FlowData {
     Done(Result<Cred, String>),
 }
 
+/// 一次登录会话：session_id 供轮询、url 供打开授权页，5 分钟过期。
 #[derive(Clone)]
 pub struct Flow {
     pub session_id: String,
@@ -51,6 +53,7 @@ fn now_ms() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64
 }
 
+/// 清空全部登录会话（应用退出或重置时调用）。
 pub fn cancel_all() {
     if let Ok(mut m) = flows().lock() {
         m.clear();
@@ -113,6 +116,7 @@ async fn wait_callback(listener: &TcpListener, timeout: std::time::Duration, pat
     }
 }
 
+/// 解析回调 URL 查询串为键值表（复用 trae 的解析实现）。
 pub fn parse_query(raw: &str) -> HashMap<String, String> {
     crate::adapters::trae::parse_callback_query(raw)
 }
@@ -350,8 +354,11 @@ async fn codearts_wait_task(
 
 // ===== 轮询 =====
 
+/// 轮询结果：status = pending | ready | expired；ready 时携带凭据。
 pub struct PollOut { pub status: String, pub credential: Option<Cred> }
 
+/// 查询登录进度：trae/codearts 读后台回调任务结果，minimax/qoder/workbuddy 现场轮询换票；
+/// 拿到凭据即移除会话，会话过期返回 expired。
 pub async fn poll_login(session_id: &str) -> Result<PollOut, PlatformError> {
     let f = {
         let m = flows().lock().unwrap();
@@ -420,7 +427,7 @@ pub async fn poll_login(session_id: &str) -> Result<PollOut, PlatformError> {
                 if info.get("code").and_then(|c| c.as_i64()) == Some(12151) { None }
                 else {
                     let acc = crate::net::http::business(info)?;
-                    let uid = acc.get("uid").map(|u| value_to_string(u))
+                    let uid = acc.get("uid").map(value_to_string)
                         .ok_or_else(|| PlatformError::Format("授权无法确认身份".into()))?;
                     let name = acc.get("nickname").or_else(|| acc.get("name")).and_then(|n| n.as_str()).unwrap_or("WorkBuddy 账号").to_string();
                     Some(Cred {
@@ -456,7 +463,7 @@ async fn minimax_profile(token: &str) -> Result<(String, String), PlatformError>
     let v = platform_fetch("https://agent.minimax.cn/matrix/api/v1/user/profile",
         reqwest::Method::GET, None, &[("Authorization", format!("Bearer {token}"))]).await?;
     let d = crate::net::http::business(v)?;
-    let uid = d.get("user_id").map(|u| value_to_string(u))
+    let uid = d.get("user_id").map(value_to_string)
         .ok_or_else(|| PlatformError::Format("MiniMax 未返回账号标识".into()))?;
     let name = d.get("user_name").and_then(|n| n.as_str()).unwrap_or("MiniMax Code").to_string();
     Ok((uid, name))

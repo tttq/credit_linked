@@ -15,6 +15,7 @@ use credit_core::db::Store;
 use credit_core::service::{adapter_for, Service};
 use std::sync::Arc;
 
+/// 命令行参数定义
 #[derive(Parser)]
 #[command(name = "credit-cli", version = "0.1.77")]
 struct Cli {
@@ -22,24 +23,33 @@ struct Cli {
     cmd: Cmd,
 }
 
+/// 子命令集合
 #[derive(Subcommand)]
 enum Cmd {
+    /// 本机扫描导入平台账号（platform: trae | wb | qoder；--intl 国际版）
     Import {
         platform: String,
         #[arg(long)]
         intl: bool,
     },
+    /// 查询账号签到状态
     State { provider: String, uid: String },
+    /// 执行签到
     Checkin { provider: String, uid: String },
+    /// 查询额度
     Quota { provider: String, uid: String },
+    /// 列出全部账号
     Accounts,
+    /// 协议自检（tc 信封加密/解密往返）
     Selftest,
 }
 
+/// 打开默认数据库（每条命令独立连接）
 fn store() -> anyhow::Result<Arc<Store>> {
     Ok(Arc::new(Store::open_default()?))
 }
 
+/// 凭据序列化入库（upsert）并打印结果
 fn save_cred(s: &Store, cred: &credit_core::adapters::Cred) -> anyhow::Result<()> {
     let auth = serde_json::to_string(cred)?;
     s.upsert_account(&cred.provider, &cred.uid, &cred.name, "", &auth)?;
@@ -47,6 +57,7 @@ fn save_cred(s: &Store, cred: &credit_core::adapters::Cred) -> anyhow::Result<()
     Ok(())
 }
 
+/// CLI 入口：解析子命令并分发执行
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -162,6 +173,7 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
+/// 按 provider+uid 从 accounts 表加载凭据
 fn load_cred(svc: &Service, provider: &str, uid: &str) -> anyhow::Result<credit_core::adapters::Cred> {
     let accounts = svc.store.list_accounts()?;
     let Some((_, _, _, _, auth)) = accounts.iter().find(|(p, u, _, _, _)| p == provider && u == uid) else {
@@ -170,6 +182,7 @@ fn load_cred(svc: &Service, provider: &str, uid: &str) -> anyhow::Result<credit_
     Ok(serde_json::from_str(auth)?)
 }
 
+/// 解 Trae JWT payload 取 uid（data.id；解析失败返回空串）
 fn jwt_uid(token: &str) -> String {
     use base64::Engine;
     let parts: Vec<&str> = token.split('.').collect();
@@ -179,6 +192,7 @@ fn jwt_uid(token: &str) -> String {
     v.pointer("/data/id").and_then(|i| i.as_str()).unwrap_or("").to_string()
 }
 
+/// 按 tc 信封格式加密（selftest 解密往返用；密钥派生对齐 credit-core）
 fn seal_for_test(body: &[u8], salt: [u8; 32]) -> String {
     use credit_core::crypto::aes_cbc::{HEADER, VOE, WOE};
     use aes::cipher::{block_padding::Pkcs7, BlockEncryptMut, KeyIvInit};

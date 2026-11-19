@@ -6,9 +6,11 @@ use std::collections::BTreeMap;
 
 use crate::adapters::day_cn;
 
+/// 随机种子表：day → u32，当日固定保证计划可复现（只保留最近 4 天）。
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Seeds(pub BTreeMap<String, u32>);
 
+/// 随机签到时间计划器（randomSchedule.v1 语义）。
 pub struct RandomSchedule;
 
 impl RandomSchedule {
@@ -40,6 +42,7 @@ fn parse_minute(t: &str) -> anyhow::Result<i64> {
     Ok(h.parse::<i64>()? * 60 + m.parse::<i64>()?)
 }
 
+/// 生成新的 32 位随机种子（OS 熵源）。
 pub fn rand_seed() -> u32 {
     let mut b = [0u8; 4];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut b);

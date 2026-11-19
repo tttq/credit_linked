@@ -30,7 +30,7 @@ pub fn electron_local_root() -> PathBuf {
 }
 
 /// 在某个 Electron userData 根下找应用目录（跨平台名候选）
-pub fn find_app_dir(root: &PathBuf, names: &[&str]) -> Option<PathBuf> {
+pub fn find_app_dir(root: &std::path::Path, names: &[&str]) -> Option<PathBuf> {
     for name in names {
         let p = root.join(name);
         if p.exists() {

@@ -8,18 +8,22 @@ use serde_json::Value;
 
 use crate::crypto::aes_cbc::tc_decrypt;
 
+/// 各平台 Trae 安装目录名候选（Windows/macOS/Linux）
 pub const APP_NAMES: [&str; 7] = [
     "Trae CN", "TRAE SOLO CN",              // Windows
     "Trae", "Trae CN", "Trae SOLO",          // macOS
     "trae", "trae-cn",                       // Linux
 ];
+/// storage.json 中登录凭据的键名（值是 tc 信封密文）
 pub const AUTH_KEY: &str = "iCubeAuthInfo://icube.cloudide";
+/// storage.json 中设备号键前缀（键名后缀即 16 位设备号）
 pub const DC_PREFIX: &str = "iCubeAuthInfo://icube-dc:";
 
 fn app_data_root() -> PathBuf {
     crate::platform_dirs::electron_userdata_root()
 }
 
+/// 定位本机 Trae userData 目录：TRADE_HOME 覆盖 → 候选安装目录探测
 pub fn trae_data_dir() -> Option<PathBuf> {
     if let Ok(over) = std::env::var("TRADE_HOME") {
         let p = PathBuf::from(&over);
@@ -37,7 +41,7 @@ pub fn trae_data_dir() -> Option<PathBuf> {
     None
 }
 
-fn read_storage_json(dir: &PathBuf) -> Option<Value> {
+fn read_storage_json(dir: &std::path::Path) -> Option<Value> {
     let f = dir.join("User/globalStorage/storage.json");
     let text = std::fs::read_to_string(f).ok()?;
     let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
@@ -56,6 +60,7 @@ fn device_id_of(storage: &Value) -> Option<String> {
     None
 }
 
+/// 本机 Trae 登录态快照（解密后的 auth + 设备身份 + 站点归属）
 pub struct TraeLiveAuth {
     pub data_dir: PathBuf,
     pub device_id: Option<String>,
@@ -81,7 +86,7 @@ pub struct TraeIdentity {
 
 /// 从 userData 目录读取身份（storage.json + machineid + product.json）
 pub fn read_identity(data_dir: &std::path::Path) -> Option<TraeIdentity> {
-    let storage = read_storage_json(&data_dir.to_path_buf())?;
+    let storage = read_storage_json(data_dir)?;
     let machine = storage.get("telemetry.machineId").and_then(|v| v.as_str()).filter(|s| !s.trim().is_empty()).map(|s| s.to_string())
         .or_else(|| std::fs::read_to_string(data_dir.join("machineid")).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()));
     let machine_id = machine?;
@@ -123,9 +128,9 @@ fn find_product_app_version() -> Option<String> {
         }
     }
     // 兜底：从运行中的 Trae 进程路径推导（<exe dir>/resources/app/product.json）
-    let out = std::process::Command::new("tasklist")
-        .args(["/FI", "IMAGENAME eq Trae CN.exe", "/FO", "CSV", "/NH"])
-        .output().ok()?;
+    let mut cmd = std::process::Command::new("tasklist");
+    cmd.args(["/FI", "IMAGENAME eq Trae CN.exe", "/FO", "CSV", "/NH"]);
+    let out = crate::proc_util::hide_console(cmd).output().ok()?;
     let _ = out;
     None
 }
@@ -139,7 +144,9 @@ fn read_app_version(path: &std::path::Path) -> Option<String> {
 fn os_version_string() -> String {
     if cfg!(windows) {
         // 与插件同格式："Windows 10.0.22631"；用 cmd ver 拿不到内部版本号时退回 "Windows"
-        let out = std::process::Command::new("cmd").args(["/C", "ver"]).output();
+        let mut cmd = std::process::Command::new("cmd");
+        cmd.args(["/C", "ver"]);
+        let out = crate::proc_util::hide_console(cmd).output();
         if let Ok(o) = out {
             let s = String::from_utf8_lossy(&o.stdout);
             if let Some(idx) = s.find("Version ") {
@@ -163,8 +170,9 @@ pub struct TraeDeviceKeyPair {
     pub public_key_pem: String,
 }
 
+/// 读取设备密钥对（tc 信封解出 privateKeyPEM/publicKeyPEM；续期 DeviceProof 签名用）
 pub fn read_device_keypair(data_dir: &std::path::Path) -> Option<TraeDeviceKeyPair> {
-    let storage = read_storage_json(&data_dir.to_path_buf())?;
+    let storage = read_storage_json(data_dir)?;
     let obj = storage.as_object()?;
     let key = obj.keys().find(|k| k.starts_with(DC_PREFIX))?;
     let raw = obj.get(key)?.as_str()?.trim().to_string();
@@ -217,7 +225,7 @@ fn host_ends_with_cn(host: &str) -> bool {
 }
 
 /// SOLO 目录名含 "SOLO" → req_source=2，否则 1（对齐 readTraeCurrent）
-pub fn request_source_for_dir(dir: &PathBuf) -> i64 {
+pub fn request_source_for_dir(dir: &std::path::Path) -> i64 {
     let name = dir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
     if name.to_uppercase().contains("SOLO") { 2 } else { 1 }
 }
@@ -250,4 +258,62 @@ pub fn collect_local_device_ids() -> Vec<String> {
         }
     }
     out
+}
+
+/// token 指纹（识别 Trae 客户端是否已刷新登录态；不泄露 token 明文）
+pub fn token_fingerprint() -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let auth = read_live_auth()?;
+    let token = auth.auth.get("token").and_then(|t| t.as_str()).unwrap_or("");
+    if token.is_empty() { return None; }
+    Some(Sha256::digest(token.as_bytes()).iter().map(|b| format!("{b:02x}")).collect::<String>()[..16].to_string())
+}
+
+/// 本机 Trae 客户端 exe 候选（CN/国际/SOLO）
+pub fn client_exe_candidates() -> Vec<std::path::PathBuf> {
+    let local = std::env::var("LOCALAPPDATA").unwrap_or_default();
+    [
+        format!("{local}/Programs/Trae CN/Trae CN.exe"),
+        format!("{local}/Programs/Trae/Trae.exe"),
+        "D:/ProgramFiles/develop/Trae CN/Trae CN.exe".to_string(),
+        "C:/Program Files/Trae/Trae.exe".to_string(),
+        format!("{local}/Programs/TRAE SOLO CN/TRAE SOLO CN.exe"),
+        "D:/ProgramFiles/develop/TRAE SOLO CN/TRAE SOLO CN.exe".to_string(),
+    ].into_iter().map(std::path::PathBuf::from).collect()
+}
+
+/// 找本机 Trae 客户端 exe（已安装才返回）
+pub fn find_client_exe() -> Option<std::path::PathBuf> {
+    client_exe_candidates().into_iter().find(|p| p.exists())
+}
+
+/// 启动本机 Trae 客户端（已运行则单实例应用聚焦现有窗口）。
+/// 返回 Some(路径) = 已尝试拉起；None = 未安装。
+pub fn launch_client() -> Option<std::path::PathBuf> {
+    let exe = find_client_exe()?;
+    // GUI 应用：完全分离 stdio（否则子进程继承父进程管道句柄会导致父端读取挂起）
+    let _ = std::process::Command::new(&exe)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    Some(exe)
+}
+
+/// 等待客户端刷新 token（指纹变化），最多 timeout。返回 Some = 已刷新。
+pub fn wait_for_token_change(old_fp: Option<&str>, timeout: std::time::Duration) -> Option<TraeLiveAuth> {
+    let start = std::time::Instant::now();
+    loop {
+        let cur_fp = token_fingerprint();
+        let changed = match (old_fp, cur_fp.as_deref()) {
+            (Some(old), Some(cur)) => cur != old,
+            (None, Some(_)) => true,
+            _ => false,
+        };
+        if changed {
+            return read_live_auth();
+        }
+        if start.elapsed() >= timeout { return None; }
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+    }
 }

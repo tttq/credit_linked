@@ -1,5 +1,8 @@
+//! 平台统一错误类型：按失败类别区分，Display 输出面向 UI 展示与落库。
+
 use std::fmt;
 
+/// 平台交互统一错误：调用方按变体决定重试（Network/Rate）、刷新凭据（Auth）或提示用户。
 #[derive(Debug, Clone)]
 pub enum PlatformError {
     /// 网络层失败（DNS/TLS/超时/非白名单 host/非 https）
@@ -47,6 +50,7 @@ impl fmt::Display for PlatformError {
 impl std::error::Error for PlatformError {}
 
 impl PlatformError {
+    /// 从响应体提取 (code, msg) 构造 BUSINESS 错误（保留原码原文用于展示/透传）。
     pub fn business_of(v: &serde_json::Value) -> Self {
         PlatformError::Business {
             code: v.get("code").cloned().unwrap_or(serde_json::Value::Null),

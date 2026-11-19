@@ -17,12 +17,17 @@ use crate::protocol::*;
 /// 上游 chat 产出的一条流事件
 #[derive(Debug, Clone)]
 pub enum StreamEvent {
+    /// 正文文本增量
     Text(String),
+    /// 思考/推理内容增量（reasoning_content）
     Reasoning(String),
     /// 工具调用增量（OpenAI `choices[].delta.tool_calls[]` 语义）
     ToolCall { index: u32, id: Option<String>, name: Option<String>, arguments: Option<String> },
+    /// token 用量（input / output / total）
     Usage { input: u64, output: u64, total: Option<u64> },
+    /// 流结束（finish_reason：stop / length / tool_calls …）
     Done { finish: String },
+    /// 错误事件（消息, code）
     Error(String, String),
 }
 
@@ -41,6 +46,7 @@ pub struct ModelInfo {
     pub supports_images: Option<bool>,
 }
 
+/// 各平台统一的 chat 事件流类型（网关层消费）
 pub type EventStream = std::pin::Pin<Box<dyn Stream<Item = Result<StreamEvent, String>> + Send>>;
 
 /// 非流式请求客户端：整体超时 300s（普通 JSON 请求）
@@ -63,12 +69,14 @@ fn stream_client() -> &'static reqwest::Client {
     C.get_or_init(|| {
         reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(20))
-            .read_timeout(Duration::from_secs(180))
+            // 深度思考模型可能连续数分钟不吐字节；空闲超时给足余量避免长任务被拦腰掐断
+            .read_timeout(Duration::from_secs(300))
             .build()
             .expect("gateway stream client")
     })
 }
 
+/// 按字符截断到 n 个字符（超长补省略号；错误信息展示用）
 fn truncate(s: &str, n: usize) -> String {
     // 按字符截断：按字节切片会在中文/emoji 边界 panic（panic 会中断整个响应）
     if s.chars().count() <= n {
@@ -79,6 +87,7 @@ fn truncate(s: &str, n: usize) -> String {
     }
 }
 
+/// 发送请求并校验 HTTP 2xx；非 2xx 读 body 截断后拼错误信息
 async fn send_sse(req: reqwest::RequestBuilder) -> Result<reqwest::Response, String> {
     let resp = req.send().await.map_err(|e| format!("network: {e}"))?;
     let status = resp.status().as_u16();
@@ -122,6 +131,8 @@ fn dedupe_models(mut models: Vec<ModelInfo>) -> Vec<ModelInfo> {
     out
 }
 
+/// WorkBuddy 模型目录：GET {chat_base}/v3/config（code!=0 信封）；
+/// 只保留 clients=cli 桶内的可用模型（剔除 disabled/auto 与缺窗口的）
 pub async fn wb_fetch_models(cred: &Cred) -> Result<Vec<ModelInfo>, PlatformError> {
     let domain = cred.meta.get("domain").and_then(|d| d.as_str()).unwrap_or("");
     let global = wb_is_global(domain);
@@ -346,6 +357,7 @@ struct Pump {
 }
 
 impl Pump {
+    /// 构造泵：绑定解析分支与原始字节流
     fn new(kind: SseKind, stream: impl Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static) -> Self {
         Self { kind, buf: Vec::new(), queue: Default::default(), stream: Box::pin(stream), done: false, finished: false }
     }
@@ -390,6 +402,7 @@ impl Pump {
             return None;
         }
     }
+    /// OpenAI data 帧 → 事件列表（[DONE] 视为 stop 结束）
     fn decode_openai(&self, data: &str) -> Vec<StreamEvent> {
         if data == "[DONE]" {
             return vec![StreamEvent::Done { finish: "stop".into() }];
@@ -443,6 +456,7 @@ fn find_block_end(buf: &[u8]) -> Option<(usize, usize)> {
     None
 }
 
+/// 解析单个 SSE 块 → (event 名, data 文本)；两者皆空返回 None
 fn parse_event_block(block: &str) -> Option<(String, String)> {
     let mut event_name = String::new();
     let mut data = String::new();
@@ -594,15 +608,12 @@ pub fn decode_trae_event(event_name: &str, data: &str) -> Option<StreamEvent> {
                 Some(StreamEvent::Reasoning(reasoning.to_string()))
             } else if !text.is_empty() {
                 Some(StreamEvent::Text(text.to_string()))
-            } else if let Some(fr) = v.get("finish_reason").and_then(|f| f.as_str()) {
-                Some(StreamEvent::Done { finish: fr.to_string() })
-            } else {
-                None
-            }
+            } else { v.get("finish_reason").and_then(|f| f.as_str()).map(|fr| StreamEvent::Done { finish: fr.to_string() }) }
         }
     }
 }
 
+/// 用泵驱动原始字节流 → 统一 EventStream（Done 后最多再等 2s 收尾）
 fn pump_stream(kind: SseKind, stream: std::pin::Pin<Box<dyn Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send>>) -> EventStream {
     Box::pin(futures_util::stream::unfold(Pump::new(kind, stream), |mut p| async move {
         loop {
@@ -885,15 +896,20 @@ pub struct QoderSigner {
 }
 
 impl QoderSigner {
+    /// 启动 sidecar 子进程并等待 ready 帧（stdio 管道接管）
     pub async fn spawn() -> Result<Self, PlatformError> {
         let exe = sidecar_script()?;
         let node_bin = find_node()?;
-        let child = tokio::process::Command::new(&node_bin)
-            .arg(&exe)
+        let mut cmd = tokio::process::Command::new(&node_bin);
+        cmd.arg(&exe)
             .arg("serve")
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        // Windows：node 是控制台子系统进程，GUI 应用里 spawn 会弹黑框 → 隐藏后台运行
+        #[cfg(windows)]
+        cmd.creation_flags(0x0800_0000);
+        let child = cmd
             .spawn()
             .map_err(|e| PlatformError::Local(format!("sidecar spawn: {e}")))?;
         let mut c = child;
@@ -939,7 +955,9 @@ impl QoderSigner {
 fn find_node() -> Result<String, PlatformError> {
     if let Ok(p) = std::env::var("NODE_BIN") { return Ok(p); }
     for name in ["node", "nodejs"] {
-        if let Ok(out) = std::process::Command::new(name).arg("--version").output() {
+        let mut cmd = std::process::Command::new(name);
+        cmd.arg("--version");
+        if let Ok(out) = credit_core::proc_util::hide_console(cmd).output() {
             if out.status.success() { return Ok(name.to_string()); }
         }
     }
@@ -955,16 +973,17 @@ fn find_node() -> Result<String, PlatformError> {
     // nvm 管理的版本目录（nodejs symlink 常指向它）
     if let Ok(entries) = std::fs::read_dir("D:/ProgramFiles/develop/nvm") {
         for e in entries.filter_map(|e| e.ok()) {
-            if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                if e.file_name().to_string_lossy().starts_with('v') {
+            if e.file_type().map(|t| t.is_dir()).unwrap_or(false)
+                && e.file_name().to_string_lossy().starts_with('v') {
                     candidates.push(format!("D:/ProgramFiles/develop/nvm/{}/node.exe", e.file_name().to_string_lossy()));
                 }
-            }
         }
     }
     for c in candidates {
         if std::path::Path::new(&c).exists() {
-            if let Ok(out) = std::process::Command::new(&c).arg("--version").output() {
+            let mut cmd = std::process::Command::new(&c);
+            cmd.arg("--version");
+            if let Ok(out) = credit_core::proc_util::hide_console(cmd).output() {
                 if out.status.success() { return Ok(c); }
             }
         }
@@ -974,8 +993,10 @@ fn find_node() -> Result<String, PlatformError> {
 
 /// 编译期嵌入 Qoder 签名器（开发运行 / 未打包资源时也能用；无需依赖 Node 之外的运行时文件布局）
 const QODER_SIGNER_JS: &str = include_str!("../sidecar/qoder-signer.mjs");
+/// 编译期嵌入 Qoder 签名 WASM（与 js 配套释放到临时目录）
 const QODER_SIGNER_WASM: &[u8] = include_bytes!("../sidecar/qoder_auth_wasm_bg.wasm");
 
+/// 定位 qoder-signer.mjs：环境变量 → 安装/资源目录 → 仓库布局 → 临时目录释放内嵌副本
 fn sidecar_script() -> Result<std::path::PathBuf, PlatformError> {
     let mut candidates: Vec<std::path::PathBuf> = Vec::new();
     if let Ok(p) = std::env::var("QODER_SIGNER") {
@@ -1034,6 +1055,48 @@ fn sidecar_script() -> Result<std::path::PathBuf, PlatformError> {
             .map_err(|e| PlatformError::Local(format!("sidecar extract: {e}")))?;
     }
     Ok(js)
+}
+
+/// Qoder 签名 sidecar 进程池槽数：单进程签名是串行的（毫秒级），多槽位轮转支撑本地网关并发。
+const QODER_SIGNER_POOL: usize = 4;
+
+/// 签名进程池槽位（惰性初始化；槽内 None = 尚未 spawn）
+fn signer_slots() -> &'static [std::sync::Arc<tokio::sync::Mutex<Option<QoderSigner>>>] {
+    static SLOTS: std::sync::OnceLock<Vec<std::sync::Arc<tokio::sync::Mutex<Option<QoderSigner>>>>> = std::sync::OnceLock::new();
+    SLOTS.get_or_init(|| {
+        (0..QODER_SIGNER_POOL)
+            .map(|_| std::sync::Arc::new(tokio::sync::Mutex::new(None)))
+            .collect()
+    })
+}
+
+/// 从进程池轮转取一个常驻签名进程完成签名（旧实现每请求 spawn 一个 node 进程，
+/// 高并发下进程创建开销大且频繁弹进程）；进程死亡时原地重建后重试一次。
+async fn qoder_sign(req: &Value) -> Result<Value, String> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let slots = signer_slots();
+    let idx = NEXT.fetch_add(1, Ordering::Relaxed) % slots.len();
+    let slot = slots[idx].clone();
+    let mut guard = slot.lock().await;
+    if guard.is_none() {
+        *guard = Some(QoderSigner::spawn().await.map_err(|e| e.to_string())?);
+    }
+    let signer = guard.as_mut().expect("signer slot must be filled");
+    match signer.sign(req).await {
+        Ok(v) => Ok(v),
+        Err(e) => match QoderSigner::spawn().await {
+            Ok(mut fresh) => {
+                let out = fresh.sign(req).await.map_err(|e| e.to_string());
+                *guard = Some(fresh);
+                out
+            }
+            Err(_) => {
+                *guard = None;
+                Err(e.to_string())
+            }
+        },
+    }
 }
 
 /// 由账号 uid 派生稳定的会话 UUID（同一账号所有请求复用一个上游会话）。
@@ -1107,10 +1170,8 @@ pub async fn codearts_chat_stream(cred: &Cred, body: Value, desktop: bool) -> Re
         ("model-name".into(), model),
     ];
     let host_of = host.to_string();
-    let client = reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(20))
-        .read_timeout(std::time::Duration::from_secs(180))
-        .build().unwrap();
+    // 共享流式 client（连接复用；旧实现每请求新建 Client 各自维护连接池，浪费且慢）
+    let client = stream_client();
     let url = format!("https://{host}{path}");
     // 并发会话上限（TM.00001041）自动退避重试：Agent 并发调用时偶发，等前序会话结束后即可成功
     let mut last_err = String::new();
@@ -1186,20 +1247,18 @@ pub async fn codearts_fetch_models(cred: &Cred, _desktop: bool) -> Result<Vec<Mo
             supports_images: m.get("supports_images").and_then(|x| x.as_bool()),
         });
     }
-    let _ = std::fs::write("E:/auto_change/_shots/ca_gw_models.txt", format!("models={} arr={}", out.len(), arr.len()));
     Ok(out)
 }
-/// Qoder chat：sidecar 签名 → POST agent_chat_generation（SSE 双层信封 → OpenAI chunk）
+/// Qoder chat：sidecar 签名（常驻进程池）→ POST agent_chat_generation（SSE 双层信封 → OpenAI chunk）
 pub async fn qoder_chat_stream(cred: &Cred, body: Value) -> Result<EventStream, String> {
-    // 1. 签名
-    let mut signer = QoderSigner::spawn().await.map_err(|e| e.to_string())?;
-    let signed = signer.sign(&json!({
+    // 1. 签名（进程池轮转，不再每请求 spawn）
+    let signed = qoder_sign(&json!({
         "deviceToken": cred.token,
         "endpoint": "https://gateway.qoder.com.cn",
         "bodyJson": body.to_string(),
         "modelKey": body.get("model").and_then(|m| m.as_str()).unwrap_or("mmodel"),
         "modelSource": "official",
-    })).await.map_err(|e| e.to_string())?;
+    })).await?;
     let url = signed.get("url").and_then(|u| u.as_str()).ok_or("sidecar: no url")?.to_string();
     let body_str = signed.get("body").and_then(|b| b.as_str()).ok_or("sidecar: no body")?.to_string();
     let headers: Value = signed.get("headers").cloned().unwrap_or(json!({}));
@@ -1247,6 +1306,7 @@ pub fn parse_qoder_envelope_sse(stream: impl Stream<Item = Result<bytes::Bytes, 
     }))
 }
 
+/// Qoder 双层信封 SSE 泵（外层 data 帧 → 内层 OpenAI chunk 解码）
 struct QoderPump {
     buf: Vec<u8>,
     stream: std::pin::Pin<Box<dyn Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send>>,

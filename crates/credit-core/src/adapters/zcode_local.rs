@@ -9,7 +9,9 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use crate::crypto::aes_gcm::gcm_decrypt;
 
+/// 凭据文件名（~/.zcode/v2/ 下，值为 enc:v1/v2 加密串）
 pub const CREDENTIAL_FILENAME: &str = "credentials.json";
+/// 遥测文件名（读 deviceMid 用）
 pub const TELEMETRY_FILENAME: &str = "telemetry-state.json";
 
 fn fallback_secret() -> String {
@@ -60,9 +62,10 @@ fn os_key(cred_file: &std::path::Path) -> Option<[u8; 32]> {
             std::env::current_dir().ok().map(|d| d.join("crates/credit-core/scripts/zcode-oskey.ps1")),
         ];
         let script = candidates.into_iter().flatten().find(|x| x.exists())?;
-        let out = std::process::Command::new("powershell.exe")
-            .args(["-NoProfile", "-File"]).arg(&script)
-            .args(["-Target", &target]).output().ok()?;
+        let mut cmd = std::process::Command::new("powershell.exe");
+        cmd.args(["-NoProfile", "-File"]).arg(&script)
+            .args(["-Target", &target]);
+        let out = crate::proc_util::hide_console(cmd).output().ok()?;
         let b64 = String::from_utf8_lossy(&out.stdout).trim().to_string();
         let key = B64URL.decode(b64.as_bytes()).ok()?;
         if key.len() != 32 { return None; }
@@ -109,8 +112,9 @@ pub fn decode_zcode_value(raw: &str, secret: &str, os_key: Option<&[u8; 32]>) ->
     }
 }
 
+/// 定位 ~/.zcode/v2：ZCODE_HOME 覆盖 → setting.json dataBaseDir 兜底
 pub fn zcode_v2_dir() -> Option<std::path::PathBuf> {
-    let home = std::env::var("ZCODE_HOME").ok().map(std::path::PathBuf::from).or_else(|| dirs::home_dir())?;
+    let home = std::env::var("ZCODE_HOME").ok().map(std::path::PathBuf::from).or_else(dirs::home_dir)?;
     let v2 = home.join(".zcode").join("v2");
     if v2.join(CREDENTIAL_FILENAME).exists() { return Some(v2); }
     let sf = v2.join("setting.json");
@@ -127,6 +131,7 @@ pub fn zcode_v2_dir() -> Option<std::path::PathBuf> {
     None
 }
 
+/// 本机 ZCode 登录态（含 plan/billing 专用 zcodejwttoken）
 pub struct ZcodeLiveAuth {
     pub uid: String,
     pub name: Option<String>,
@@ -147,6 +152,7 @@ pub fn read_credential(key_name: &str) -> Option<String> {
     decode_zcode_value(raw, &secret, key.as_ref())
 }
 
+/// 读取当前活跃 provider（zai_cn/zai/bigmodel）的本机凭据
 pub fn read_live_auth() -> Option<ZcodeLiveAuth> {
     let dir = zcode_v2_dir()?;
     let cred_file = dir.join(CREDENTIAL_FILENAME);

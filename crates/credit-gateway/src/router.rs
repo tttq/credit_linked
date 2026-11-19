@@ -29,17 +29,20 @@ pub struct RouteRule {
     pub created_at: String,
 }
 
+/// 路由器：基于 Store 的平台选择 / 路由规则 / 平台内账号挑选
 pub struct Router {
     pub store: Arc<Store>,
 }
 
 impl Router {
+    /// 用共享 Store 构造路由器
     pub fn new(store: Arc<Store>) -> Self {
         Self { store }
     }
 
     // ---------- 当前平台 ----------
 
+    /// 当前请求平台（settings 表 gw_platform；未设置回落 WorkBuddy）
     pub fn current_platform(&self) -> Platform {
         let v = self.store.get_setting("gw_platform", "workbuddy").unwrap_or_default();
         Platform::parse(&v).unwrap_or(Platform::WorkBuddy)
@@ -58,23 +61,27 @@ impl Router {
         }
     }
 
+    /// 按枚举持久化当前平台
     pub fn set_current_platform(&self, p: Platform) {
         let _ = self.store.set_setting("gw_platform", p.as_str());
     }
 
     // ---------- 路由规则 ----------
 
+    /// 全部路由规则（gw_rules 存 JSON 数组）
     pub fn list_rules(&self) -> Vec<RouteRule> {
         let raw = self.store.get_setting("gw_rules", "[]").unwrap_or_else(|_| "[]".into());
         serde_json::from_str(&raw).unwrap_or_default()
     }
 
+    /// 规则写回 gw_rules（序列化失败静默忽略）
     fn save_rules(&self, rules: &[RouteRule]) {
         if let Ok(s) = serde_json::to_string(rules) {
             let _ = self.store.set_setting("gw_rules", &s);
         }
     }
 
+    /// 新增规则（生成 id/created_at 后落库，返回保存后的规则）
     pub fn add_rule(&self, mut rule: RouteRule) -> RouteRule {
         rule.id = uuid::Uuid::new_v4().to_string();
         rule.created_at = credit_core::adapters::now_iso();
@@ -84,6 +91,7 @@ impl Router {
         rule
     }
 
+    /// 按 id 更新规则；不存在返回 false
     pub fn update_rule(&self, rule: RouteRule) -> bool {
         let mut rules = self.list_rules();
         if let Some(slot) = rules.iter_mut().find(|r| r.id == rule.id) {
@@ -95,6 +103,7 @@ impl Router {
         }
     }
 
+    /// 按 id 删除规则；返回是否确实删除
     pub fn delete_rule(&self, id: &str) -> bool {
         let mut rules = self.list_rules();
         let before = rules.len();

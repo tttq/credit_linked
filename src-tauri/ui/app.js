@@ -1,25 +1,26 @@
 // AI路由助手 前端逻辑
 const _T = window.__TAURI__;
 const invoke = _T?.core?.invoke || _T?.invoke;
+window.invoke = invoke; // i18n.js 等外部脚本经 window.invoke 调后端（settings locale 持久化）
 const openUrl = _T?.opener?.openUrl || _T?.shell?.open || null;
 
 const PLAT = {
-  trae:      { name: 'Trae',      color: '#20b978', login: 'browser', desc: '将在本机 3379 端口起回调并打开 Trae 授权页，登录后自动回填。' },
-  workbuddy: { name: 'WorkBuddy', color: '#00ba9c', login: 'browser', desc: '跳转腾讯 CodeBuddy 授权页，确认后自动取回凭据。' },
-  minimax:   { name: 'MiniMax',   color: '#20b9ec', login: 'device',  desc: '打开 MiniMax 授权页并输入展示的确认码后，此处自动完成。' },
-  qoder:     { name: 'Qoder',     color: '#606570', login: 'browser', desc: '打开 Qoder 设备授权页，选择账号授权后自动完成。' },
-  codearts:  { name: '华为云码道', color: '#e93442', login: 'browser', desc: '打开码道授权页（IDE 通道），完成后自动换取 STS 凭据。' },
-  'codearts-desktop': { name: '码道桌面', color: '#854cf5', login: 'browser', desc: '打开码道授权页（桌面通道），完成后自动换取 STS 凭据。' },
-  zcode:     { name: 'ZCode',     color: '#2e7a6f', login: 'none',    desc: '仅支持扫描本机当前账号。' },
-  doubao:    { name: '豆包',       color: '#c78f79', login: 'none',    desc: '走窗口驱动（后续版本接入）。' },
+  trae:      { color: '#20b978', login: 'browser' },
+  workbuddy: { color: '#00ba9c', login: 'browser' },
+  minimax:   { color: '#20b9ec', login: 'device'  },
+  qoder:     { color: '#606570', login: 'browser' },
+  codearts:  { color: '#e93442', login: 'browser' },
+  'codearts-desktop': { color: '#854cf5', login: 'browser' },
+  zcode:     { color: '#2e7a6f', login: 'none'    },
+  doubao:    { color: '#c78f79', login: 'none'    },
 };
 const NAV = [
-  ['overview', '首页', icon('home')],
-  ['accounts', '账号管理', icon('users')],
-  ['checkin', '签到中心', icon('check')],
-  ['statistics', '积分统计', icon('chart')],
-  ['routing', '账号路由', icon('route')],
-  ['settings', '设置', icon('gear')],
+  ['overview', 'nav_home', icon('home')],
+  ['accounts', 'nav_accounts', icon('users')],
+  ['checkin', 'nav_checkin', icon('check')],
+  ['statistics', 'nav_stats', icon('chart')],
+  ['routing', 'nav_route', icon('route')],
+  ['settings', 'nav_settings', icon('gear')],
 ];
 function icon(k) {
   const P = {
@@ -41,13 +42,45 @@ let checkinFilter = 'all';
 let loginTimer = null, curLoginSid = null;
 let charts = { ov: null, st: null };
 
+// ===== 外观主题（system | light | dark，默认跟随系统） =====
+// html[data-theme] 驱动 CSS 暗色变量；system 模式实时跟随 OS 深浅色切换。
+let THEME_MODE = 'system';
+const themeMedia = window.matchMedia ? window.matchMedia('(prefers-color-scheme: dark)') : null;
+function resolveTheme(mode) {
+  return mode === 'system' ? ((themeMedia && themeMedia.matches) ? 'dark' : 'light') : mode;
+}
+function applyTheme(mode, save) {
+  THEME_MODE = (mode === 'dark' || mode === 'light') ? mode : 'system';
+  document.documentElement.dataset.theme = resolveTheme(THEME_MODE);
+  if (save) {
+    try { localStorage.setItem('ui-theme', THEME_MODE); } catch {}
+    try { const r = invoke('settings_set', { key: 'theme', value: THEME_MODE }); if (r && r.catch) r.catch(() => {}); } catch {}
+  }
+  // 坐标轴文字/分隔线颜色是 JS 画的，换主题后重绘当前页图表
+  try { showPage(curPage); } catch {}
+}
+// 启动恢复：localStorage（本机偏好）> DB settings.theme > 跟随系统
+function restoreTheme(dbTheme) {
+  let saved = null;
+  try { saved = localStorage.getItem('ui-theme'); } catch {}
+  applyTheme(saved || dbTheme || 'system', false);
+}
+if (themeMedia && themeMedia.addEventListener) themeMedia.addEventListener('change', () => {
+  if (THEME_MODE === 'system') { document.documentElement.dataset.theme = resolveTheme('system'); try { showPage(curPage); } catch {} }
+});
+// 脚本加载即应用一次（避免暗色用户启动时白闪）；DB 恢复在 refreshAll 里再校正
+try { document.documentElement.dataset.theme = resolveTheme(localStorage.getItem('ui-theme') || 'system'); } catch {}
+// 图表配色跟随主题（echarts 选项不支持 CSS 变量）
+function chartAxisColor() { return document.documentElement.dataset.theme === 'dark' ? '#9d9bb0' : '#7f7d91'; }
+function chartSplitColor() { return document.documentElement.dataset.theme === 'dark' ? '#34334a' : '#eae9f1'; }
+
 const $ = (s) => document.querySelector(s);
 const $$ = (s) => [...document.querySelectorAll(s)];
 const esc = (v) => { const d = document.createElement('div'); d.textContent = v == null ? '' : String(v); return d.innerHTML; };
 function toast(msg, ms = 2800) { const t = $('#toast'); t.textContent = msg; t.style.display = 'block'; clearTimeout(t._h); t._h = setTimeout(() => t.style.display = 'none', ms); }
 
 // 居中确认弹框（替代原生 confirm/alert）
-function confirmBox(title, message, { okText = '确定', cancelText = '取消', danger = false, onlyOk = false } = {}) {
+function confirmBox(title, message, { okText = t('ok'), cancelText = t('cancel'), danger = false, onlyOk = false } = {}) {
   return new Promise(resolve => {
     const mask = $('#confirm-mask');
     if (!mask) { resolve(window.confirm(message)); return; }
@@ -64,8 +97,10 @@ function confirmBox(title, message, { okText = '确定', cancelText = '取消', 
     no.onclick = () => done(false);
   });
 }
-function platName(p) { return (PLAT[p] || {}).name || p; }
+function platName(p) { const k = 'pname_' + p; const s = t(k); return s === k ? p : s; }
+function platDesc(p) { const k = 'desc_' + p; const s = t(k); return s === k ? '' : s; }
 function platMeta(p) { return PLAT[p] || { color: '#456' }; }
+function gwLabel(p) { const k = 'gw_' + p; const s = t(k); return s === k ? p : s; }
 function picon(p, cls) {
   const m = platMeta(p);
   const iconFile = { trae: 'trae.png', workbuddy: 'workbuddy.jpg', minimax: 'minimax.png', qoder: 'qoder.png', codearts: 'codearts.svg', 'codearts-desktop': 'codearts-desktop.png', doubao: 'doubao.ico', zcode: null }[p];
@@ -76,15 +111,16 @@ function picon(p, cls) {
 }
 function piconFallback(p, cls) {
   const m = platMeta(p);
-  return '<span class="picon ' + (cls || '') + '" style="background:' + m.color + ';width:26px;height:26px;border-radius:7px;display:inline-flex;align-items:center;justify-content:center;color:#fff;font-weight:700;font-size:12px;flex:0 0 auto">' + esc(m.name ? m.name[0] : '?') + '</span>';
+  return '<span class="picon ' + (cls || '') + '" style="background:' + m.color + ';width:26px;height:26px;border-radius:7px;display:inline-flex;align-items:center;justify-content:center;color:#fff;font-weight:700;font-size:12px;flex:0 0 auto">' + esc((platName(p) || '?')[0]) + '</span>';
 }
 function stInfo(s) {
-  const m = { success: ['st-ok','已领取'], already: ['st-ok','今日已领'], failed: ['st-bad','失败'],
-    pending: ['st-warn','待确认'], 'needs-action': ['st-warn','需操作'], 'no-activity': ['st-idle','无活动'], idle: ['st-idle','待签到'], 'auth-expired': ['st-bad','授权过期'] };
-  const [cls, txt] = m[s] || ['st-idle', s || '—'];
+  const m = { success: ['st-ok','st_success'], already: ['st-ok','st_already'], failed: ['st-bad','st_failed'],
+    pending: ['st-warn','st_pending'], 'needs-action': ['st-warn','st_needs_action'], 'no-activity': ['st-idle','st_no_activity'], idle: ['st-idle','st_idle'], 'auth-expired': ['st-bad','st_auth_expired'] };
+  const hit = m[s];
+  const [cls, txt] = hit ? [hit[0], t(hit[1])] : ['st-idle', s || '—'];
   return '<span class="status ' + cls + '"><span class="dot"></span>' + esc(txt) + '</span>';
 }
-function fmt(n) { return n == null ? '—' : (Math.round(n * 100) / 100).toLocaleString('zh-CN'); }
+function fmt(n) { return I18n.fmtNumber(n); }
 function parseQuota(a) {
   if (!a.quota) return null;
   try { return typeof a.quota === 'string' ? JSON.parse(a.quota) : a.quota; } catch { return null; }
@@ -101,8 +137,8 @@ async function backfillQuotas() {
 
 // ===== 导航 =====
 function renderNav() {
-  $('#nav').innerHTML = NAV.map(([k, label, ic]) =>
-    '<button data-page="' + k + '" class="' + (curPage === k ? 'selected' : '') + '">' + ic + '<span>' + label + '</span></button>').join('');
+  $('#nav').innerHTML = NAV.map(([k, labelKey, ic]) =>
+    '<button data-page="' + k + '" class="' + (curPage === k ? 'selected' : '') + '">' + ic + '<span>' + esc(t(labelKey)) + '</span></button>').join('');
   $$('#nav button').forEach(b => b.addEventListener('click', () => showPage(b.dataset.page)));
 }
 function showPage(p) {
@@ -123,10 +159,12 @@ async function refreshAll() {
   try {
     SNAP = await invoke('snapshot');
     SETTINGS = await invoke('settings_get');
-    $('#cycle-label').textContent = '今日周期 ' + SNAP.cycle;
-    $('#today-str').textContent = new Date().toLocaleDateString('zh-CN', { weekday: 'long', month: 'long', day: 'numeric' });
-    $('#sched-time').textContent = SETTINGS.randomTime ? '随机' : SETTINGS.time;
-  } catch (e) { console.error('[refresh:snapshot]', e); toast('数据加载失败: ' + e, 4200); }
+    try { if (window.I18n && I18n.restoreFromDb) I18n.restoreFromDb(SETTINGS.locale); } catch {}
+    try { restoreTheme(SETTINGS.theme); } catch {}
+    $('#cycle-label').textContent = t('today_cycle') + ' ' + SNAP.cycle;
+    $('#today-str').textContent = I18n.fmtDate(new Date(), { weekday: 'long', month: 'long', day: 'numeric' });
+    $('#sched-time').textContent = SETTINGS.randomTime ? t('random') : SETTINGS.time;
+  } catch (e) { console.error('[refresh:snapshot]', e); toast(t('data_load_failed') + e, 4200); }
   await step('gateway', async () => { await refreshGateway(); });
   await step('overview', () => { renderOverview(); });
   await step('accounts', () => { renderAccounts(); });
@@ -143,16 +181,16 @@ async function refreshAll() {
 function renderOverview() {
   const accs = SNAP.accounts || [];
   const grid = $('#tool-grid');
-  if (!accs.length) { grid.innerHTML = '<div class="empty" style="grid-column:1/-1">还没有添加 AI 工具 —— 到「账号管理」添加账号</div>'; return; }
+  if (!accs.length) { grid.innerHTML = '<div class="empty" style="grid-column:1/-1">' + t('empty_no_tools') + '</div>'; return; }
   grid.innerHTML = accs.map(a => {
     const m = platMeta(a.provider);
     const done = a.status === 'success' || a.status === 'already';
     const q = parseQuota(a);
     return '<section class="tool-card" data-provider="' + a.provider + '">' +
       '<div class="tool-identity">' + picon(a.provider) + '<div><h3>' + esc(platName(a.provider)) + '</h3><p class="subtle" title="' + esc(a.name) + '">' + esc(a.name || a.uid.slice(0, 10)) + '</p></div></div>' +
-      '<div class="tool-balance"><span class="subtle">可用</span><strong>' + (q && q.remaining != null ? fmt(q.remaining) : '—') + '</strong></div>' +
-      '<div class="tool-result">' + (done ? '<span class="checkin-done">✓ 已签到</span>' : stInfo(a.status)) +
-      '<span class="subtle">' + esc(a.last_checkin ? '上次 ' + a.last_checkin.slice(5, 10) : '') + '</span></div></section>';
+      '<div class="tool-balance"><span class="subtle">' + t('available') + '</span><strong>' + (q && q.remaining != null ? fmt(q.remaining) : '—') + '</strong></div>' +
+      '<div class="tool-result">' + (done ? '<span class="checkin-done">' + t('checked_in') + '</span>' : stInfo(a.status)) +
+      '<span class="subtle">' + esc(a.last_checkin ? t('last') + a.last_checkin.slice(5, 10) : '') + '</span></div></section>';
   }).join('');
 }
 async function drawOverview() {
@@ -166,20 +204,20 @@ async function drawOverview() {
     const colors = { trae: '#20b978', workbuddy: '#00ba9c', minimax: '#20b9ec', qoder: '#606570', codearts: '#e93442', 'codearts-desktop': '#854cf5', doubao: '#c78f79', zcode: '#2e7a6f' };
     charts.ov.setOption({
       tooltip: { trigger: 'axis' },
-      legend: provs.length > 1 ? { data: provs.map(platName), bottom: 0, textStyle: { fontSize: 11, color: '#7f7d91' } } : undefined,
+      legend: provs.length > 1 ? { data: provs.map(platName), bottom: 0, textStyle: { fontSize: 11, color: chartAxisColor() } } : undefined,
       grid: { left: 44, right: 14, top: 20, bottom: provs.length > 1 ? 42 : 26 },
-      xAxis: { type: 'category', data: days.map(d => d.day.slice(overviewRange > 100 ? 2 : 5)), axisLabel: { fontSize: 10, color: '#7f7d91' } },
-      yAxis: { type: 'value', axisLabel: { fontSize: 10, color: '#7f7d91' }, splitLine: { lineStyle: { color: '#eae9f1' } } },
+      xAxis: { type: 'category', data: days.map(d => d.day.slice(overviewRange > 100 ? 2 : 5)), axisLabel: { fontSize: 10, color: chartAxisColor() } },
+      yAxis: { type: 'value', axisLabel: { fontSize: 10, color: chartAxisColor() }, splitLine: { lineStyle: { color: chartSplitColor() } } },
       series: (provs.length ? provs : ['_']).map(p => ({
-        name: p === '_' ? '签到积分' : platName(p), type: 'bar', stack: 'income',
+        name: p === '_' ? t('checkin_points') : platName(p), type: 'bar', stack: 'income',
         itemStyle: { color: p === '_' ? '#6862ed' : (colors[p] || '#6862ed'), borderRadius: p === '_' ? 4 : undefined, borderColor: '#fff', borderWidth: p === '_' ? 0 : 1 },
         data: days.map(d => p === '_' ? d.income : (d.by_provider?.[p] || 0)),
         barMaxWidth: 22,
       })),
     });
     const sum = days.reduce((s, d) => s + d.income, 0);
-    $('#chart-sum').textContent = '期间签到积分 +' + fmt(sum);
-  } catch (e) { toast('图表加载失败: ' + e); }
+    $('#chart-sum').textContent = t('period_points') + fmt(sum);
+  } catch (e) { toast(t('chart_load_failed') + e); }
 }
 $$('#range-pills button').forEach(b => b.addEventListener('click', () => {
   overviewRange = Number(b.dataset.range);
@@ -194,7 +232,7 @@ function renderAccounts() {
   const ALL_PLATS = Object.keys(PLAT).filter(p => p !== 'doubao');
   const added = [...new Set(accs.map(a => a.provider))];
   const plats = [...added, ...ALL_PLATS.filter(p => !added.includes(p))];
-  $('#accounts-sub').textContent = '已连接 ' + added.length + ' 个平台 · ' + accs.length + ' 个账号';
+  $('#accounts-sub').textContent = t('accounts_connected', { n: added.length, m: accs.length });
   const el = $('#account-list');
   el.innerHTML = plats.map(p => {
     const list = accs.filter(a => a.provider === p);
@@ -203,49 +241,49 @@ function renderAccounts() {
     return '<section class="account-platform-group" data-provider="' + p + '">' +
       '<header class="account-platform-header">' +
       '<div class="account-platform-heading">' + picon(p) + '<h2>' + esc(platName(p)) + '</h2>' +
-      '<span class="account-capability ' + (multi ? 'multi' : '') + '">' + (multi ? '支持多账号' : '仅支持单账号') + '</span>' +
-      '<span class="account-platform-count subtle">' + list.length + ' 个账号</span></div>' +
+      '<span class="account-capability ' + (multi ? 'multi' : '') + '">' + (multi ? t('multi_account') : t('single_account')) + '</span>' +
+      '<span class="account-platform-count subtle">' + t('n_accounts', { n: list.length }) + '</span></div>' +
       '<div class="actions">' +
-      (m.login !== 'none' ? '<button data-add="' + p + '" class="small primary">＋ 添加账号</button>' : '') +
-      (['trae','workbuddy','qoder','zcode','minimax','codearts','codearts-desktop'].includes(p) ? '<button data-import="' + p + '" class="small">扫描本机</button>' : '') +
+      (m.login !== 'none' ? '<button data-add="' + p + '" class="small primary">' + t('add_account') + '</button>' : '') +
+      (['trae','workbuddy','qoder','zcode','minimax','codearts','codearts-desktop'].includes(p) ? '<button data-import="' + p + '" class="small">' + t('scan_local') + '</button>' : '') +
       '</div></header>' +
-      (list.length ? list.map(a => acctRow(a, p)).join('') : '<div class="empty" style="padding:14px">尚未添加账号 —— 点右上角「添加账号」开始</div>') +
+      (list.length ? list.map(a => acctRow(a, p)).join('') : '<div class="empty" style="padding:14px">' + t('empty_no_accounts') + '</div>') +
       '</section>';
   }).join('');
   el.querySelectorAll('[data-add]').forEach(b => b.addEventListener('click', () => startLogin(b.dataset.add)));
   el.querySelectorAll('[data-import]').forEach(b => b.addEventListener('click', async () => {
-    b.disabled = true; b.textContent = '扫描中…';
+    b.disabled = true; b.textContent = t('scanning');
     try {
       const r = await invoke('import', { platform: b.dataset.import === 'workbuddy' ? 'wb' : b.dataset.import, intl: false });
-      toast('导入成功：' + (r.name || r.uid));
+      toast(t('import_ok') + (r.name || r.uid));
       await refreshAll();
-    } catch (e) { toast('导入失败: ' + e, 4200); }
-    b.disabled = false; b.textContent = '扫描本机';
+    } catch (e) { toast(t('import_failed') + e, 4200); }
+    b.disabled = false; b.textContent = t('scan_local');
   }));
   el.querySelectorAll('.acct-actions button, .acct-actions input').forEach(wire);
 }
 function acctRow(a, p) {
   const q = parseQuota(a);
   const done = a.status === 'success' || a.status === 'already';
-  const stateText = done ? '今日已领取' : (a.status === 'failed' || a.status === 'auth-expired' ? '签到异常' : '今日未领取');
+  const stateText = done ? t('today_claimed') : (a.status === 'failed' || a.status === 'auth-expired' ? t('checkin_error') : t('today_not_claimed'));
   const stateCls = done ? 'done' : (a.status === 'failed' || a.status === 'auth-expired' ? 'bad' : '');
   return '<div class="account-group-row" data-p="' + esc(a.provider) + '" data-u="' + esc(a.uid) + '">' +
-    '<div class="single-account-identity"><strong>' + esc(a.name || platName(p)) + ' <span class="acct-state ' + stateCls + '">(' + stateText + ')</span></strong><small>' + esc(a.uid) + (a.expires ? ' · 凭据到期 ' + a.expires.slice(0, 10) : '') + '</small></div>' +
-    '<div class="single-account-balance"><strong>' + (q && q.remaining != null ? fmt(q.remaining) : '—') + '</strong><small>可用余额' + (a.message ? ' · ' + esc(a.message) : '') + '</small></div>' +
+    '<div class="single-account-identity"><strong>' + esc(a.name || platName(p)) + ' <span class="acct-state ' + stateCls + '">(' + stateText + ')</span></strong><small>' + esc(a.uid) + (a.expires ? t('cred_expires') + a.expires.slice(0, 10) : '') + '</small></div>' +
+    '<div class="single-account-balance"><strong>' + (q && q.remaining != null ? fmt(q.remaining) : '—') + '</strong><small>' + t('available_balance') + (a.message ? ' · ' + esc(a.message) : '') + '</small></div>' +
     '<div class="account-row-actions acct-actions">' +
-    '<label class="switch" title="自动签到"><input type="checkbox" data-auto ' + (a.auto ? 'checked' : '') + '><span class="track"><span class="knob"></span></span></label>' +
-    '<button class="small" data-act="checkin"' + (done ? ' disabled title="今日已领取"' : '') + '>' + (done ? '今日已领取' : '签到') + '</button>' +
-    '<button class="small" data-act="quota">额度</button>' +
-    (p === 'trae' ? '<button class="small" data-act="device" title="Trae 一个设备号一天只能签一个账号：为该账号设置独立设备号">设备号</button>' : '') +
-    '<button class="small danger-ghost" data-act="del">删除</button>' +
+    '<label class="switch" title="' + t('auto_checkin') + '"><input type="checkbox" data-auto ' + (a.auto ? 'checked' : '') + '><span class="track"><span class="knob"></span></span></label>' +
+    '<button class="small" data-act="checkin"' + (done ? ' disabled title="' + t('today_claimed') + '"' : '') + '>' + (done ? t('today_claimed') : t('checkin')) + '</button>' +
+    '<button class="small" data-act="quota">' + t('quota_btn') + '</button>' +
+    (p === 'trae' ? '<button class="small" data-act="device" title="' + t('device_btn_tip') + '">' + t('device_btn') + '</button>' : '') +
+    '<button class="small danger-ghost" data-act="del">' + t('delete') + '</button>' +
     '</div></div>';
 }
 function wire(el) {
   if (el.type === 'checkbox') {
     el.addEventListener('change', async () => {
       const row = el.closest('.account-group-row');
-      try { await invoke('account_toggle_auto', { provider: row.dataset.p, uid: row.dataset.u, auto: el.checked }); toast('已' + (el.checked ? '开启' : '关闭') + '自动签到'); }
-      catch (e) { toast('设置失败: ' + e); }
+      try { await invoke('account_toggle_auto', { provider: row.dataset.p, uid: row.dataset.u, auto: el.checked }); toast(el.checked ? t('auto_on') : t('auto_off')); }
+      catch (e) { toast(t('set_failed') + e); }
     });
     return;
   }
@@ -258,7 +296,7 @@ function wire(el) {
         el.innerHTML = '<span class="spin"></span>';
         const r = await invoke('checkin', { provider: p, uid, all: false });
         const o = r.results[0];
-        toast((o.status === 'success' ? '领取成功' : o.status === 'already' ? '今日已领取' : o.status) + (o.amount != null ? ' +' + o.amount : '') + (o.message ? ' · ' + o.message : ''));
+        toast((o.status === 'success' ? t('claim_ok') : o.status === 'already' ? t('already_claimed') : o.status) + (o.amount != null ? ' +' + o.amount : '') + (o.message ? ' · ' + o.message : ''));
         await refreshAll();
       } else if (el.dataset.act === 'quota') {
         el.textContent = '…';
@@ -270,12 +308,12 @@ function wire(el) {
         await openDeviceDialog(p, uid);
         return;
       } else if (el.dataset.act === 'del') {
-        if (!await confirmBox('删除账号', '删除账号 ' + uid.slice(0, 12) + '？历史记录保留。', { okText: '删除', danger: true })) { el.disabled = false; return; }
+        if (!await confirmBox(t('delete_account'), t('delete_confirm_msg', { u: uid.slice(0, 12) }), { okText: t('delete'), danger: true })) { el.disabled = false; return; }
         await invoke('account_delete', { provider: p, uid });
-        toast('已删除');
+        toast(t('deleted'));
         await refreshAll();
       }
-    } catch (e) { toast('操作失败: ' + e, 4200); }
+    } catch (e) { toast(t('op_error') + e, 4200); }
     el.disabled = false; el.textContent = old;
   });
 }
@@ -283,20 +321,20 @@ function wire(el) {
 // ===== Trae 设备号设置弹窗（居中模态） =====
 async function openDeviceDialog(p, uid) {
   const mask = document.getElementById('dev-mask');
-  if (!mask) { toast('设备号设置不可用'); return; }
+  if (!mask) { toast(t('dev_unavailable')); return; }
   const body = document.getElementById('dev-body');
-  document.getElementById('dev-desc').textContent = 'Trae 一个设备号一天只能签一个账号，且必须是本机已注册的设备号（否则签到报 9074）。多账号请各用各的号；留空保存 = 自动从本机空闲设备号中挑选。';
-  body.innerHTML = '<div style="padding:14px 0"><span class="spin"></span> 正在读取设备号…</div>';
+  document.getElementById('dev-desc').textContent = t('dev_desc');
+  body.innerHTML = '<div style="padding:14px 0"><span class="spin"></span>' + t('dev_loading') + '</div>';
   mask.style.display = 'flex';
   let local = [];
   try { local = await invoke('trae_local_devices'); } catch {}
   body.innerHTML =
-    (local.length ? '<div style="font-size:12.5px;margin-bottom:8px">本机检测到 ' + local.length + ' 个已注册设备号：</div>' +
+    (local.length ? '<div style="font-size:12.5px;margin-bottom:8px">' + t('dev_local_found', { n: local.length }) + '</div>' +
       '<div style="display:grid;gap:6px;margin-bottom:12px">' +
-      local.map((d, i) => '<label style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer"><input type="radio" name="dev-pick" value="' + esc(d) + '"> <code style="font-size:12.5px">' + esc(d) + '</code><span class="subtle">本机设备 ' + (i + 1) + '</span></label>').join('') +
-      '<label style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer"><input type="radio" name="dev-pick" value=""> <span class="subtle">自动（签到时从空闲设备号中挑选）</span></label></div>'
-    : '<div class="subtle" style="margin-bottom:10px">未检测到本机 Trae 客户端设备号。可在装过 Trae 并登录过的电脑上，从 %APPDATA%\\Trae CN\\User\\globalStorage\\storage.json 里找 iCubeAuthInfo://icube-dc: 开头的键，冒号后的数字即设备号。</div>') +
-    '<input id="dev-manual" type="text" placeholder="手动输入设备号（8~20 位纯数字，可留空）" style="width:100%;padding:9px;border-radius:9px;border:1px solid var(--line);font:inherit;font-size:13px">';
+      local.map((d, i) => '<label style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer"><input type="radio" name="dev-pick" value="' + esc(d) + '"> <code style="font-size:12.5px">' + esc(d) + '</code><span class="subtle">' + t('dev_local_n', { n: i + 1 }) + '</span></label>').join('') +
+      '<label style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer"><input type="radio" name="dev-pick" value=""> <span class="subtle">' + t('dev_auto_option') + '</span></label></div>'
+    : '<div class="subtle" style="margin-bottom:10px">' + t('dev_none_found') + '</div>') +
+    '<input id="dev-manual" type="text" placeholder="' + t('dev_manual_ph') + '" style="width:100%;padding:9px;border-radius:9px;border:1px solid var(--line);font:inherit;font-size:13px">';
   document.getElementById('dev-cancel').onclick = () => { mask.style.display = 'none'; };
   document.getElementById('dev-save').onclick = async () => {
     const picked = (body.querySelector('input[name=dev-pick]:checked') || {}).value;
@@ -304,9 +342,9 @@ async function openDeviceDialog(p, uid) {
     const val = manual || picked || '';
     try {
       await invoke('trae_set_device', { provider: p, uid, deviceId: val });
-      toast(val ? '设备号已设置：' + val : '已清除，签到时自动挑选空闲设备号');
+      toast(val ? t('dev_set_ok') + val : t('dev_cleared'));
       mask.style.display = 'none';
-    } catch (e) { toast('保存失败: ' + e, 4200); }
+    } catch (e) { toast(t('save_failed') + e, 4200); }
   };
 }
 
@@ -318,12 +356,12 @@ function renderCheckin() {
   const confirmN = accs.filter(a => a.status === 'pending').length;
   const attention = accs.filter(a => a.status === 'failed' || a.status === 'needs-action' || a.status === 'auth-expired').length;
   $('#progress-hero').innerHTML =
-    '<div><strong>' + done + ' <span style="font-size:20px;color:var(--subtle)">/ ' + accs.length + '</span></strong><p>当前周期已完成</p>' +
+    '<div><strong>' + done + ' <span style="font-size:20px;color:var(--subtle)">/ ' + accs.length + '</span></strong><p>' + t('cycle_done') + '</p>' +
     '<div class="progress"><span style="width:' + (accs.length ? done / accs.length * 100 : 0) + '%"></span></div></div>' +
-    '<div><b style="font-size:24px">' + pending + '</b><p>等待领取</p></div>' +
-    '<div><b style="font-size:24px">' + confirmN + '</b><p>待确认</p></div>' +
-    '<div><b style="font-size:24px;color:' + (attention ? 'var(--amber)' : 'inherit') + '">' + attention + '</b><p>需要处理</p></div>';
-  const FILTERS = [['all','全部'],['done','已完成'],['pending','等待领取'],['confirm','待确认'],['attention','需要处理']];
+    '<div><b style="font-size:24px">' + pending + '</b><p>' + t('waiting_claim') + '</p></div>' +
+    '<div><b style="font-size:24px">' + confirmN + '</b><p>' + t('st_pending') + '</p></div>' +
+    '<div><b style="font-size:24px;color:' + (attention ? 'var(--amber)' : 'inherit') + '">' + attention + '</b><p>' + t('st_needs_action') + '</p></div>';
+  const FILTERS = [['all', t('filter_all')],['done', t('filter_done')],['pending', t('filter_pending')],['confirm', t('filter_confirm')],['attention', t('filter_attention')]];
   const cnt = k => ({ all: accs.length, done, pending, confirm: confirmN, attention }[k]);
   $('#checkin-filters').innerHTML = FILTERS.map(([k, l]) =>
     '<button data-filter="' + k + '" class="' + (checkinFilter === k ? 'active' : '') + '">' + l + ' <span class="checkin-filter-count">' + cnt(k) + '</span></button>').join('');
@@ -339,29 +377,32 @@ function renderCheckin() {
     }
   };
   const list = accs.filter(match);
-  $('#checkin-list').innerHTML = list.length ? list.map(a =>
-    '<div class="checkin-row" data-provider="' + a.provider + '">' +
+  $('#checkin-list').innerHTML = list.length ? list.map(a => {
+    const q = parseQuota(a);
+    return '<div class="checkin-row" data-provider="' + a.provider + '">' +
     '<div class="checkin-identity">' + picon(a.provider) + '<div><strong>' + esc(platName(a.provider)) + '</strong><small>' + esc(a.name || a.uid.slice(0, 14)) + '</small></div></div>' +
-    '<div><small class="subtle">状态</small><br>' + stInfo(a.status) + '</div>' +
-    '<div><small class="subtle">上次</small><br><span style="font-size:12.5px">' + esc(a.last_checkin ? a.last_checkin.slice(0, 16).replace('T', ' ') : '—') + '</span></div>' +
+    '<div><small class="subtle">' + t('status') + '</small><br>' + stInfo(a.status) + '</div>' +
+    '<div class="single-account-balance"><strong>' + (q && q.remaining != null ? fmt(q.remaining) : '—') + '</strong><small>' + t('available_balance') + (a.message ? ' · ' + esc(a.message) : '') + '</small></div>' +
+    '<div><small class="subtle">' + t('last_time') + '</small><br><span style="font-size:12.5px">' + esc(a.last_checkin ? a.last_checkin.slice(0, 16).replace('T', ' ') : '—') + '</span></div>' +
     '<div style="margin-left:auto;display:flex;gap:6px">' +
-    '<button class="small" data-ck-p="' + esc(a.provider) + '" data-ck-u="' + esc(a.uid) + '">立即签到</button>' +
-    '<button class="small" data-qk-p="' + esc(a.provider) + '" data-qk-u="' + esc(a.uid) + '">刷新额度</button>' +
-    '</div></div>').join('') : '<div class="empty">该筛选下暂无账号</div>';
+    '<button class="small" data-ck-p="' + esc(a.provider) + '" data-ck-u="' + esc(a.uid) + '">' + t('checkin_now') + '</button>' +
+    '<button class="small" data-qk-p="' + esc(a.provider) + '" data-qk-u="' + esc(a.uid) + '">' + t('quota_btn') + '</button>' +
+    '</div></div>';
+  }).join('') : '<div class="empty">' + t('no_accounts_in_filter') + '</div>';
   $$('#checkin-list [data-ck-p]').forEach(b => b.addEventListener('click', async () => {
     b.disabled = true; b.innerHTML = '<span class="spin"></span>';
     try {
       const r = await invoke('checkin', { provider: b.dataset.ckP, uid: b.dataset.ckU, all: false });
       const o = r.results[0];
-      toast((o.status === 'success' ? '领取成功' : o.status === 'already' ? '今日已领取' : o.status) + (o.amount != null ? ' +' + o.amount : ''));
+      toast((o.status === 'success' ? t('claim_ok') : o.status === 'already' ? t('already_claimed') : o.status) + (o.amount != null ? ' +' + o.amount : ''));
       await refreshAll();
-    } catch (e) { toast('失败: ' + e, 4200); }
-    b.disabled = false; b.textContent = '立即签到';
+    } catch (e) { toast(t('failed') + ': ' + e, 4200); }
+    b.disabled = false; b.textContent = t('checkin_now');
   }));
   $$('#checkin-list [data-qk-p]').forEach(b => b.addEventListener('click', async () => {
     b.disabled = true;
-    try { await invoke('quota_refresh', { provider: b.dataset.qkP, uid: b.dataset.qkU }); toast('额度已刷新'); await refreshAll(); }
-    catch (e) { toast('失败: ' + e, 4200); }
+    try { await invoke('quota_refresh', { provider: b.dataset.qkP, uid: b.dataset.qkU }); toast(t('quota_refreshed')); await refreshAll(); }
+    catch (e) { toast(t('failed') + ': ' + e, 4200); }
     b.disabled = false;
   }));
 }
@@ -371,7 +412,7 @@ async function refreshStatistics() {
   const sel = $('#stat-account');
   const accs = SNAP?.accounts || [];
   const cur = sel.value;
-  sel.innerHTML = '<option value="all">全部账号</option>' + accs.map(a =>
+  sel.innerHTML = '<option value="all">' + t('all_accounts') + '</option>' + accs.map(a =>
     '<option value="' + esc(a.provider + '|' + a.uid) + '">' + esc(platName(a.provider) + ' · ' + (a.name || a.uid.slice(0, 10))) + '</option>').join('');
   if (cur) sel.value = cur;
   if (SNAP) await drawStatistics();
@@ -386,29 +427,20 @@ async function drawStatistics() {
     const totalCount = items.reduce((s, i) => s + i.count, 0);
     const successCount = items.reduce((s, i) => s + i.count, 0);
     $('#stat-metrics').innerHTML =
-      '<div><p>期间签到积分</p><strong>' + fmt(totalSum) + '</strong></div>' +
-      '<div><p>记录次数</p><strong>' + totalCount + '</strong></div>' +
-      '<div><p>统计桶数</p><strong>' + items.length + '</strong></div>';
+      '<div><p>' + t('period_points_short') + '</p><strong>' + fmt(totalSum) + '</strong></div>' +
+      '<div><p>' + t('records') + '</p><strong>' + totalCount + '</strong></div>' +
+      '<div><p>' + t('buckets') + '</p><strong>' + items.length + '</strong></div>';
     const el = $('#stat-chart');
     charts.st ||= echarts.init(el);
     charts.st.resize();
     charts.st.setOption({
       tooltip: { trigger: 'axis' },
       grid: { left: 46, right: 14, top: 22, bottom: 28 },
-      xAxis: { type: 'category', data: items.map(i => i.bucket), axisLabel: { fontSize: 10, color: '#7f7d91', rotate: items.length > 12 ? 30 : 0 } },
-      yAxis: { type: 'value', axisLabel: { fontSize: 10, color: '#7f7d91' }, splitLine: { lineStyle: { color: '#eae9f1' } } },
-      series: [{ name: '签到积分', type: 'bar', itemStyle: { color: '#6862ed', borderRadius: 4 }, barMaxWidth: 26, data: items.map(i => Math.round(i.sum * 100) / 100) }],
+      xAxis: { type: 'category', data: items.map(i => i.bucket), axisLabel: { fontSize: 10, color: chartAxisColor(), rotate: items.length > 12 ? 30 : 0 } },
+      yAxis: { type: 'value', axisLabel: { fontSize: 10, color: chartAxisColor() }, splitLine: { lineStyle: { color: chartSplitColor() } } },
+      series: [{ name: t('checkin_points'), type: 'bar', itemStyle: { color: '#6862ed', borderRadius: 4 }, barMaxWidth: 26, data: items.map(i => Math.round(i.sum * 100) / 100) }],
     });
-    // ledger：该账号（或全部）最近记录
-    let rows = SNAP.history || [];
-    if (provider) rows = rows.filter(h => h.provider === provider && (!uid || h.uid === uid));
-    $('#ledger-body').innerHTML = rows.length ? rows.map(h =>
-      '<tr><td style="color:var(--subtle);white-space:nowrap">' + esc((h.at || '').slice(0, 16).replace('T', ' ')) + '</td>' +
-      '<td>' + stInfo(h.status) + '</td>' +
-      '<td style="color:var(--subtle)">' + esc(h.message || '') + '</td>' +
-      '<td style="text-align:right;color:var(--green);font-weight:600">' + (h.amount != null ? '+' + h.amount : '') + '</td></tr>').join('')
-      : '<tr><td colspan="4" style="text-align:center;color:var(--subtle);padding:24px">暂无记录</td></tr>';
-  } catch (e) { toast('统计读取失败: ' + e, 4200); }
+  } catch (e) { toast(t('stat_read_failed') + e, 4200); }
 }
 $$('#stat-period button').forEach(b => b.addEventListener('click', () => {
   statPeriod = b.dataset.period;
@@ -420,16 +452,16 @@ $('#stat-account').addEventListener('change', () => { statAccount = $('#stat-acc
 // ===== 账号路由 + 模型网关 =====
 // 平台清单（与 credit-gateway 的 Platform 对齐；chat 标注是否有对话通道）
 const GW_PLATFORMS = {
-  'workbuddy':        { label: 'WorkBuddy 国内版', provider: 'workbuddy', chat: true },
-  'workbuddy-intl':   { label: 'WorkBuddy 国际版', provider: 'workbuddy-intl', chat: true },
-  'trae':             { label: 'Trae 国内版 (SOLO)', provider: 'trae', chat: true },
-  'trae-enterprise':  { label: 'Trae 企业版', provider: 'trae', chat: true },
-  'trae-global':      { label: 'Trae 国际版', provider: 'trae', chat: true },
-  'zcode':            { label: 'ZCode (智谱)', provider: 'zcode', chat: true },
-  'minimax':          { label: 'MiniMax', provider: 'minimax', chat: true },
-  'qoder':            { label: 'Qoder', provider: 'qoder', chat: true },
-  'codearts':         { label: '华为码道 (IDE)', provider: 'codearts', chat: false },
-  'codearts-desktop': { label: '码道桌面', provider: 'codearts-desktop', chat: false },
+  'workbuddy':        { label: () => t('gw_workbuddy'), provider: 'workbuddy', chat: true },
+  'workbuddy-intl':   { label: () => t('gw_workbuddy_intl'), provider: 'workbuddy-intl', chat: true },
+  'trae':             { label: () => t('gw_trae'), provider: 'trae', chat: true },
+  'trae-enterprise':  { label: () => t('gw_trae_enterprise'), provider: 'trae', chat: true },
+  'trae-global':      { label: () => t('gw_trae_global'), provider: 'trae', chat: true },
+  'zcode':            { label: () => t('gw_zcode'), provider: 'zcode', chat: true },
+  'minimax':          { label: () => t('gw_minimax'), provider: 'minimax', chat: true },
+  'qoder':            { label: () => t('gw_qoder'), provider: 'qoder', chat: true },
+  'codearts':         { label: () => t('gw_codearts'), provider: 'codearts', chat: false },
+  'codearts-desktop': { label: () => t('gw_codearts_desktop'), provider: 'codearts-desktop', chat: false },
 };
 let GW_STATUS = null;
 
@@ -444,15 +476,15 @@ async function refreshGatewayAccounts() {
   if (!box) return;
   const d = await invoke('gateway_accounts').catch(() => null);
   if (!d || !d.accounts?.length) {
-    box.innerHTML = '<div class="empty" style="padding:12px">当前平台（' + esc(d?.platform || '') + '）没有可用账号 —— 请先在账号管理添加</div>';
+    box.innerHTML = '<div class="empty" style="padding:12px">' + t('no_accounts_platform', { p: esc(d?.platform || '') }) + '</div>';
     return;
   }
   box.innerHTML = d.accounts.map(a => {
-    const bal = a.remaining != null ? (' · 余额 ' + fmt(a.remaining)) : '';
+    const bal = a.remaining != null ? (t('balance') + fmt(a.remaining)) : '';
     return '<button class="small gw-acct-pick" data-ref="' + esc(a.ref) + '" style="text-align:left;display:flex;align-items:center;gap:8px;' + (a.active ? 'border-color:var(--accent);background:var(--accent-soft)' : '') + '">' +
       '<span style="font-weight:700;color:' + (a.active ? 'var(--accent)' : 'var(--subtle)') + '">' + (a.active ? '●' : '○') + '</span>' +
       '<span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(a.name || a.uid) + bal + '</span>' +
-      (a.status === 'failed' ? '<span class="subtle" style="color:var(--red)">额度耗尽</span>' : '') + '</button>';
+      (a.status === 'failed' ? '<span class="subtle" style="color:var(--red)">' + t('quota_exhausted') + '</span>' : '') + '</button>';
   }).join('');
   box.querySelectorAll('.gw-acct-pick').forEach(b => b.addEventListener('click', async () => {
     b.disabled = true;
@@ -463,11 +495,11 @@ async function refreshGatewayAccounts() {
       let verify = '';
       try {
         const q = await invoke('quota_refresh', { provider: prov, uid });
-        verify = q.remaining != null ? (' · 余额 ' + fmt(q.remaining)) : '';
-      } catch (e) { verify = ' · 凭据校验失败: ' + String(e).slice(0, 80); }
-      toast('已切换账号（网关请求将使用该账号）' + verify, 4200);
+        verify = q.remaining != null ? (t('balance') + fmt(q.remaining)) : '';
+      } catch (e) { verify = t('cred_check_failed') + String(e).slice(0, 80); }
+      toast(t('switched_account') + verify, 4200);
       await refreshGatewayAccounts();
-    } catch (e) { toast('切换失败: ' + e, 4200); b.disabled = false; }
+    } catch (e) { toast(t('switch_failed') + e, 4200); b.disabled = false; }
   }));
 }
 
@@ -479,12 +511,12 @@ function bindGwSave(btnId, inputId, field) {
     btn.disabled = true;
     try {
       const val = Number(input.value);
-      if (field === 'port' && !(val >= 1 && val <= 65535)) { toast('端口需在 1-65535 之间', 4200); return; }
+      if (field === 'port' && !(val >= 1 && val <= 65535)) { toast(t('port_invalid'), 4200); return; }
       const r = await invoke('gateway_set_limits', { [field]: val });
-      if (field === 'port') toast(r.needsRestart ? '端口已保存 —— 重启应用后生效' : '端口已保存');
-      else toast('速率限制已保存（实时生效）');
+      if (field === 'port') toast(r.needsRestart ? t('port_saved_restart') : t('port_saved'));
+      else toast(t('rate_saved'));
       await refreshGateway();
-    } catch (e) { toast('保存失败: ' + e, 4200); }
+    } catch (e) { toast(t('save_failed') + e, 4200); }
     btn.disabled = false;
   });
 }
@@ -502,30 +534,28 @@ function fmtLogDuration(ms) {
 }
 function buildLogRows(logs) {
   return (logs || []).slice(0, 30).map(l => {
-    const detail = '请求时间 ' + fmtLogTime(l.at) + ' · 耗时 ' + fmtLogDuration(l.duration) + ' · ' + l.platform +
+    const detail = t('log_time') + fmtLogTime(l.at) + t('log_duration') + fmtLogDuration(l.duration) + ' · ' + l.platform +
       (l.account ? ' · ' + l.account : '') + (l.message ? ' · ' + l.message : '');
     return '<div class="route-row" style="font-size:12.5px" title="' + esc(detail) + '">' +
       '<div style="flex:1;min-width:0;display:flex;align-items:center;gap:8px">' +
       '<span style="font-weight:700;flex:0 0 auto">' + (l.ok ? '<span style="color:var(--green,#16a34a)">✓</span>' : '<span style="color:var(--red,#dc2626)">✗</span>') + '</span>' +
-      '<div style="min-width:0"><strong style="font-size:12.5px"><code style="font-size:12px">' + esc(l.model || '(无模型)') + '</code></strong>' +
+      '<div style="min-width:0"><strong style="font-size:12.5px"><code style="font-size:12px">' + esc(l.model || t('no_model')) + '</code></strong>' +
       '<div class="subtle" style="margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' +
-      '请求时间 ' + esc(fmtLogTime(l.at)) +
-      ' · 耗时 ' + esc(fmtLogDuration(l.duration)) +
+      t('log_time') + esc(fmtLogTime(l.at)) +
+      t('log_duration') + esc(fmtLogDuration(l.duration)) +
       ' · ' + esc(l.platform) +
       (l.account ? ' · ' + esc(l.account) : '') + (l.message && !l.ok ? ' · <span style="color:var(--red,#dc2626)">' + esc(l.message) + '</span>' : '') + '</div></div></div>' +
       '</div>';
-  }).join('') || '<div class="empty" style="padding:16px">暂无请求日志</div>';
+  }).join('') || '<div class="empty" style="padding:16px">' + t('no_logs') + '</div>';
 }
 function buildLogStats(st) {
   const s = st?.logStats || { total: 0, ok: 0, fail: 0 };
-  return ' · 最近 ' + Math.min(st?.logs?.length || 0, 30) + ' 条 · 总计 ' + s.total +
-    ' · <span style="color:var(--green,#16a34a)">成功 ' + s.ok + '</span>' +
-    ' · <span style="color:var(--red,#dc2626)">失败 ' + s.fail + '</span>';
+  return t('log_stats', { n: Math.min(st?.logs?.length || 0, 30), t: s.total, ok: s.ok, fail: s.fail });
 }
 
 function renderRouting() {
   const el = $('#route-matrix');
-  if (!GW_STATUS) { el.innerHTML = '<div class="empty">网关状态读取失败</div>'; return; }
+  if (!GW_STATUS) { el.innerHTML = '<div class="empty">' + t('gw_read_failed') + '</div>'; return; }
   const st = GW_STATUS;
   const logStats = st.logStats || { total: 0, ok: 0, fail: 0 };
   const curMeta = GW_PLATFORMS[st.platform] || {};
@@ -536,76 +566,76 @@ function renderRouting() {
     // ===== 网关卡 =====
     '<section class="surface route-card">' +
     '<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">' +
-    '<div style="flex:1;min-width:200px"><h3 style="font-size:14px">本地网关 · OpenAI 兼容接口</h3>' +
+    '<div style="flex:1;min-width:200px"><h3 style="font-size:14px">' + t('gw_title') + '</h3>' +
     '<div style="display:flex;align-items:center;gap:8px;margin-top:8px;flex-wrap:wrap">' +
     '<code style="background:var(--accent-soft);color:var(--accent);padding:8px 14px;border-radius:9px;font-size:13.5px;font-weight:600;max-width:100%;overflow-wrap:anywhere">' + esc(st.baseUrl) + '/v1</code>' +
-    '<button class="small" id="gw-copy-url">复制</button>' +
+    '<button class="small" id="gw-copy-url">' + t('copy') + '</button>' +
     '<span class="subtle" style="font-size:11.5px">GET /v1/models · POST /v1/chat/completions</span></div>' +
-    '<p class="subtle" style="font-size:11.5px;margin-top:8px">模型 id 用 <code>平台/模型</code>；裸模型 id 走当前平台。</p></div></div>' +
+    '<p class="subtle" style="font-size:11.5px;margin-top:8px">' + t('models_follow_platform') + '</p></div></div>' +
     '<div class="route-grid">' +
-    '<div class="route-field"><label class="subtle route-field-label">端口 <span class="route-field-hint">改后需重启应用</span></label>' +
+    '<div class="route-field"><label class="subtle route-field-label">' + t('port') + ' <span class="route-field-hint">' + t('port_restart_hint') + '</span></label>' +
     '<div style="display:flex;gap:6px"><input id="gw-port" type="number" min="1" max="65535" value="' + st.port + '" style="flex:1;min-width:0;padding:7px 10px;border-radius:8px;border:1px solid var(--line);font:inherit">' +
-    '<button id="gw-port-save" class="small primary">保存</button></div></div>' +
-    '<div class="route-field"><label class="subtle route-field-label">速率限制 <span class="route-field-hint">RPM · 0 = 不限</span></label>' +
+    '<button id="gw-port-save" class="small primary">' + t('save') + '</button></div></div>' +
+    '<div class="route-field"><label class="subtle route-field-label">' + t('rate_limit') + ' <span class="route-field-hint">' + t('rate_limit_hint') + '</span></label>' +
     '<div style="display:flex;gap:6px"><input id="gw-rpm" type="number" min="0" value="' + (st.rpm || 0) + '" style="flex:1;min-width:0;padding:7px 10px;border-radius:8px;border:1px solid var(--line);font:inherit">' +
-    '<button id="gw-rpm-save" class="small primary">保存</button></div></div>' +
-    '<div class="route-field"><label class="subtle route-field-label">仅允许当前平台</label>' +
+    '<button id="gw-rpm-save" class="small primary">' + t('save') + '</button></div></div>' +
+    '<div class="route-field"><label class="subtle route-field-label">' + t('strict_current_only') + '</label>' +
     '<div style="display:flex;align-items:center;gap:10px;margin-top:6px"><label class="switch"><input type="checkbox" id="gw-strict" ' + (st.strict !== false ? 'checked' : '') + '><span class="track"><span class="knob"></span></span></label>' +
-    '<span class="subtle" style="font-size:11px">开启后跨平台请求被 403 拒绝</span></div></div>' +
+    '<span class="subtle" style="font-size:11px">' + t('strict_hint') + '</span></div></div>' +
     '</div></section>' +
 
     // ===== 请求平台卡（全部整合进下拉框）=====
     '<section class="surface route-card">' +
     '<div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap">' +
-    '<h3 style="font-size:14px">请求平台 <span class="subtle" style="font-size:11.5px;font-weight:400">裸模型 id 的默认路由</span></h3>' +
+    '<h3 style="font-size:14px">' + t('request_platform') + ' <span class="subtle" style="font-size:11.5px;font-weight:400">' + t('bare_model_hint') + '</span></h3>' +
     '<select id="route-plat-select" style="padding:8px 12px;border-radius:9px;border:1px solid var(--line);font:inherit;min-width:0;flex:1 1 220px;max-width:100%">' +
-    Object.entries(GW_PLATFORMS).map(([name, meta]) => '<option value="' + name + '"' + (st.platform === name ? ' selected' : '') + '>' + esc(meta.label) + ' · ' + ((st.accounts || {})[name] || 0) + ' 账号' + (meta.chat ? '' : '（仅签到）') + '</option>').join('') +
+    Object.entries(GW_PLATFORMS).map(([name, meta]) => '<option value="' + name + '"' + (st.platform === name ? ' selected' : '') + '>' + esc(meta.label()) + ' · ' + t('n_accounts_suffix', { n: (st.accounts || {})[name] || 0 }) + (meta.chat ? '' : t('signin_only')) + '</option>').join('') +
     '</select></div>' +
     '<div style="display:flex;align-items:center;gap:12px;margin-top:14px;padding:12px 14px;background:var(--accent-soft,#eef6ff);border-radius:11px">' +
     picon(st.platform) +
-    '<div style="flex:1"><strong style="font-size:13.5px">' + esc(curMeta.label || st.platform) + '</strong>' +
-    '<div class="subtle" style="margin-top:3px;font-size:12px">provider：' + esc(curMeta.provider || st.platform) + ' · 可用账号 <b>' + ((st.accounts || {})[st.platform] || 0) + '</b> 个' +
-    (curMeta.chat ? '' : ' · 无公开对话协议，网关暂不代理') + '</div></div>' +
-    '<span class="tag" style="background:var(--accent);color:#fff">当前</span></div>' +
+    '<div style="flex:1"><strong style="font-size:13.5px">' + esc(curMeta.label ? curMeta.label() : st.platform) + '</strong>' +
+    '<div class="subtle" style="margin-top:3px;font-size:12px">' + t('provider_label') + esc(curMeta.provider || st.platform) + ' · ' + t('available_accounts', { n: (st.accounts || {})[st.platform] || 0 }) +
+    (curMeta.chat ? '' : t('no_chat_protocol')) + '</div></div>' +
+    '<span class="tag" style="background:var(--accent);color:#fff">' + t('current') + '</span></div>' +
     '</section>' +
 
     // ===== 账号切换卡 =====
     '<section class="surface route-card">' +
     '<div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap">' +
-    '<h3 style="font-size:14px">账号切换 <span class="subtle" style="font-size:11.5px;font-weight:400">当前平台 · 点击即切换本地账号</span></h3>' +
-    '<button id="gw-acct-next" class="small primary">↻ 一键切换下一个</button></div>' +
-    '<div id="gw-acct-list" style="display:grid;gap:6px;margin-top:12px"><span class="subtle">加载中…</span></div>' +
+    '<h3 style="font-size:14px">' + t('account_switch') + ' <span class="subtle" style="font-size:11.5px;font-weight:400">' + t('account_switch_hint') + '</span></h3>' +
+    '<button id="gw-acct-next" class="small primary">' + t('switch_next') + '</button></div>' +
+    '<div id="gw-acct-list" style="display:grid;gap:6px;margin-top:12px"><span class="subtle">' + t('loading') + '</span></div>' +
     '</section>' +
 
     // ===== 模型测试卡 =====
     '<section class="surface route-card">' +
     '<div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap">' +
-    '<h3 style="font-size:14px">模型测试 <span class="subtle" style="font-size:11.5px;font-weight:400">请求经本地网关转发到对应平台</span></h3>' +
-    '<button id="gw-test-refresh" class="small">刷新模型</button></div>' +
+    '<h3 style="font-size:14px">' + t('model_test') + ' <span class="subtle" style="font-size:11.5px;font-weight:400">' + t('model_test_hint') + '</span></h3>' +
+    '<button id="gw-test-refresh" class="small">' + t('refresh_models') + '</button></div>' +
     '<div style="display:flex;gap:8px;margin-top:12px;align-items:center;flex-wrap:wrap">' +
-    '<select id="gw-test-model" style="flex:1 1 240px;min-width:0;max-width:100%;padding:8px 12px;border-radius:9px;border:1px solid var(--line);font:inherit"><option value="">（点击「刷新模型」获取当前平台模型）</option></select>' +
+    '<select id="gw-test-model" style="flex:1 1 240px;min-width:0;max-width:100%;padding:8px 12px;border-radius:9px;border:1px solid var(--line);font:inherit"><option value="">' + t('model_placeholder') + '</option></select>' +
     '</div>' +
-    '<textarea id="gw-test-msg" rows="2" placeholder="输入测试消息，如：你好，请介绍一下你自己" style="width:100%;margin-top:10px;padding:10px 12px;border-radius:9px;border:1px solid var(--line);font:inherit;resize:vertical"></textarea>' +
+    '<textarea id="gw-test-msg" rows="2" placeholder="' + t('test_msg_placeholder') + '" style="width:100%;margin-top:10px;padding:10px 12px;border-radius:9px;border:1px solid var(--line);font:inherit;resize:vertical"></textarea>' +
     '<div style="display:flex;align-items:center;gap:10px;margin-top:10px">' +
-    '<button id="gw-test-send" class="small primary">发送测试</button>' +
+    '<button id="gw-test-send" class="small primary">' + t('send_test') + '</button>' +
     '<span id="gw-test-status" class="subtle" style="font-size:12px"></span></div>' +
     '<div id="gw-test-result" style="margin-top:12px;padding:12px 14px;border-radius:11px;background:var(--surface-2,#f7f7fa);min-height:44px;font-size:13px;white-space:pre-wrap;word-break:break-word;display:none"></div>' +
     '</section>' +
 
     // ===== 请求日志卡 =====
     '<section class="surface route-card">' +
-    '<div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px"><h3 style="font-size:14px">请求日志' +
+    '<div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px"><h3 style="font-size:14px">' + t('request_log') +
     '<span class="subtle" id="gw-logs-stats" style="font-size:11.5px;font-weight:400">' + buildLogStats(st) + '</span></h3>' +
     '<div style="display:flex;align-items:center;gap:8px">' +
-    '<button id="gw-logs-refresh" class="small">刷新</button>' +
-    ((logStats.total || 0) > 0 ? '<button id="gw-logs-clear" class="small danger-ghost">清空日志</button>' : '') + '</div></div>' +
+    '<button id="gw-logs-refresh" class="small">' + t('refresh') + '</button>' +
+    ((logStats.total || 0) > 0 ? '<button id="gw-logs-clear" class="small danger-ghost">' + t('clear_log') + '</button>' : '') + '</div></div>' +
     '<div id="gw-logs-list" style="margin-top:10px">' + logRows + '</div></section>';
 
   // ===== 账号切换卡 =====
   refreshGatewayAccounts();
   el.querySelector('#gw-acct-next')?.addEventListener('click', async () => {
     const d = await invoke('gateway_accounts').catch(() => null);
-    if (!d || !d.accounts?.length) { toast('当前平台没有可用账号'); return; }
+    if (!d || !d.accounts?.length) { toast(t('no_accounts_current')); return; }
     const cur = d.accounts.findIndex(a => a.active);
     const next = d.accounts[(cur + 1) % d.accounts.length];
     try {
@@ -613,16 +643,16 @@ function renderRouting() {
       // 同步拉余额验证新账号
       const [prov, uid] = next.ref.split(':');
       let verify = '';
-      try { const q = await invoke('quota_refresh', { provider: prov, uid }); verify = q.remaining != null ? (' · 余额 ' + fmt(q.remaining)) : ''; }
-      catch (e) { verify = ' · 凭据校验失败: ' + String(e).slice(0, 80); }
-      toast('已切换账号：' + next.name + verify, 4200);
+      try { const q = await invoke('quota_refresh', { provider: prov, uid }); verify = q.remaining != null ? (t('balance') + fmt(q.remaining)) : ''; }
+      catch (e) { verify = t('cred_check_failed') + String(e).slice(0, 80); }
+      toast(t('switched_account') + next.name + verify, 4200);
       await refreshGatewayAccounts();
-    } catch (e) { toast('切换失败: ' + e, 4200); }
+    } catch (e) { toast(t('switch_failed') + e, 4200); }
   });
 
   // ===== 绑定 =====
   el.querySelector('#gw-copy-url')?.addEventListener('click', async () => {
-    try { await navigator.clipboard.writeText(st.baseUrl + '/v1'); toast('接口地址已复制'); } catch (e) { toast('复制失败: ' + e); }
+    try { await navigator.clipboard.writeText(st.baseUrl + '/v1'); toast(t('copied_url')); } catch (e) { toast(t('copy_failed') + e); }
   });
   const platSelect = el.querySelector('#route-plat-select');
   if (platSelect) platSelect.addEventListener('change', async () => {
@@ -631,27 +661,27 @@ function renderRouting() {
     try {
       // 切换前检查客户端是否运行，未运行自动启动
       const er = await invoke('platform_ensure_running', { platform: p }).catch(() => null);
-      if (er && er.launched) toast((GW_PLATFORMS[p]?.label || p) + ' 客户端未运行 —— 已自动启动');
+      if (er && er.launched) toast(t('client_not_running', { p: GW_PLATFORMS[p] ? GW_PLATFORMS[p].label() : p }));
       await invoke('gateway_set_platform', { platform: p });
-      toast('已切换请求平台：' + (GW_PLATFORMS[p]?.label || p));
+      toast(t('switched_platform') + (GW_PLATFORMS[p] ? GW_PLATFORMS[p].label() : p));
       await refreshGateway(); renderRouting();
-    } catch (e) { toast('切换失败: ' + e, 4200); renderRouting(); }
+    } catch (e) { toast(t('switch_failed') + e, 4200); renderRouting(); }
   });
   // 请求日志刷新：只重取最新日志并就地更新列表/统计，不重渲染整页（保留输入状态）
   const refreshLogsBtn = el.querySelector('#gw-logs-refresh');
   if (refreshLogsBtn) refreshLogsBtn.addEventListener('click', async () => {
     refreshLogsBtn.disabled = true;
     const old = refreshLogsBtn.textContent;
-    refreshLogsBtn.textContent = '刷新中…';
+    refreshLogsBtn.textContent = t('refreshing_logs');
     try {
       await refreshGateway();
-      if (!GW_STATUS) { toast('网关状态读取失败', 4200); return; }
+      if (!GW_STATUS) { toast(t('gw_read_failed'), 4200); return; }
       const listEl = el.querySelector('#gw-logs-list');
       const statsEl = el.querySelector('#gw-logs-stats');
       if (listEl) listEl.innerHTML = buildLogRows(GW_STATUS.logs);
       if (statsEl) statsEl.innerHTML = buildLogStats(GW_STATUS);
-      toast('已刷新请求日志');
-    } catch (e) { toast('刷新失败: ' + e, 4200); }
+      toast(t('logs_refreshed'));
+    } catch (e) { toast(t('refresh_failed') + e, 4200); }
     finally {
       refreshLogsBtn.disabled = false;
       refreshLogsBtn.textContent = old;
@@ -659,13 +689,13 @@ function renderRouting() {
   });
   const clearBtn = el.querySelector('#gw-logs-clear');
   if (clearBtn) clearBtn.addEventListener('click', async () => {
-    if (!await confirmBox('清空请求日志', '确定清空全部请求日志？此操作不可恢复。', { okText: '清空', danger: true })) return;
+    if (!await confirmBox(t('clear_logs_title'), t('clear_logs_msg'), { okText: t('clear_btn'), danger: true })) return;
     clearBtn.disabled = true;
     try {
       const r = await invoke('gateway_clear_logs');
-      toast('已清空 ' + (r.cleared || 0) + ' 条日志');
+      toast(t('cleared_n', { n: r.cleared || 0 }));
       await refreshGateway(); renderRouting();
-    } catch (e) { toast('清空失败: ' + e, 4200); }
+    } catch (e) { toast(t('clear_failed') + e, 4200); }
     clearBtn.disabled = false;
   });
   bindGwSave('gw-port-save', 'gw-port', 'port');
@@ -675,9 +705,9 @@ function renderRouting() {
     strictChk.disabled = true;
     try {
       await invoke('gateway_set_limits', { strict: strictChk.checked });
-      toast('已' + (strictChk.checked ? '开启' : '关闭') + '「仅允许当前平台」');
+      toast(strictChk.checked ? t('strict_on') : t('strict_off'));
       await refreshGateway();
-    } catch (e) { strictChk.checked = !strictChk.checked; toast('设置失败: ' + e, 4200); }
+    } catch (e) { strictChk.checked = !strictChk.checked; toast(t('set_failed') + e, 4200); }
     strictChk.disabled = false;
   });
 
@@ -686,37 +716,37 @@ function renderRouting() {
   const statusEl = el.querySelector('#gw-test-status');
   const resultEl = el.querySelector('#gw-test-result');
   const fetchModels = async () => {
-    statusEl.textContent = '获取模型中…';
+    statusEl.textContent = t('fetching_models');
     try {
       const r = await fetch(st.baseUrl + '/v1/models').then(x => x.json());
-      // /v1/models 返回全平台目录：当前平台为裸 id，其它平台为「平台/模型」——直接用 id 作为请求模型
+      // /v1/models 只返回当前请求平台的模型（跟随「请求平台」下拉框）——直接用返回的 id 作为请求模型
       const models = (r.data || []).map(m => m.id).filter(Boolean);
       if (!models.length) {
-        modelSel.innerHTML = '<option value="">（无可用模型）</option>';
+        modelSel.innerHTML = '<option value="">' + t('no_models') + '</option>';
         // 码道：STS 可能过期 —— 提供一键同步客户端最新会话
         if (st.platform === 'codearts' || st.platform === 'codearts-desktop') {
-          statusEl.innerHTML = '码道凭据可能已过期（客户端 refresh 会轮换 STS） <button id="gw-ca-sync" class="small primary" style="margin-left:6px">从客户端同步最新会话</button>';
+          statusEl.innerHTML = t('codearts_expired') + '<button id="gw-ca-sync" class="small primary" style="margin-left:6px">' + t('sync_from_client') + '</button>';
           statusEl.querySelector('#gw-ca-sync')?.addEventListener('click', async (ev) => {
-            ev.target.disabled = true; ev.target.textContent = '同步中…';
+            ev.target.disabled = true; ev.target.textContent = t('syncing');
             try {
               const sr = await invoke('codearts_sync_local');
               if (sr.synced?.length) {
-                toast('已同步 ' + sr.synced.join(' / ') + ' 的最新凭据');
+                toast(t('sync_ok', { names: sr.synced.join(' / ') }));
                 fetchModels();
               } else {
-                toast('客户端里没有登录态 —— 请先在码道客户端登录，或在账号管理「扫描本机」导入');
+                toast(t('sync_no_login'));
               }
-            } catch (e) { toast('同步失败: ' + e, 4200); }
-            ev.target.disabled = false; ev.target.textContent = '从客户端同步最新会话';
+            } catch (e) { toast(t('sync_failed') + e, 4200); }
+            ev.target.disabled = false; ev.target.textContent = t('sync_from_client');
           });
         } else {
-          statusEl.textContent = '该平台没有可用账号或凭据失效 —— 到账号管理检查';
+          statusEl.textContent = t('no_accounts_or_expired');
         }
         return;
       }
       modelSel.innerHTML = models.map(m => '<option value="' + esc(m) + '">' + esc(m) + '</option>').join('');
-      statusEl.textContent = models.length + ' 个模型';
-    } catch (e) { statusEl.textContent = '获取失败: ' + e; }
+      statusEl.textContent = t('n_models', { n: models.length });
+    } catch (e) { statusEl.textContent = t('fetch_models_failed') + e; }
   };
   el.querySelector('#gw-test-refresh')?.addEventListener('click', fetchModels);
   // 进页面自动获取一次
@@ -725,13 +755,13 @@ function renderRouting() {
     const model = modelSel.value;
     const msg = (el.querySelector('#gw-test-msg')?.value || '').trim();
     const sendBtn = el.querySelector('#gw-test-send');
-    if (!model) { toast('请先获取并选择模型', 4200); return; }
-    if (!msg) { toast('请输入测试消息', 4200); return; }
+    if (!model) { toast(t('select_model_first'), 4200); return; }
+    if (!msg) { toast(t('input_test_msg'), 4200); return; }
     sendBtn.disabled = true;
-    statusEl.textContent = '请求中…';
+    statusEl.textContent = t('requesting');
     resultEl.style.display = 'block';
     resultEl.style.color = 'var(--subtle,#7f7d91)';
-    resultEl.textContent = '等待平台响应…（均衡/极致档为深度推理模型，响应可能需要 1-2 分钟）';
+    resultEl.textContent = t('waiting_response');
     const t0 = Date.now();
     try {
       const resp = await fetch(st.baseUrl + '/v1/chat/completions', {
@@ -743,21 +773,21 @@ function renderRouting() {
       const secs = ((Date.now() - t0) / 1000).toFixed(1);
       if (data.error) {
         resultEl.style.color = 'var(--red,#dc2626)';
-        resultEl.textContent = '✗ 失败（' + secs + 's）：' + (data.error.message || JSON.stringify(data.error));
+        resultEl.textContent = t('test_failed', { s: secs }) + (data.error.message || JSON.stringify(data.error));
         statusEl.textContent = '';
       } else {
         const content = data.choices?.[0]?.message?.content || JSON.stringify(data).slice(0, 500);
         const u = data.usage || {};
         const comp = u.completion_tokens ?? 0;
         const speed = comp > 0 && Number(secs) > 0 ? (comp / Number(secs)).toFixed(1) + ' tok/s' : '—';
-        const usage = u.total_tokens != null ? ' · tokens 输入 ' + (u.prompt_tokens ?? 0) + ' + 输出 ' + comp + ' = ' + u.total_tokens + ' · 输出速度 ' + speed : '';
+        const usage = u.total_tokens != null ? t('usage_tokens', { in: u.prompt_tokens ?? 0, out: comp, total: u.total_tokens }) + speed : '';
         resultEl.style.color = 'var(--ink,#25252f)';
-        resultEl.textContent = '✓ ' + model + '（' + secs + 's' + usage + '）：\n\n' + content;
+        resultEl.textContent = t('test_ok', { model, s: secs, usage }) + '\n\n' + content;
         statusEl.textContent = '';
       }
     } catch (e) {
       resultEl.style.color = 'var(--red,#dc2626)';
-      resultEl.textContent = '✗ 请求异常：' + e;
+      resultEl.textContent = t('request_error') + e;
       statusEl.textContent = '';
     }
     sendBtn.disabled = false;
@@ -766,16 +796,16 @@ function renderRouting() {
 function showRuleModal() {
   const accs = SNAP?.accounts || [];
   const accOptions = accs.map(a => '<option value="' + esc(a.provider + ':' + a.uid) + '">' + esc(platName(a.provider) + ' · ' + (a.name || a.uid.slice(0, 10))) + '</option>').join('');
-  const platOptions = Object.entries(GW_PLATFORMS).map(([k, v]) => '<option value="' + k + '">' + esc(v.label) + '</option>').join('');
+  const platOptions = Object.entries(GW_PLATFORMS).map(([k, v]) => '<option value="' + k + '">' + esc(v.label()) + '</option>').join('');
   const mask = document.createElement('div');
   mask.className = 'modal-mask'; mask.style.display = 'flex';
-  mask.innerHTML = '<div class="modal"><h3>新建路由规则</h3>' +
-    '<div class="desc">模型前缀命中的请求固定路由到指定平台/账号；留空表示跟随当前平台。</div>' +
+  mask.innerHTML = '<div class="modal"><h3>' + t('rule_modal_title') + '</h3>' +
+    '<div class="desc">' + t('rule_modal_desc') + '</div>' +
     '<div style="display:grid;gap:10px;margin:12px 0">' +
-    '<label class="subtle">模型前缀（* 匹配全部）<input id="rule-model" placeholder="如 workbuddy/glm-5.3-flash 或 *" style="width:100%;padding:8px;border-radius:9px;border:1px solid var(--line);font:inherit"></label>' +
-    '<label class="subtle">目标平台<select id="rule-platform" style="width:100%;padding:8px;border-radius:9px;border:1px solid var(--line);font:inherit"><option value="">跟随当前平台</option>' + platOptions + '</select></label>' +
-    '<label class="subtle">指定账号（可选）<select id="rule-account" style="width:100%;padding:8px;border-radius:9px;border:1px solid var(--line);font:inherit"><option value="">平台内默认选号</option>' + accOptions + '</select></label>' +
-    '</div><div class="foot"><button id="rule-cancel">取消</button><button id="rule-save" class="primary">保存</button></div></div>';
+    '<label class="subtle">' + t('rule_model_prefix') + '<input id="rule-model" placeholder="' + t('rule_model_ph') + '" style="width:100%;padding:8px;border-radius:9px;border:1px solid var(--line);font:inherit"></label>' +
+    '<label class="subtle">' + t('rule_target_platform') + '<select id="rule-platform" style="width:100%;padding:8px;border-radius:9px;border:1px solid var(--line);font:inherit"><option value="">' + t('rule_follow_platform') + '</option>' + platOptions + '</select></label>' +
+    '<label class="subtle">' + t('rule_account') + '<select id="rule-account" style="width:100%;padding:8px;border-radius:9px;border:1px solid var(--line);font:inherit"><option value="">' + t('rule_default_account') + '</option>' + accOptions + '</select></label>' +
+    '</div><div class="foot"><button id="rule-cancel">' + t('cancel') + '</button><button id="rule-save" class="primary">' + t('save') + '</button></div></div>';
   document.body.appendChild(mask);
   mask.querySelector('#rule-cancel').addEventListener('click', () => mask.remove());
   mask.querySelector('#rule-save').addEventListener('click', async () => {
@@ -784,10 +814,10 @@ function showRuleModal() {
     const account = mask.querySelector('#rule-account').value;
     try {
       await invoke('gateway_add_rule', { modelPattern, platform, account, weight: 1, enabled: true });
-      toast('规则已保存');
+      toast(t('rule_saved'));
       mask.remove();
       await refreshGateway(); renderRouting();
-    } catch (e) { toast('保存失败: ' + e, 4200); }
+    } catch (e) { toast(t('save_failed') + e, 4200); }
   });
 }
 
@@ -802,41 +832,56 @@ function renderSettings() {
   if (footer) footer.style.display = (tab === 'data') ? 'flex' : 'none';
   if (tab === 'tasks') {
     body.innerHTML = '<div class="task-settings"><div>' +
-      '<div class="setting-row"><div><h3>自动签到</h3><p>每个平台仅为已启用自动签到的账号执行任务。</p></div>' + sw('auto', settingsDraft.auto) + '</div>' +
-      '<div class="setting-row"><div><h3>错过时间后补跑</h3><p>启动、唤醒或修改时间后检查当前周期。</p></div>' + sw('catchup', settingsDraft.catchup) + '</div>' +
-      '<div class="setting-row"><div><h3>余额刷新间隔</h3><p>仅查询额度，不消耗模型调用。</p></div>' +
-      '<select data-set="refreshMinutes"><option value="30"' + (settingsDraft.refreshMinutes === 30 ? ' selected' : '') + '>30分钟</option>' +
-      '<option value="60"' + (settingsDraft.refreshMinutes === 60 ? ' selected' : '') + '>60分钟</option>' +
-      '<option value="120"' + (settingsDraft.refreshMinutes === 120 ? ' selected' : '') + '>120分钟</option></select></div>' +
-      '<div class="setting-row"><div><h3>计划时间</h3><p>每天执行的北京时间（随机模式忽略）。</p></div>' +
+      '<div class="setting-row"><div><h3>' + t('auto_checkin') + '</h3><p>' + t('auto_checkin_desc') + '</p></div>' + sw('auto', settingsDraft.auto) + '</div>' +
+      '<div class="setting-row"><div><h3>' + t('catchup') + '</h3><p>' + t('catchup_desc') + '</p></div>' + sw('catchup', settingsDraft.catchup) + '</div>' +
+      '<div class="setting-row"><div><h3>' + t('refresh_interval') + '</h3><p>' + t('refresh_interval_desc') + '</p></div>' +
+      '<select data-set="refreshMinutes"><option value="30"' + (settingsDraft.refreshMinutes === 30 ? ' selected' : '') + '>' + t('m30') + '</option>' +
+      '<option value="60"' + (settingsDraft.refreshMinutes === 60 ? ' selected' : '') + '>' + t('m60') + '</option>' +
+      '<option value="120"' + (settingsDraft.refreshMinutes === 120 ? ' selected' : '') + '>' + t('m120') + '</option></select></div>' +
+      '<div class="setting-row"><div><h3>' + t('sched_time') + '</h3><p>' + t('sched_time_desc') + '</p></div>' +
       '<input type="time" data-set="time" value="' + esc(settingsDraft.time) + '" style="padding:7px 10px;border-radius:9px;border:1px solid var(--line);font:inherit">' +
-      '<label class="switch" title="随机时间"><input type="checkbox" data-setb="randomTime" ' + (settingsDraft.randomTime ? 'checked' : '') + '><span class="track"><span class="knob"></span></span></label></div>' +
-      '</div><div class="settings-preview"><h3 class="spaced" style="margin-bottom:6px">执行预览 · 保存后生效</h3>' +
-      '<p class="subtle">当前已保存时间：' + esc(SETTINGS.randomTime ? '随机' : SETTINGS.time) + '。</p>' +
-      (SNAP?.accounts || []).slice(0, 8).map(a => '<div class="preview-row">' + picon(a.provider) + '<strong>' + esc(platName(a.provider)) + '</strong><span class="subtle" style="margin-left:auto">每天 ' + esc(settingsDraft.randomTime ? '随机' : settingsDraft.time) + '</span></div>').join('') +
-      '<p class="notice">所有平台均按你保存的北京时间执行。开启补跑后，会检查已错过计划时间的账号。已领取账号会跳过。</p>' +
+      '<label class="switch" title="' + t('random_time') + '"><input type="checkbox" data-setb="randomTime" ' + (settingsDraft.randomTime ? 'checked' : '') + '><span class="track"><span class="knob"></span></span></label></div>' +
+      '</div><div class="settings-preview"><h3 class="spaced" style="margin-bottom:6px">' + t('exec_preview') + '</h3>' +
+      '<p class="subtle">' + t('saved_time_is', { v: esc(SETTINGS.randomTime ? t('random') : SETTINGS.time) }) + '</p>' +
+      (SNAP?.accounts || []).slice(0, 8).map(a => '<div class="preview-row">' + picon(a.provider) + '<strong>' + esc(platName(a.provider)) + '</strong><span class="subtle" style="margin-left:auto">' + t('every_day', { v: esc(settingsDraft.randomTime ? t('random') : settingsDraft.time) }) + '</span></div>').join('') +
+      '<p class="notice">' + t('notice_beijing') + '</p>' +
       '</div></div>';
   } else if (tab === 'tools') {
     renderToolsTab(body);
   } else if (tab === 'general') {
+    const loc = (window.I18n && I18n.getLocale()) || 'zh-CN';
     body.innerHTML =
-      '<div class="setting-row"><div><h3>基础使用统计</h3><p>仅上报随机安装标识、版本、日期与运行状态，不上传平台凭据。</p></div>' + sw('telemetry', settingsDraft.telemetry) + '</div>' +
-      '<p class="notice">平台账号、凭据及积分历史保存在本机，不上传任何凭据。</p>';
+      '<div class="setting-row"><div><h3>' + t('language') + '</h3><p>' + t('language_desc') + '</p></div>' +
+      '<select id="locale-select"><option value="zh-CN"' + (loc === 'zh-CN' ? ' selected' : '') + '>' + t('lang_zh') + '</option>' +
+      '<option value="en-US"' + (loc === 'en-US' ? ' selected' : '') + '>' + t('lang_en') + '</option></select></div>' +
+      '<div class="setting-row"><div><h3>' + t('appearance') + '</h3><p>' + t('appearance_desc') + '</p></div>' +
+      '<select id="theme-select"><option value="system"' + (THEME_MODE === 'system' ? ' selected' : '') + '>' + t('theme_system') + '</option>' +
+      '<option value="light"' + (THEME_MODE === 'light' ? ' selected' : '') + '>' + t('theme_light') + '</option>' +
+      '<option value="dark"' + (THEME_MODE === 'dark' ? ' selected' : '') + '>' + t('theme_dark') + '</option></select></div>' +
+      '<div class="setting-row"><div><h3>' + t('base_usage_stats') + '</h3><p>' + t('base_usage_desc') + '</p></div>' + sw('telemetry', settingsDraft.telemetry) + '</div>' +
+      '<p class="notice">' + t('privacy_notice') + '</p>';
+    const locSel = body.querySelector('#locale-select');
+    if (locSel) locSel.addEventListener('change', () => {
+      if (window.I18n) I18n.setLocale(locSel.value);
+      renderSettings(); // 用新语言重绘当前 tab
+    });
+    const themeSel = body.querySelector('#theme-select');
+    if (themeSel) themeSel.addEventListener('change', () => { applyTheme(themeSel.value, true); });
   } else {
     body.innerHTML =
-      '<div class="setting-row"><div><h3>AI路由助手 <span id="ver-current">…</span></h3><p>Rust + Tauri 实现 · 数据库：credit.sqlite（本机）</p></div><span class="tag">本地版</span></div>' +
-      '<div class="setting-row"><div><h3>软件更新</h3><p id="upd-status">检查 GitHub Releases 最新版本…</p></div>' +
+      '<div class="setting-row"><div><h3>' + t('app_name') + ' <span id="ver-current">…</span></h3><p>' + t('app_version') + '</p></div><span class="tag">' + t('local_edition') + '</span></div>' +
+      '<div class="setting-row"><div><h3>' + t('software_update') + '</h3><p id="upd-status">' + t('checking_release') + '</p></div>' +
       '<div class="actions" style="display:flex;gap:6px;align-items:center;justify-content:flex-end;flex-shrink:0">' +
       '<span class="subtle" id="upd-progress"></span>' +
-      '<button id="upd-check" class="small">重新检查</button>' +
-      '<button id="upd-download" class="small primary" style="display:none">下载更新</button>' +
-      '<button id="upd-install" class="small primary" style="display:none">重启并安装</button>' +
+      '<button id="upd-check" class="small">' + t('recheck') + '</button>' +
+      '<button id="upd-download" class="small primary" style="display:none">' + t('download_update') + '</button>' +
+      '<button id="upd-install" class="small primary" style="display:none">' + t('restart_install') + '</button>' +
       '</div></div>' +
-      '<div class="setting-row"><div><h3>数据目录</h3><p>%APPDATA%/credit-rs/credit.sqlite · 平台凭据经系统密钥加密</p></div>' +
-      '<button data-open-db class="small">打开目录</button></div>' +
-      '<p class="notice">数据库升级前会备份；导出记录不包含凭据。更新包下载后需手动点击「重启并安装」（静默安装）。</p>';
+      '<div class="setting-row"><div><h3>' + t('data_dir') + '</h3><p>' + t('data_dir_desc') + '</p></div>' +
+      '<button data-open-db class="small">' + t('open_dir') + '</button></div>' +
+      '<p class="notice">' + t('db_notice') + '</p>';
     body.querySelector('[data-open-db]').addEventListener('click', async () => {
-      try { await invoke('account_list_all'); toast('账号数据记录 ' + (SNAP?.accounts?.length || 0) + ' 条'); } catch {}
+      try { await invoke('account_list_all'); toast(t('accounts_records', { n: SNAP?.accounts?.length || 0 })); } catch {}
     });
     // ===== 自动更新流程 =====
     (async () => {
@@ -847,35 +892,35 @@ function renderSettings() {
       let updateInfo = null;
       const run = async () => {
         try {
-          statusEl.textContent = '检查更新中…';
+          statusEl.textContent = t('checking_update');
           updateInfo = await invoke('check_update');
           body.querySelector('#ver-current').textContent = 'v' + updateInfo.currentVersion;
           if (updateInfo.updateAvailable) {
-            statusEl.innerHTML = '发现新版本 <b>v' + esc(updateInfo.latestVersion) + '</b>（当前 v' + esc(updateInfo.currentVersion) + '）';
+            statusEl.innerHTML = t('new_version_found', { latest: esc(updateInfo.latestVersion), current: esc(updateInfo.currentVersion) });
             if (updateInfo.assetUrl) {
               dlBtn.style.display = '';
             } else {
-              statusEl.innerHTML += ' · <a href="' + esc(updateInfo.releaseUrl) + '" target="_blank" style="color:var(--accent)">前往 Release 页下载</a>';
+              statusEl.innerHTML += ' · <a href="' + esc(updateInfo.releaseUrl) + '" target="_blank" style="color:var(--accent)">' + t('goto_release') + '</a>';
             }
           } else {
-            statusEl.textContent = '已是最新版本 v' + updateInfo.currentVersion;
+            statusEl.textContent = t('already_latest', { v: updateInfo.currentVersion });
           }
-        } catch (e) { statusEl.textContent = '检查失败: ' + e; }
+        } catch (e) { statusEl.textContent = t('check_failed') + e; }
       };
       run();
       body.querySelector('#upd-check')?.addEventListener('click', run);
       dlBtn?.addEventListener('click', async () => {
         if (!updateInfo?.assetUrl) return;
-        dlBtn.disabled = true; dlBtn.textContent = '下载中…';
+        dlBtn.disabled = true; dlBtn.textContent = t('downloading');
         progEl.textContent = '';
         try {
           const r = await invoke('download_update', { url: updateInfo.assetUrl });
           window.__updFile = r.file;
           instBtn.style.display = '';
           dlBtn.style.display = 'none';
-          toast('下载完成（' + Math.round(r.bytes / 1024 / 1024) + ' MB）— 点击「重启并安装」');
-        } catch (e) { toast('下载失败: ' + e, 5000); }
-        dlBtn.disabled = false; dlBtn.textContent = '下载更新';
+          toast(t('download_done_toast', { mb: Math.round(r.bytes / 1024 / 1024) }));
+        } catch (e) { toast(t('download_failed') + e, 5000); }
+        dlBtn.disabled = false; dlBtn.textContent = t('download_update');
       });
       instBtn?.addEventListener('click', async () => {
         const file = (await invoke('check_update').then(i => null).catch(() => null), null) || (window.__updFile || '');
@@ -883,7 +928,7 @@ function renderSettings() {
         instBtn.disabled = true;
         try {
           await invoke('install_update', { file: window.__updFile || '' });
-        } catch (e) { toast('安装失败: ' + e, 5000); instBtn.disabled = false; }
+        } catch (e) { toast(t('install_failed') + e, 5000); instBtn.disabled = false; }
       });
       // 下载进度事件
       try {
@@ -904,15 +949,15 @@ let TOOLS = null;
 let TOOLS_QUOTA_REFRESHED = false; // 防止 quota 刷新 → 重绘 → 再刷新 的死循环
 async function renderToolsTab(body) {
   // 立即渲染骨架（每平台一行占位），数据回来后原地更新 —— 不再整页"加载平台信息…"
-  const SKELETON_META = { trae: 'Trae（字节跳动）', workbuddy: 'WorkBuddy / CodeBuddy（腾讯）', minimax: 'MiniMax Code', qoder: 'Qoder', zcode: 'ZCode（智谱）', codearts: '华为云码道' };
+  const SKELETON_META = { trae: t('tool_trae'), workbuddy: t('tool_workbuddy'), minimax: t('tool_minimax'), qoder: t('tool_qoder'), zcode: t('tool_zcode'), codearts: t('tool_codearts') };
   body.innerHTML = Object.keys(SKELETON_META).map(p =>
-    '<div class="setting-row" data-tool="' + p + '"><div><h3>' + picon(p) + ' ' + SKELETON_META[p] + '</h3><p class="subtle">检测安装状态…</p></div>' +
+    '<div class="setting-row" data-tool="' + p + '"><div><h3>' + picon(p) + ' ' + SKELETON_META[p] + '</h3><p class="subtle">' + t('detect_state') + '</p></div>' +
     '<div class="actions"><span class="subtle" style="font-size:11.5px">…</span></div></div>').join('') +
-    '<div class="setting-row"><div><h3>安装包下载路径</h3><p class="subtle">…</p></div></div>';
+    '<div class="setting-row"><div><h3>' + t('tools_dl_path') + '</h3><p class="subtle">…</p></div></div>';
   // 后台探测 MiniMax 直链缓存，不阻塞渲染
   invoke('tools_refresh_minimax_url').catch(() => {});
   if (!TOOLS) {
-    try { TOOLS = await invoke('tools_info'); } catch (e) { body.innerHTML = '<div class="empty">加载失败: ' + esc(String(e)) + '</div>'; return; }
+    try { TOOLS = await invoke('tools_info'); } catch (e) { body.innerHTML = '<div class="empty">' + t('tools_load_failed') + esc(String(e)) + '</div>'; return; }
   }
   // 每次进入页面只后台刷一次额度，完成后仅更新卡片额度文字（不重绘整个列表，避免打断操作）
   if (!TOOLS_QUOTA_REFRESHED) {
@@ -931,61 +976,70 @@ async function renderToolsTab(body) {
   }
   const dlDir = TOOLS.installDir || '';
   const items = TOOLS.items || [];
-  const meta = { trae: 'Trae（字节跳动）', workbuddy: 'WorkBuddy / CodeBuddy（腾讯）', minimax: 'MiniMax Code', qoder: 'Qoder', zcode: 'ZCode（智谱）', codearts: '华为云码道' };
-  body.innerHTML = '<div class="setting-row"><div><h3>平台工具一键安装</h3><p>下载官方安装包并静默安装。支持直链的平台自动下载；其余平台将打开官方下载页。</p></div></div>' +
-    '<div class="setting-row"><div><h3>安装包下载路径</h3><p>留空使用系统临时目录。安装程序本身默认装到系统默认位置（安装器参数可控部分有限）。</p></div>' +
-    '<div style="display:flex;gap:6px;min-width:340px"><input id="tools-dir" type="text" value="' + esc(dlDir) + '" placeholder="D:\\Tools\\Installers" style="flex:1;padding:8px 10px;border-radius:9px;border:1px solid var(--line);font:inherit">' +
-    '<button id="tools-dir-save" class="small primary">保存</button></div></div>' +
+  const meta = SKELETON_META;
+  body.innerHTML = '<div class="setting-row"><div><h3>' + t('tools_one_click') + '</h3><p>' + t('tools_one_click_desc') + '</p></div></div>' +
+    '<div class="setting-row"><div><h3>' + t('tools_dl_path') + '</h3><p>' + t('tools_dl_path_desc') + '</p></div>' +
+    '<div style="display:flex;gap:6px;min-width:340px"><input id="tools-dir" type="text" value="' + esc(dlDir) + '" placeholder="' + t('tools_dl_path_ph') + '" style="flex:1;padding:8px 10px;border-radius:9px;border:1px solid var(--line);font:inherit">' +
+    '<button id="tools-dir-save" class="small primary">' + t('save') + '</button></div></div>' +
     items.map(it => {
       const dl = (TOOLS.downloads || []).find(d => d.platform === it.platform) || {};
-      const stMap = { downloading: '下载中 ' + (dl.progress || 0) + '%', downloaded: '下载完成', installing: '安装中…', installed: '✓ 已安装', install_timeout: '安装器已退出（请手动确认）' };
+      const stMap = { downloading: t('dl_state_downloading', { n: dl.progress || 0 }), downloaded: t('dl_state_downloaded'), installing: t('dl_state_installing'), installed: t('dl_state_installed'), install_timeout: t('dl_state_timeout') };
       const st = stMap[dl.status] || '';
-      const qtxt = it.accounts > 0 ? ' · 已装 ' + it.accounts + ' 个账号' + (it.quotaTotal != null ? ' · 剩余额度 ' + fmt(it.quotaTotal) : '') : ' · 未添加账号';
+      const qtxt = it.accounts > 0 ? t('installed_accounts', { n: it.accounts }) + (it.quotaTotal != null ? t('remaining_quota') + fmt(it.quotaTotal) : '') : t('no_account_added');
       return '<div class="setting-row" data-tool="' + it.platform + '"><div><h3>' + picon(it.platform) + ' ' + (meta[it.platform] || it.platform) + '</h3>' +
-        '<p>' + (it.direct ? '支持应用内直链下载 · ' + esc(it.url.split('/').pop() || '') : '无稳定直链 → 打开官方下载页手动下载') + qtxt + '</p></div>' +
+        '<p>' + (it.direct ? t('direct_link') + esc(it.url.split('/').pop() || '') : t('no_direct_link')) + qtxt + '</p></div>' +
         '<div class="actions" style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;justify-content:flex-end">' +
-        '<span data-status style="font-size:11.5px;font-weight:600;' + (it.installed ? 'color:var(--green,#16a34a)' : 'color:var(--subtle,#7f7d91)') + '">' + (it.installed ? '✓ 已安装 ' : '未检测到') + st + '</span>' +
-        (it.direct ? '<button data-dl="' + it.platform + '" class="small ' + (it.installed ? '' : 'primary') + '">' + (it.installed ? '重新安装' : '一键下载安装') + '</button>' : '<button data-page="' + it.platform + '" class="small">打开下载页</button>') +
-        '<button data-setdir="' + it.platform + '" class="small" title="客户端装在非常规位置时，手动指定安装目录">指定目录</button>' +
+        '<span data-status style="font-size:11.5px;font-weight:600;' + (it.installed ? 'color:var(--green,#16a34a)' : 'color:var(--subtle,#7f7d91)') + '">' + (it.installed ? t('installed_yes') : t('not_detected')) + st + '</span>' +
+        (it.direct ? '<button data-dl="' + it.platform + '" class="small ' + (it.installed ? '' : 'primary') + '">' + (it.installed ? t('reinstall') : t('one_click_install')) + '</button>' : '<button data-page="' + it.platform + '" class="small">' + t('open_dl_page') + '</button>') +
+        '<button data-setdir="' + it.platform + '" class="small" title="' + t('specify_dir_tip') + '">' + t('specify_dir') + '</button>' +
         '</div></div>';
     }).join('') +
-    '<p class="notice">已安装检测：自动扫描注册表卸载信息与常见安装路径；若客户端装在自定义位置，点「指定目录」手动导入安装目录（含主程序的文件夹）。</p>';
+    '<p class="notice">' + t('tools_notice') + '</p>' +
+    '<div class="setting-row" style="flex-direction:column;align-items:flex-start;gap:6px">' +
+    '<p style="font-size:12.5px;margin:0">' + t('open_source_repo') + '：<a id="repo-link" href="https://github.com/tttq/credit_linked" style="color:var(--accent,#4b7bec);word-break:break-all;cursor:pointer">https://github.com/tttq/credit_linked</a></p>' +
+    '<p class="subtle" style="font-size:12px;line-height:1.7;margin:0">' + t('disclaimer') + '</p>' +
+    '</div>';
   // 绑定
+  // 开源仓库链接：Tauri webview 内 <a> 默认导航会被拦，走 opener 插件用系统浏览器打开
+  const repoLink = body.querySelector('#repo-link');
+  if (repoLink) repoLink.addEventListener('click', (e) => {
+    if (openUrl) { e.preventDefault(); try { Promise.resolve(openUrl('https://github.com/tttq/credit_linked')).catch(() => {}); } catch {} }
+  });
   body.querySelectorAll('[data-setdir]').forEach(b => b.addEventListener('click', async () => {
     const p = b.dataset.setdir;
-    const dir = prompt('请输入 ' + (meta[p] || p) + ' 的安装目录（含主 exe 的文件夹路径）：', '');
+    const dir = prompt(t('input_install_dir', { name: meta[p] || p }), '');
     if (dir == null) return;
     if (!dir.trim()) {
-      try { await invoke('tools_set_install_dir', { platform: p, dir: '' }); toast('已清除手动指定目录'); TOOLS = null; renderToolsTab(body); } catch (e) { toast('操作失败: ' + e, 4200); }
+      try { await invoke('tools_set_install_dir', { platform: p, dir: '' }); toast(t('install_dir_cleared')); TOOLS = null; renderToolsTab(body); } catch (e) { toast(t('op_error') + e, 4200); }
       return;
     }
     b.disabled = true;
     try {
       const r = await invoke('tools_set_install_dir', { platform: p, dir: dir.trim() });
-      toast(r.installed ? ('已导入：' + r.exe) : '已清除手动指定目录');
+      toast(r.installed ? (t('imported') + r.exe) : t('install_dir_cleared'));
       TOOLS = null;
       renderToolsTab(body);
-    } catch (e) { toast('导入失败: ' + e, 4200); }
+    } catch (e) { toast(t('import_failed') + e, 4200); }
     b.disabled = false;
   }));
   body.querySelectorAll('[data-dl]').forEach(b => b.addEventListener('click', async () => {
     const p = b.dataset.dl;
     const dir = body.querySelector('#tools-dir')?.value || '';
-    b.disabled = true; b.textContent = '处理中…';
+    b.disabled = true; b.textContent = t('processing');
     try {
       const r = await invoke('tools_download', { platform: p, installDir: dir });
       if (r.ok) {
         await invoke('tools_install', { platform: p, file: r.file });
-        toast((meta[p] || p) + ' 静默安装已启动，完成后状态会更新为「已安装」');
+        toast(t('silent_install_started', { name: meta[p] || p }));
       } else if (r.openPage) {
         await invoke('tools_open_page', { platform: p });
-        toast('该平台暂无稳定直链，已打开官网下载页');
+        toast(t('no_direct_open_page'));
       }
-    } catch (e) { toast('下载/安装失败: ' + e, 5000); }
-    b.disabled = false; b.textContent = '一键下载安装';
+    } catch (e) { toast(t('dl_install_failed') + e, 5000); }
+    b.disabled = false; b.textContent = t('one_click_install');
   }));
   body.querySelectorAll('[data-page]').forEach(b => b.addEventListener('click', async () => {
-    try { await invoke('tools_open_page', { platform: b.dataset.page }); toast('已打开官方下载页'); } catch (e) { toast('打开失败: ' + e); }
+    try { await invoke('tools_open_page', { platform: b.dataset.page }); toast(t('dl_page_opened')); } catch (e) { toast(t('open_failed') + e); }
   }));
   // 下载进度事件（5% 步进）
   try {
@@ -996,9 +1050,9 @@ async function renderToolsTab(body) {
       TOOLS.downloads = (TOOLS.downloads || []).filter(x => x.platform !== d.platform).concat([d]);
       const row = document.querySelector('#settings-body [data-tool="' + d.platform + '"] [data-status]');
       if (row) {
-        const stMap2 = { downloading: '下载中 ' + (d.progress || 0) + '%', downloaded: '下载完成', installing: '安装中…', installed: '✓ 已安装', install_timeout: '安装器已退出（请手动确认）' };
+        const stMap2 = { downloading: t('dl_state_downloading', { n: d.progress || 0 }), downloaded: t('dl_state_downloaded'), installing: t('dl_state_installing'), installed: t('dl_state_installed'), install_timeout: t('dl_state_timeout') };
         row.textContent = stMap2[d.status] || '';
-        if (d.status === 'installed' || d.status === 'install_timeout') toast((d.platform === 'qoder' ? 'Qoder' : d.platform) + ' 安装流程结束');
+        if (d.status === 'installed' || d.status === 'install_timeout') toast((d.platform === 'qoder' ? 'Qoder' : d.platform) + t('install_flow_done'));
       }
     });
   } catch {}
@@ -1022,44 +1076,44 @@ async function autoSaveSettings() {
       if (SETTINGS[k] !== v) { await invoke('settings_set', { key: k, value: String(v) }); SETTINGS[k] = v; }
     }
     applyRefreshInterval();
-    toast('设置已保存');
-  } catch (e) { toast('保存失败: ' + e, 4200); }
+    toast(t('settings_saved'));
+  } catch (e) { toast(t('save_failed') + e, 4200); }
 }
 $$('#settings-tabs button').forEach(b => b.addEventListener('click', () => {
   $$('#settings-tabs button').forEach(x => x.classList.toggle('active', x === b));
   renderSettings();
 }));
-$('#settings-cancel').addEventListener('click', () => { renderSettings(); toast('已还原未保存修改'); });
+$('#settings-cancel').addEventListener('click', () => { renderSettings(); toast(t('settings_reverted')); });
 $('#settings-save').addEventListener('click', async () => {
   try {
     for (const [k, v] of Object.entries(settingsDraft)) {
       if (SETTINGS[k] !== v) await invoke('settings_set', { key: k, value: String(v) });
     }
-    toast('设置已保存，任务按新计划安排');
+    toast(t('settings_saved_sched'));
     applyRefreshInterval();
     await refreshAll();
     // 补跑：开启 catchup 且今日计划时间已过 → 后台调度器 60s 内接管（Rust auto_tick）
-  } catch (e) { toast('保存失败: ' + e, 4200); }
+  } catch (e) { toast(t('save_failed') + e, 4200); }
 });
 
 // ===== 登录模态 =====
 async function startLogin(p) {
   const meta = PLAT[p] || {};
-  $('#login-title').textContent = '登录 ' + platName(p);
+  $('#login-title').textContent = t('login_title', { p: platName(p) });
   $('#login-desc').textContent = meta.desc || '';
-  $('#login-body').innerHTML = '<div style="padding:18px 0"><span class="spin"></span> 正在发起授权…</div>';
+  $('#login-body').innerHTML = '<div style="padding:18px 0"><span class="spin"></span>' + t('starting_auth') + '</div>';
   $('#login-mask').classList.add('show');
   clearInterval(loginTimer);
   try {
     const r = await invoke('login_start', { provider: p });
     $('#login-body').innerHTML =
-      '<div style="font-size:12.5px;color:var(--subtle);margin-bottom:10px">授权链接已生成（5 分钟内有效）：</div>' +
+      '<div style="font-size:12.5px;color:var(--subtle);margin-bottom:10px">' + t('auth_link_ready') + '</div>' +
       '<div style="word-break:break-all;font-size:12px;background:var(--bg);border-radius:8px;padding:10px;max-height:120px;overflow:auto">' + esc(r.url) + '</div>' +
-      '<div id="login-status" style="margin-top:12px;font-size:13px"><span class="spin"></span> 等待授权完成…</div>';
+      '<div id="login-status" style="margin-top:12px;font-size:13px"><span class="spin"></span> ' + t('waiting_auth') + '</div>';
     // 应用内授权子窗口（不是系统浏览器）：iframe 会被平台 X-Frame-Options 拒绝，Tauri 子窗口不受限
     await invoke('login_open_window', { sessionId: r.sessionId, url: r.url, provider: p });
     curLoginSid = r.sessionId;
-    $('#login-open').textContent = '刷新授权窗口';
+    $('#login-open').textContent = t('refresh_auth_window');
     $('#login-open').onclick = async () => {
       await invoke('login_open_window', { sessionId: r.sessionId, url: r.url, provider: p });
     };
@@ -1070,8 +1124,8 @@ async function startLogin(p) {
           clearInterval(loginTimer);
           invoke('login_close_window', { sessionId: r.sessionId }).catch(() => {});
           curLoginSid = null;
-          $('#login-body').innerHTML = '<div style="color:var(--green);font-weight:600;padding:16px 0">✔ 登录成功：' + esc(s.account?.name || '') + ' · 正在获取额度…</div>';
-          toast('登录成功：' + (s.account?.name || '') + '，正在获取额度');
+          $('#login-body').innerHTML = '<div style="color:var(--green);font-weight:600;padding:16px 0">' + t('login_ok') + esc(s.account?.name || '') + ' · ' + t('fetching_quota') + '</div>';
+          toast(t('login_ok_toast', { n: s.account?.name || '' }));
           // 登录后立即获取：余额 + 状态
           try { await invoke('quota_refresh', { provider: s.account.provider, uid: s.account.uid }); } catch {}
           await refreshAll();
@@ -1079,7 +1133,7 @@ async function startLogin(p) {
           showPage('accounts');
         } else if (s.status === 'expired') {
           clearInterval(loginTimer);
-          $('#login-status').innerHTML = '<span style="color:var(--amber)">授权已超时，请重新发起</span>';
+          $('#login-status').innerHTML = '<span style="color:var(--amber)">' + t('auth_timeout') + '</span>';
         }
       } catch (e) {
         clearInterval(loginTimer);
@@ -1094,36 +1148,36 @@ $('#login-cancel').addEventListener('click', () => {
     clearInterval(loginTimer);
     invoke('login_cancel').catch(() => {});
     if (curLoginSid) { invoke('login_close_window', { sessionId: curLoginSid }).catch(() => {}); curLoginSid = null; }
-    $('#login-open').textContent = '打开授权页面';
+    $('#login-open').textContent = t('open_auth_page');
     $('#login-mask').classList.remove('show');
   });
 
 // ===== 顶部 =====
 async function checkinAll(btn) {
-  btn.disabled = true; const old = btn.textContent; btn.innerHTML = '<span class="spin"></span> 签到中…';
+  btn.disabled = true; const old = btn.textContent; btn.innerHTML = '<span class="spin"></span>' + t('checkin_running');
   try {
     const r = await invoke('checkin', { provider: '', uid: '', all: true });
     const ok = r.results.filter(x => x.status === 'success').length;
     const al = r.results.filter(x => x.status === 'already').length;
     const bad = r.results.filter(x => x.status === 'failed').length;
-    toast('签到完成：成功 ' + ok + ' · 已领 ' + al + ' · 失败 ' + bad);
+    toast(t('checkin_done_stats', { ok, al, bad }));
     await refreshAll();
-  } catch (e) { toast('签到失败: ' + e); }
+  } catch (e) { toast(t('checkin_failed') + e); }
   btn.disabled = false; btn.textContent = old;
 }
 $('#btn-checkin-all').addEventListener('click', (e) => checkinAll(e.currentTarget));
 $('#btn-checkin-all2').addEventListener('click', (e) => checkinAll(e.currentTarget));
 async function quotaAll(btn) {
-  btn.disabled = true; const old = btn.textContent; btn.textContent = '刷新中…';
+  btn.disabled = true; const old = btn.textContent; btn.textContent = t('refreshing');
   try {
     const accs = SNAP?.accounts || [];
     for (const a of accs) { try { await invoke('quota_refresh', { provider: a.provider, uid: a.uid }); } catch {} }
-    toast('余额已刷新');
+    toast(t('balance_refreshed'));
     await refreshAll();
-  } catch (e) { toast('刷新失败: ' + e); }
+  } catch (e) { toast(t('refresh_failed') + e); }
   btn.disabled = false; btn.textContent = old;
 }
-$('#btn-quota-all').addEventListener('click', (e) => quotaAll(e.currentTarget));
+$('#btn-quota-all3').addEventListener('click', (e) => quotaAll(e.currentTarget));
 $('#btn-quota-all2').addEventListener('click', (e) => quotaAll(e.currentTarget));
 $('#btn-refresh').addEventListener('click', refreshAll);
 $$('[data-goto]').forEach(b => b.addEventListener('click', () => showPage(b.dataset.goto)));

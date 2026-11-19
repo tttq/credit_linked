@@ -1,6 +1,7 @@
 //! safeStorage(DPAPI) 等价：Windows 用 CryptProtectData/CryptUnprotectData + base64；
 //! 非 Windows 平台（macOS/Linux CI 构建）提供 base64 占位实现，保证可编译可运行。
 
+/// DPAPI 加密原始字节（当前用户作用域；结果仅本机当前用户可解）。
 #[cfg(windows)]
 pub fn dpapi_protect(data: &[u8]) -> anyhow::Result<Vec<u8>> {
     use anyhow::anyhow;
@@ -32,6 +33,7 @@ pub fn dpapi_protect(data: &[u8]) -> anyhow::Result<Vec<u8>> {
     }
 }
 
+/// DPAPI 解密原始字节（dpapi_protect 的逆操作）。
 #[cfg(windows)]
 pub fn dpapi_unprotect(data: &[u8]) -> anyhow::Result<Vec<u8>> {
     use anyhow::anyhow;
@@ -54,6 +56,7 @@ pub fn dpapi_unprotect(data: &[u8]) -> anyhow::Result<Vec<u8>> {
     }
 }
 
+/// 非 Windows：尝试写入系统 keyring；失败静默降级为原样返回，保证功能可用。
 #[cfg(not(windows))]
 pub fn dpapi_protect(data: &[u8]) -> anyhow::Result<Vec<u8>> {
     // macOS Keychain / Linux libsecret 通过 keyring crate；失败时退回明文（保证功能可用）
@@ -66,18 +69,21 @@ pub fn dpapi_protect(data: &[u8]) -> anyhow::Result<Vec<u8>> {
     }
 }
 
+/// 非 Windows：原样返回（与降级语义配对，DB 内值即明文）。
 #[cfg(not(windows))]
 pub fn dpapi_unprotect(data: &[u8]) -> anyhow::Result<Vec<u8>> {
     // keyring 里的值与 DB 内一致；直接返回（不使用系统加密存储作唯一来源，避免跨机迁移失效）
     Ok(data.to_vec())
 }
 
+/// 加密并 base64 编码为字符串（入库存 secret 列用）。
 pub fn seal_b64(plain: &str) -> anyhow::Result<String> {
     use base64::engine::general_purpose::STANDARD as B64;
     use base64::Engine;
     Ok(B64.encode(dpapi_protect(plain.as_bytes())?))
 }
 
+/// seal_b64 的逆操作：base64 解码后解密还原明文。
 pub fn open_b64(b64: &str) -> anyhow::Result<String> {
     use base64::engine::general_purpose::STANDARD as B64;
     use base64::Engine;

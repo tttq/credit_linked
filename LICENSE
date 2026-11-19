@@ -1,0 +1,36 @@
+MIT License
+
+Copyright (c) 2026 tttq (github.com/tttq/credit_linked)
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, subject to the Additional Terms below.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+--------------------------------------------------------------------------
+
+附加条款（Additional Terms）
+
+本许可基于 MIT License，并附加以下限制条款；附加条款与 MIT 条款冲突时，以附加条款为准：
+
+1. 本项目**仅供学习和技术研究使用**，严禁用于任何商业用途。
+2. **禁止二次开发后销售**，或以任何形式付费分发本项目及其衍生版本。
+3. 使用本项目产生的一切后果由使用者自行承担，与项目作者无关。
+
+English reference:
+
+1. This project is for learning and technical research ONLY. Any commercial
+   use is strictly prohibited.
+2. Selling modified (derivative) versions, or distributing this project or
+   its derivatives for a fee in any form, is prohibited.
+3. Users bear full responsibility for any consequences arising from the use
+   of this project. The authors assume no liability.
