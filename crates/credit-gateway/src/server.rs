@@ -825,6 +825,42 @@ impl Drop for StreamGuard {
     }
 }
 
+/// 修复上游工具参数分片伪影：部分上游（实测 Qoder gfmodel）会在参数结尾多发一个 `""`，
+/// 例如 `{"file_path":"...","limit":100"` + `""` + `}` 拼成 `{"limit":100""}`，
+/// 客户端会因非法 JSON 报 "Expected ',' or '}' after property value"（工具调用直接失败）。
+/// 这里在整体下发前校验并修复；修不好则原样返回。
+fn sanitize_tool_arguments(raw: &str) -> String {
+    let raw = raw.trim();
+    if raw.is_empty() || serde_json::from_str::<serde_json::Value>(raw).is_ok() {
+        return raw.to_string();
+    }
+    let mut cur = raw.to_string();
+    for _ in 0..8 {
+        let before = cur.clone();
+        // 紧邻 } / ] 前的多余引号对：{"limit":100""} → {"limit":100}
+        cur = cur.replace("\"\"}", "}").replace("\"\"]", "]");
+        if serde_json::from_str::<serde_json::Value>(&cur).is_ok() {
+            return cur;
+        }
+        if cur == before {
+            break;
+        }
+    }
+    // 结尾多余一个引号：{...100"} → {...100}
+    if let Some(stripped) = cur.strip_suffix("\"}") {
+        let candidate = format!("{stripped}}}");
+        if serde_json::from_str::<serde_json::Value>(&candidate).is_ok() {
+            return candidate;
+        }
+    }
+    // 最后尝试整体去掉一处重复引号
+    let cand = cur.replace("\"\"", "\"");
+    if serde_json::from_str::<serde_json::Value>(&cand).is_ok() {
+        return cand;
+    }
+    raw.to_string()
+}
+
 /// SSE 流式响应（OpenAI chat.completion.chunk 线格式）
 fn stream_response(
     st: &Arc<GatewayState>,
@@ -866,38 +902,60 @@ fn stream_response(
         error,
     };
 
-    let body_stream = events.map(move |ev| -> Result<Event, std::convert::Infallible> {
+    // 工具参数按 index 缓冲：上游分片可能含伪影（如 Qoder 多发 `""`），
+    // 直接透传会让客户端拼出非法 JSON；这里缓存分片，在结束事件时校验/修复后一次性下发。
+    let mut tool_buf: std::collections::BTreeMap<u32, (Option<String>, String, String)> = Default::default();
+    let mut tool_flushed = false;
+
+    let body_stream = events.flat_map(move |ev| {
         // guard 随闭包存活 → 流结束/中断时 Drop 回填耗时
         let _keep_alive = &guard;
+        let mut out: Vec<Result<Event, std::convert::Infallible>> = Vec::new();
         match &ev {
             Ok(StreamEvent::Done { .. }) => finished2.store(true, std::sync::atomic::Ordering::Relaxed),
+            Ok(StreamEvent::ToolCall { .. }) => tool_seen2.store(true, std::sync::atomic::Ordering::Relaxed),
             Ok(StreamEvent::Error(m, _)) | Err(m) => {
                 if let Ok(mut g) = error2.lock() { *g = Some(m.clone()); }
             }
             _ => {}
         }
-        let payload = match ev {
-            Ok(StreamEvent::Text(t)) => json!({
+        match ev {
+            Ok(StreamEvent::Text(t)) => out.push(Ok(Event::default().data(json!({
                 "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
                 "choices": [{ "index": 0, "delta": { "content": t }, "finish_reason": null }],
-            }),
-            Ok(StreamEvent::Reasoning(t)) => json!({
+            }).to_string()))),
+            Ok(StreamEvent::Reasoning(t)) => out.push(Ok(Event::default().data(json!({
                 "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
                 "choices": [{ "index": 0, "delta": { "reasoning_content": t }, "finish_reason": null }],
-            }),
+            }).to_string()))),
             Ok(StreamEvent::ToolCall { index, id: tool_id, name, arguments }) => {
-                tool_seen2.store(true, std::sync::atomic::Ordering::Relaxed);
-                let mut tc = json!({ "index": index });
-                if let Some(tid) = &tool_id { tc["id"] = json!(tid); }
-                tc["type"] = json!("function");
-                if let Some(n) = &name { tc["function"]["name"] = json!(n); }
-                if let Some(a) = &arguments { tc["function"]["arguments"] = json!(a); }
-                json!({
-                    "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
-                    "choices": [{ "index": 0, "delta": { "tool_calls": [tc] }, "finish_reason": null }],
-                })
-            },
-            Ok(StreamEvent::Usage { input, output, total }) => json!({
+                let e = tool_buf.entry(index).or_default();
+                // id 只在下发一次
+                if let Some(tid) = &tool_id {
+                    if e.0.is_none() {
+                        e.0 = Some(tid.clone());
+                        let tc = json!({ "index": index, "id": tid, "type": "function" });
+                        out.push(Ok(Event::default().data(json!({
+                            "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
+                            "choices": [{ "index": 0, "delta": { "tool_calls": [tc] }, "finish_reason": null }],
+                        }).to_string())));
+                    }
+                }
+                // name 按上游分片原样透传（客户端自身会拼接；重复整名会得到 readread）
+                if let Some(n) = &name {
+                    if !n.is_empty() {
+                        e.1.push_str(n);
+                        let tc = json!({ "index": index, "function": { "name": n } });
+                        out.push(Ok(Event::default().data(json!({
+                            "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
+                            "choices": [{ "index": 0, "delta": { "tool_calls": [tc] }, "finish_reason": null }],
+                        }).to_string())));
+                    }
+                }
+                // 参数缓存到结束帧统一校验/修复后下发
+                if let Some(a) = arguments { e.2.push_str(&a); }
+            }
+            Ok(StreamEvent::Usage { input, output, total }) => out.push(Ok(Event::default().data(json!({
                 "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
                 "choices": [],
                 "usage": {
@@ -905,27 +963,43 @@ fn stream_response(
                     "completion_tokens": output,
                     "total_tokens": total.unwrap_or(input + output),
                 },
-            }),
+            }).to_string()))),
             Ok(StreamEvent::Done { finish }) => {
+                if !tool_flushed {
+                    tool_flushed = true;
+                    for (index, (_tid, _name, args)) in &tool_buf {
+                        let args_str = if args.trim().is_empty() {
+                            "{}".to_string()
+                        } else {
+                            sanitize_tool_arguments(args)
+                        };
+                        // 只补参数（id/name 已在前面的分片下发，重复会拼成 readread）
+                        let tc = json!({ "index": index, "function": { "arguments": args_str } });
+                        out.push(Ok(Event::default().data(json!({
+                            "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
+                            "choices": [{ "index": 0, "delta": { "tool_calls": [tc] }, "finish_reason": null }],
+                        }).to_string())));
+                    }
+                }
                 let mut fr = normalize_finish(&finish);
                 if fr == "stop" && tool_seen2.load(std::sync::atomic::Ordering::Relaxed) { fr = "tool_calls".to_string(); }
-                json!({
+                out.push(Ok(Event::default().data(json!({
                     "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
                     "choices": [{ "index": 0, "delta": {}, "finish_reason": fr }],
-                })
-            },
-            Ok(StreamEvent::Error(msg, code)) => json!({
+                }).to_string())));
+            }
+            Ok(StreamEvent::Error(msg, code)) => out.push(Ok(Event::default().data(json!({
                 "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
                 "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }],
                 "error": { "message": msg, "code": code },
-            }),
-            Err(e) => json!({
+            }).to_string()))),
+            Err(e) => out.push(Ok(Event::default().data(json!({
                 "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
                 "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }],
                 "error": { "message": e, "code": "stream_error" },
-            }),
-        };
-        Ok::<_, std::convert::Infallible>(Event::default().data(payload.to_string()))
+            }).to_string()))),
+        }
+        futures_util::stream::iter(out)
     });
 
     let done = futures_util::stream::once(async {
@@ -1003,7 +1077,7 @@ async fn blocking_response(
                 "index": idx,
                 "id": id.unwrap_or_else(|| format!("call_{}", uuid::Uuid::new_v4().simple())),
                 "type": "function",
-                "function": { "name": name, "arguments": args },
+                "function": { "name": name, "arguments": sanitize_tool_arguments(&args) },
             })
         }).collect();
         message["tool_calls"] = json!(arr);
@@ -1122,4 +1196,39 @@ async fn gateway_status(State(st): State<Arc<GatewayState>>) -> Response {
 
 async fn healthz() -> Response {
     Json(json!({ "ok": true })).into_response()
+}
+
+#[cfg(test)]
+mod tool_args_tests {
+    use super::sanitize_tool_arguments;
+
+    #[test]
+    fn repairs_duplicated_quotes_before_brace() {
+        // Qoder 实测伪影：{"limit":100""}
+        let raw = "{\"file_path\":\"E:\\\\a.md\",\"limit\":100\"\"}";
+        let fixed = sanitize_tool_arguments(raw);
+        let v: serde_json::Value = serde_json::from_str(&fixed).expect("修复后必须合法");
+        assert_eq!(v["limit"], 100);
+        assert_eq!(v["file_path"], "E:\\a.md");
+    }
+
+    #[test]
+    fn keeps_valid_json_unchanged() {
+        let raw = "{\"city\":\"北京\",\"temp\":18}";
+        assert_eq!(sanitize_tool_arguments(raw), raw);
+    }
+
+    #[test]
+    fn repairs_trailing_quote() {
+        let raw = "{\"limit\":100\"}";
+        let fixed = sanitize_tool_arguments(raw);
+        let v: serde_json::Value = serde_json::from_str(&fixed).expect("修复后必须合法");
+        assert_eq!(v["limit"], 100);
+    }
+
+    #[test]
+    fn repairs_empty_tool_args() {
+        assert_eq!(sanitize_tool_arguments(""), "");
+        assert_eq!(sanitize_tool_arguments("{}"), "{}");
+    }
 }
