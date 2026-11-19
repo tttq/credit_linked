@@ -41,6 +41,7 @@ pub struct ModelInfo {
 
 pub type EventStream = std::pin::Pin<Box<dyn Stream<Item = Result<StreamEvent, String>> + Send>>;
 
+/// 非流式请求客户端：整体超时 300s（普通 JSON 请求）
 fn http_client() -> &'static reqwest::Client {
     static C: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
     C.get_or_init(|| {
@@ -52,11 +53,27 @@ fn http_client() -> &'static reqwest::Client {
     })
 }
 
+/// 流式（SSE）请求客户端：**不能用整体 timeout**——reqwest 的 timeout 覆盖整个响应体读取，
+/// 长回答/长时间思考会被拦腰截断（客户端表现为「只收到一点数据就断开」）。
+/// 这里只限制连接与「两次读取之间的空闲」，长流可以有任意总时长。
+fn stream_client() -> &'static reqwest::Client {
+    static C: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    C.get_or_init(|| {
+        reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(20))
+            .read_timeout(Duration::from_secs(180))
+            .build()
+            .expect("gateway stream client")
+    })
+}
+
 fn truncate(s: &str, n: usize) -> String {
-    if s.len() <= n {
+    // 按字符截断：按字节切片会在中文/emoji 边界 panic（panic 会中断整个响应）
+    if s.chars().count() <= n {
         s.to_string()
     } else {
-        format!("{}…", &s[..n])
+        let t: String = s.chars().take(n).collect();
+        format!("{t}…")
     }
 }
 
@@ -169,7 +186,7 @@ pub async fn wb_chat_stream(cred: &Cred, body: Value, device: Option<(&str, &str
     let url = format!("{base}/v2/chat/completions");
     let enterprise = cred.meta.get("enterpriseId").and_then(|e| e.as_str());
     let hs = wb_chat_headers(&cred.token, &cred.uid, domain, enterprise, device);
-    let mut req = http_client().post(&url).json(&body);
+    let mut req = stream_client().post(&url).json(&body);
     for (k, v) in &hs {
         req = req.header(k, v);
     }
@@ -297,7 +314,7 @@ pub async fn trae_chat_stream(cred: &Cred, intl: bool, enterprise: bool, body: V
         meta["uid"] = Value::String(cred.uid.clone());
     }
     let hs = trae_chat_headers(&cred.token, &meta);
-    let mut req = http_client().post(&url).json(&body);
+    let mut req = stream_client().post(&url).json(&body);
     for (k, v) in &hs {
         req = req.header(k, v);
     }
@@ -321,11 +338,14 @@ struct Pump {
     queue: std::collections::VecDeque<StreamEvent>,
     stream: std::pin::Pin<Box<dyn Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send>>,
     done: bool,
+    /// 已收到结束事件（finish_reason / [DONE]）：之后最多再等 2s 收尾（usage 等），
+    /// 上游不关闭连接也不会让客户端一直挂着（否则客户端会超时断开，表现为「只收到一点数据」）
+    finished: bool,
 }
 
 impl Pump {
     fn new(kind: SseKind, stream: impl Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static) -> Self {
-        Self { kind, buf: Vec::new(), queue: Default::default(), stream: Box::pin(stream), done: false }
+        Self { kind, buf: Vec::new(), queue: Default::default(), stream: Box::pin(stream), done: false, finished: false }
     }
     fn feed(&mut self, chunk: &[u8]) {
         self.buf.extend_from_slice(chunk);
@@ -394,21 +414,29 @@ impl Pump {
 
 }
 
-/// 块边界：\n\n 或 \r\n\r\n（返回 (内容长度, 总消耗)）
+/// 块边界：空行（\n\n / \r\n\r\n / \n\r\n / \r\n\n）。
+/// 注意：必须做边界检查——旧实现 `buf[i-1]` 在 i==0 时越界 panic，
+/// 而 panic 会直接杀死响应任务，客户端表现为「只收到一点数据就断开」。
 fn find_block_end(buf: &[u8]) -> Option<(usize, usize)> {
-    for i in 0..buf.len().saturating_sub(1) {
-        if buf[i] == b'\n' {
-            if buf[i + 1] == b'\n' {
-                return Some((i, i + 2));
-            }
-            if i + 3 < buf.len() && buf[i + 1] == b'\r' && buf[i + 2] == b'\n' {
-                return Some((i, i + 4));
-            }
-            if buf[i - 1] == b'\r' && buf[i + 1] == b'\n' {
-                // \r\n\n 混合：视为边界
-                return Some((i - 1, i + 2));
-            }
+    let mut i = 0;
+    while i < buf.len() {
+        if buf[i] != b'\n' {
+            i += 1;
+            continue;
         }
+        // \n\n
+        if i + 1 < buf.len() && buf[i + 1] == b'\n' {
+            return Some((i, i + 2));
+        }
+        // \n\r\n
+        if i + 2 < buf.len() && buf[i + 1] == b'\r' && buf[i + 2] == b'\n' {
+            return Some((i, i + 3));
+        }
+        // \r\n\n（前一个字节是 \r）
+        if i > 0 && buf[i - 1] == b'\r' && i + 1 < buf.len() && buf[i + 1] == b'\n' {
+            return Some((i - 1, i + 2));
+        }
+        i += 1;
     }
     None
 }
@@ -546,12 +574,24 @@ fn pump_stream(kind: SseKind, stream: std::pin::Pin<Box<dyn Stream<Item = Result
     Box::pin(futures_util::stream::unfold(Pump::new(kind, stream), |mut p| async move {
         loop {
             if let Some(ev) = p.pop() {
+                if matches!(ev, StreamEvent::Done { .. }) {
+                    p.finished = true;
+                }
                 return Some((Ok(ev), p));
             }
             if p.done {
                 return p.take_tail().map(|ev| (Ok(ev), p));
             }
-            match p.stream.next().await {
+            // 已收到结束事件：最多再等 2s 收尾（usage / 剩余帧），避免上游不关闭连接时客户端挂死
+            let next = if p.finished {
+                match tokio::time::timeout(Duration::from_millis(2000), p.stream.next()).await {
+                    Ok(v) => v,
+                    Err(_) => return p.take_tail().map(|ev| (Ok(ev), p)),
+                }
+            } else {
+                p.stream.next().await
+            };
+            match next {
                 Some(Ok(chunk)) => p.feed(&chunk),
                 Some(Err(e)) => return Some((Err(format!("stream: {e}")), p)),
                 None => {
@@ -628,7 +668,7 @@ pub async fn zcode_chat_stream(cred: &Cred, body: Value) -> Result<EventStream, 
     let url = format!("{}{}", crate::protocol::ZCODE_PLAN_ANTHROPIC_BASE, crate::protocol::ZCODE_ANTHROPIC_PATH);
     let mut hs = crate::protocol::zcode_chat_headers(&jwt, Some(mid));
     hs.push(("anthropic-version".to_string(), "2023-06-01".to_string()));
-    let mut req = http_client().post(&url).json(&a_body);
+    let mut req = stream_client().post(&url).json(&a_body);
     for (k, v) in &hs { req = req.header(k, v); }
     let resp = match req.send().await {
         Ok(r) => r,
@@ -672,7 +712,7 @@ pub async fn minimax_fetch_models(_cred: &Cred) -> Result<Vec<ModelInfo>, Platfo
 pub async fn minimax_chat_stream(cred: &Cred, body: Value) -> Result<EventStream, String> {
     let url = format!("{MINIMAX_API_BASE}{MINIMAX_ANTHROPIC_PATH}");
     let hs = minimax_chat_headers(&cred.token);
-    let mut req = http_client().post(&url).json(&body);
+    let mut req = stream_client().post(&url).json(&body);
     for (k, v) in &hs {
         req = req.header(k, v);
     }
@@ -976,7 +1016,10 @@ pub async fn codearts_chat_stream(cred: &Cred, body: Value, desktop: bool) -> Re
     ];
     let host_of = host.to_string();
     let (auth, signed) = credit_core::adapters::codearts::sign_codearts(ak, sk, "POST", &host_of, path, "", &extra, &body_str, Some(sts));
-    let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(300)).build().unwrap();
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(20))
+        .read_timeout(std::time::Duration::from_secs(180))
+        .build().unwrap();
     let url = format!("https://{host}{path}");
     let mut req = client.post(&url).header("Content-Type", "application/json");
     for (k, v) in &signed {
@@ -1054,7 +1097,7 @@ pub async fn qoder_chat_stream(cred: &Cred, body: Value) -> Result<EventStream, 
     let body_str = signed.get("body").and_then(|b| b.as_str()).ok_or("sidecar: no body")?.to_string();
     let headers: Value = signed.get("headers").cloned().unwrap_or(json!({}));
     // 2. 发请求（上游响应是外层信封 SSE：data:{headers,body,statusCode}）
-    let mut req = http_client().post(&url);
+    let mut req = stream_client().post(&url);
     if let Some(hs) = headers.as_object() {
         for (k, v) in hs {
             if let Some(sv) = v.as_str() {
@@ -1149,4 +1192,61 @@ fn decode_qoder_envelope(data: &str) -> Option<StreamEvent> {
     // 复用 OpenAI chunk 解析（choices/delta 形状一致）
     let events = parse_openai_chunk(&inner);
     events.into_iter().next()
+}
+
+#[cfg(test)]
+mod stream_tests {
+    use super::*;
+
+    #[test]
+    fn find_block_end_no_panic_on_leading_newline() {
+        // 旧实现在 buf 以单个 '\n' 开头时 buf[i-1] 越界 panic
+        assert_eq!(find_block_end(b"\ndata: {}"), None);
+        assert_eq!(find_block_end(b"\n"), None);
+        assert_eq!(find_block_end(b"\n\n"), Some((0, 2)));
+        assert_eq!(find_block_end(b"data: {}\n\n"), Some((8, 10)));
+        assert_eq!(find_block_end(b"data: {}\r\n\r\ndata: {}"), Some((9, 12)));
+        assert_eq!(find_block_end(b"data: {}\n\r\ndata: {}"), Some((8, 11)));
+    }
+
+    #[tokio::test]
+    async fn pump_finishes_even_if_upstream_never_closes() {
+        use futures_util::StreamExt;
+        // 先发一个 finish_reason 帧，然后流永远 pending（模拟上游不关闭连接）
+        let first = bytes::Bytes::from_static(b"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n");
+        let s = futures_util::stream::once(async move { Ok::<_, reqwest::Error>(first) })
+            .chain(futures_util::stream::pending());
+        let mut ev = parse_openai_sse(s);
+        let t0 = std::time::Instant::now();
+        let mut done = false;
+        while let Some(item) = ev.next().await {
+            if let Ok(StreamEvent::Done { .. }) = item { done = true; }
+            if t0.elapsed() > std::time::Duration::from_secs(10) { break; }
+        }
+        assert!(done, "应收到 Done 事件");
+        assert!(t0.elapsed() < std::time::Duration::from_secs(8), "上游不关闭时也应在宽限时间内结束，实际 {:?}", t0.elapsed());
+    }
+
+    #[tokio::test]
+    async fn pump_emits_all_text_chunks() {
+        use futures_util::StreamExt;
+        let chunks: Vec<bytes::Bytes> = vec![
+            bytes::Bytes::from_static(b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\xe4\xbd\xa0\"},\"finish_reason\":null}]}\n\n"),
+            bytes::Bytes::from_static(b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\xe5\xa5\xbd\"},\"finish_reason\":null}]}\n"),
+            bytes::Bytes::from_static(b"\ndata: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"),
+        ];
+        let s = futures_util::stream::iter(chunks.into_iter().map(Ok::<_, reqwest::Error>));
+        let mut ev = parse_openai_sse(s);
+        let mut text = String::new();
+        let mut done = false;
+        while let Some(item) = ev.next().await {
+            match item.expect("no stream error") {
+                StreamEvent::Text(t) => text.push_str(&t),
+                StreamEvent::Done { .. } => done = true,
+                _ => {}
+            }
+        }
+        assert_eq!(text, "你好");
+        assert!(done, "应收到结束事件");
+    }
 }

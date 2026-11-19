@@ -511,7 +511,7 @@ function renderRouting() {
     '<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">' +
     '<div style="flex:1;min-width:200px"><h3 style="font-size:14px">本地网关 · OpenAI 兼容接口</h3>' +
     '<div style="display:flex;align-items:center;gap:8px;margin-top:8px;flex-wrap:wrap">' +
-    '<code style="background:var(--accent-soft);color:var(--accent);padding:8px 14px;border-radius:9px;font-size:13.5px;font-weight:600">' + esc(st.baseUrl) + '/v1</code>' +
+    '<code style="background:var(--accent-soft);color:var(--accent);padding:8px 14px;border-radius:9px;font-size:13.5px;font-weight:600;max-width:100%;overflow-wrap:anywhere">' + esc(st.baseUrl) + '/v1</code>' +
     '<button class="small" id="gw-copy-url">复制</button>' +
     '<span class="subtle" style="font-size:11.5px">GET /v1/models · POST /v1/chat/completions</span></div>' +
     '<p class="subtle" style="font-size:11.5px;margin-top:8px">模型 id 用 <code>平台/模型</code>；裸模型 id 走当前平台。</p></div></div>' +
@@ -531,7 +531,7 @@ function renderRouting() {
     '<section class="surface route-card">' +
     '<div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap">' +
     '<h3 style="font-size:14px">请求平台 <span class="subtle" style="font-size:11.5px;font-weight:400">裸模型 id 的默认路由</span></h3>' +
-    '<select id="route-plat-select" style="padding:8px 12px;border-radius:9px;border:1px solid var(--line);font:inherit;min-width:220px">' +
+    '<select id="route-plat-select" style="padding:8px 12px;border-radius:9px;border:1px solid var(--line);font:inherit;min-width:0;flex:1 1 220px;max-width:100%">' +
     Object.entries(GW_PLATFORMS).map(([name, meta]) => '<option value="' + name + '"' + (st.platform === name ? ' selected' : '') + '>' + esc(meta.label) + ' · ' + ((st.accounts || {})[name] || 0) + ' 账号' + (meta.chat ? '' : '（仅签到）') + '</option>').join('') +
     '</select></div>' +
     '<div style="display:flex;align-items:center;gap:12px;margin-top:14px;padding:12px 14px;background:var(--accent-soft,#eef6ff);border-radius:11px">' +
@@ -556,7 +556,7 @@ function renderRouting() {
     '<h3 style="font-size:14px">模型测试 <span class="subtle" style="font-size:11.5px;font-weight:400">请求经本地网关转发到对应平台</span></h3>' +
     '<button id="gw-test-refresh" class="small">刷新模型</button></div>' +
     '<div style="display:flex;gap:8px;margin-top:12px;align-items:center;flex-wrap:wrap">' +
-    '<select id="gw-test-model" style="flex:1;min-width:240px;padding:8px 12px;border-radius:9px;border:1px solid var(--line);font:inherit"><option value="">（点击「刷新模型」获取当前平台模型）</option></select>' +
+    '<select id="gw-test-model" style="flex:1 1 240px;min-width:0;max-width:100%;padding:8px 12px;border-radius:9px;border:1px solid var(--line);font:inherit"><option value="">（点击「刷新模型」获取当前平台模型）</option></select>' +
     '</div>' +
     '<textarea id="gw-test-msg" rows="2" placeholder="输入测试消息，如：你好，请介绍一下你自己" style="width:100%;margin-top:10px;padding:10px 12px;border-radius:9px;border:1px solid var(--line);font:inherit;resize:vertical"></textarea>' +
     '<div style="display:flex;align-items:center;gap:10px;margin-top:10px">' +

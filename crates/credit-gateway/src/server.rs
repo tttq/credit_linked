@@ -623,13 +623,12 @@ async fn chat_completions(
             match outcome {
                 Ok(events) => {
                     return if stream {
-                        // 流式：拿到流即记成功（客户端边收边用）
+                        // 流式：拿到流即记成功（客户端边收边用）；异常结束（无 Done / 上游报错）再补一条失败日志
+                        let account_ref = format!("{}:{}", attempt_cred.provider, attempt_cred.uid);
                         let _ = st.store.log_gateway_request(
-                            platform.as_str(),
-                            &format!("{}:{}", attempt_cred.provider, attempt_cred.uid),
-                            &model, true, Some(200), None, None,
+                            platform.as_str(), &account_ref, &model, true, Some(200), None, None,
                         );
-                        stream_response(&model, platform.as_str(), events)
+                        stream_response(&st, &model, platform.as_str(), &account_ref, events)
                     } else {
                         // 非流式：聚合完成后再按实际内容记录（空流记失败，避免"假成功"）
                         let (resp, has_content) = blocking_response(&model, platform.as_str(), events).await;
@@ -769,7 +768,7 @@ async fn dispatch_stream(
 }
 
 /// SSE 流式响应（OpenAI chat.completion.chunk 线格式）
-fn stream_response(model: &str, platform: &str, events: EventStream) -> Response {
+fn stream_response(st: &Arc<GatewayState>, model: &str, platform: &str, account_ref: &str, events: EventStream) -> Response {
     let platform = platform.to_string();
     let model = model.to_string();
     let id = format!("chatcmpl-{}", uuid::Uuid::new_v4().simple());
@@ -786,7 +785,24 @@ fn stream_response(model: &str, platform: &str, events: EventStream) -> Response
         })).unwrap_or_default(),
     );
 
+    // 流结束时补写一条失败日志：正常（收到 Done 且无错误）则跳过
+    let stats = Arc::new(std::sync::Mutex::new((0u64, 0u64, false, Option::<String>::None)));
+    let stats2 = stats.clone();
+    let store2 = st.store.clone();
+    let platform2 = platform.clone();
+    let model2 = model.clone();
+    let account2 = account_ref.to_string();
+
     let body_stream = events.map(move |ev| -> Result<Event, std::convert::Infallible> {
+        if let Ok(mut s) = stats2.lock() {
+            match &ev {
+                Ok(StreamEvent::Text(_)) => s.0 += 1,
+                Ok(StreamEvent::Reasoning(_)) => s.1 += 1,
+                Ok(StreamEvent::Done { .. }) => s.2 = true,
+                Ok(StreamEvent::Error(m, _)) | Err(m) => s.3 = Some(m.clone()),
+                _ => {}
+            }
+        }
         let payload = match ev {
             Ok(StreamEvent::Text(t)) => json!({
                 "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
@@ -827,8 +843,25 @@ fn stream_response(model: &str, platform: &str, events: EventStream) -> Response
         Ok::<_, std::convert::Infallible>(Event::default().data("[DONE]"))
     });
 
+    // 流结束钩子：异常结束（无 Done 或上游错误）才补一条失败日志，正常结束不重复记
+    let tail_log = futures_util::stream::once(async move {
+        if let Ok(s) = stats.lock() {
+            let (text_chunks, reasoning_chunks, finished, err) = (s.0, s.1, s.2, s.3.clone());
+            drop(s);
+            if !finished || err.is_some() {
+                let msg = match err {
+                    Some(e) => format!("stream interrupted after {text_chunks} text chunks: {e}"),
+                    None => format!("stream ended without finish event (text chunks={text_chunks}, reasoning={reasoning_chunks})"),
+                };
+                let _ = store2.log_gateway_request(&platform2, &account2, &model2, false, Some(502), Some(&msg), Some(text_chunks as i64));
+            }
+        }
+        None::<Result<Event, std::convert::Infallible>>
+    });
+
     Sse::new(futures_util::stream::iter([Ok::<_, std::convert::Infallible>(prelude)])
         .chain(body_stream)
+        .chain(tail_log.filter_map(|x| async move { x }))
         .chain(done))
         .keep_alive(KeepAlive::default())
         .into_response()

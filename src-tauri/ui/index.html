@@ -70,8 +70,10 @@ button.primary:hover { filter: brightness(1.08); color: #fff; }
 button.danger-ghost { color: var(--red); }
 button.small { padding: 4px 10px; font-size: 12px; border-radius: 7px; }
 button.text-button { border: 0; background: transparent; }
-main { flex: 1; overflow-y: auto; min-height: 0; }
-.page { display: none; } .page.active { display: block; }
+main { flex: 1; overflow-y: auto; min-height: 0; min-width: 0; }
+/* .page 是 main（flex 纵向容器）的 flex item：默认 min-width:auto 会被内部内容撑宽，
+   导致窄窗口下整页横向溢出。显式 min-width:0 让它始终跟随窗口宽度。 */
+.page { display: none; min-width: 0; max-width: 100%; } .page.active { display: block; }
 h1 { font-size: 16px; font-weight: 700; } h2 { font-size: 14px; } h3 { font-size: 13px; }
 .subtle { color: var(--subtle); font-size: 11.5px; }
 .surface { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; }
@@ -223,9 +225,13 @@ td { padding: 7px 8px; border-bottom: 1px solid var(--line); }
 select { padding: 6px 9px; border-radius: 8px; border: 1px solid var(--line); background: #fff; font: inherit; font-size: 12.5px; }
 
 /* 账号路由占位 */
-.route-matrix { margin-top: 0; display: grid; gap: 12px; }
-.route-card { padding: 14px 16px !important; }
-.route-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 14px; margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--line); }
+/* 账号路由页：跟随窗口宽度（内部网格/选择框不能把页面撑宽） */
+#page-routing { min-width: 0; max-width: 100%; }
+.route-matrix { margin-top: 0; display: grid; grid-template-columns: minmax(0, 1fr); min-width: 0; max-width: 100%; }
+.route-card { padding: 14px 16px !important; min-width: 0; max-width: 100%; overflow-x: hidden; }
+.route-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 160px), 1fr)); gap: 14px; margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--line); }
+.route-card select, .route-card input, .route-card textarea { max-width: 100%; box-sizing: border-box; }
+.route-card code { overflow-wrap: anywhere; word-break: break-word; }
 .route-field { min-width: 0; }
 .route-field-label { display: block; font-size: 11.5px; font-weight: 600; margin-bottom: 6px; }
 .route-field-hint { font-weight: 400; opacity: .8; }
