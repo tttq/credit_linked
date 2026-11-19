@@ -19,6 +19,7 @@ impl Store {
         )?;
         Self::migrate(&conn)?;
         Self::migrate_v2(&conn)?;
+        Self::migrate_v3(&conn)?;
         Ok(Self { conn: Mutex::new(conn) })
     }
 
@@ -93,6 +94,18 @@ impl Store {
             CREATE INDEX IF NOT EXISTS gateway_logs_at ON gateway_logs(at DESC);
             PRAGMA user_version = 2;",
         )?;
+        Ok(())
+    }
+
+    /// v3：网关请求日志增加 duration_ms（请求耗时，毫秒）
+    fn migrate_v3(conn: &Connection) -> anyhow::Result<()> {
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if version >= 3 {
+            return Ok(());
+        }
+        // 老库可能已有该列（重复执行容忍）：ALTER TABLE ADD COLUMN 失败直接忽略
+        let _ = conn.execute("ALTER TABLE gateway_logs ADD COLUMN duration_ms INTEGER", []);
+        let _ = conn.execute("PRAGMA user_version = 3", []);
         Ok(())
     }
 
@@ -241,7 +254,7 @@ pub fn list_history(&self, limit: i64) -> anyhow::Result<Vec<HistoryRow>> {
         status_code: Option<i64>,
         message: Option<&str>,
         tokens: Option<i64>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<i64> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO gateway_logs (at, platform, account, model, ok, status_code, message, tokens) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -256,6 +269,30 @@ pub fn list_history(&self, limit: i64) -> anyhow::Result<Vec<HistoryRow>> {
                 tokens
             ],
         )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// 请求结束时回填耗时（毫秒）/结果（流式请求先记开始行，结束或中断时更新）。
+    /// ok=None 表示只更新耗时。
+    pub fn finish_gateway_log(
+        &self,
+        id: i64,
+        duration_ms: i64,
+        ok: Option<bool>,
+        status_code: Option<i64>,
+        message: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        match ok {
+            Some(okv) => conn.execute(
+                "UPDATE gateway_logs SET duration_ms = ?2, ok = ?3, status_code = ?4, message = ?5 WHERE id = ?1",
+                rusqlite::params![id, duration_ms, okv as i64, status_code, message],
+            )?,
+            None => conn.execute(
+                "UPDATE gateway_logs SET duration_ms = ?2 WHERE id = ?1",
+                rusqlite::params![id, duration_ms],
+            )?,
+        };
         Ok(())
     }
 
@@ -263,7 +300,7 @@ pub fn list_history(&self, limit: i64) -> anyhow::Result<Vec<HistoryRow>> {
     pub fn list_gateway_logs(&self, limit: i64) -> anyhow::Result<Vec<GatewayLogRow>> {
         let conn = self.conn.lock().unwrap();
         let mut st = conn.prepare(
-            "SELECT id, at, platform, account, model, ok, status_code, message, tokens FROM gateway_logs ORDER BY at DESC, id DESC LIMIT ?1",
+            "SELECT id, at, platform, account, model, ok, status_code, message, tokens, duration_ms FROM gateway_logs ORDER BY at DESC, id DESC LIMIT ?1",
         )?;
         let rows = st.query_map([limit], |r| {
             Ok(GatewayLogRow {
@@ -276,6 +313,7 @@ pub fn list_history(&self, limit: i64) -> anyhow::Result<Vec<HistoryRow>> {
                 status_code: r.get(6)?,
                 message: r.get(7)?,
                 tokens: r.get(8)?,
+                duration_ms: r.get(9)?,
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -311,6 +349,8 @@ pub struct GatewayLogRow {
     pub status_code: Option<i64>,
     pub message: Option<String>,
     pub tokens: Option<i64>,
+    /// 请求耗时（毫秒）；NULL = 尚未结束（流式中）
+    pub duration_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]

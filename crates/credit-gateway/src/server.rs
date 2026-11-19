@@ -519,6 +519,8 @@ async fn chat_completions(
     headers: axum::http::HeaderMap,
     body: axum::extract::Json<Value>,
 ) -> Response {
+    // 请求开始时间：用于日志回填「耗时」
+    let t0 = std::time::Instant::now();
     if !st.check_auth(headers.get(axum::http::header::AUTHORIZATION).and_then(|v| v.to_str().ok())) {
         return openai_error_response(StatusCode::UNAUTHORIZED, "unauthorized", "missing or invalid Authorization bearer");
     }
@@ -626,22 +628,23 @@ async fn chat_completions(
             match outcome {
                 Ok(events) => {
                     return if stream {
-                        // 流式：拿到流即记成功（客户端边收边用）；异常结束（无 Done / 上游报错）再补一条失败日志
+                        // 流式：先记一条开始行（请求时间），耗时/结果由 StreamGuard 在流结束时回填
                         let account_ref = format!("{}:{}", attempt_cred.provider, attempt_cred.uid);
-                        let _ = st.store.log_gateway_request(
+                        let log_id = st.store.log_gateway_request(
                             platform.as_str(), &account_ref, &model, true, Some(200), None, None,
-                        );
-                        stream_response(&st, &model, platform.as_str(), &account_ref, events)
+                        ).unwrap_or(0);
+                        stream_response(&st, &model, platform.as_str(), events, log_id, t0)
                     } else {
                         // 非流式：聚合完成后再按实际内容记录（空流记失败，避免"假成功"）
                         let (resp, has_content) = blocking_response(&model, platform.as_str(), events).await;
-                        let _ = st.store.log_gateway_request(
+                        let log_id = st.store.log_gateway_request(
                             platform.as_str(),
                             &format!("{}:{}", attempt_cred.provider, attempt_cred.uid),
                             &model, has_content, Some(if has_content { 200 } else { 502 }),
                             if has_content { None } else { Some("empty stream (no finish_reason/content)") },
                             None,
-                        );
+                        ).unwrap_or(0);
+                        let _ = st.store.finish_gateway_log(log_id, t0.elapsed().as_millis() as i64, None, None, None);
                         resp
                     };
                 }
@@ -799,8 +802,38 @@ fn account_semaphore(key: &str, permits: usize) -> Arc<tokio::sync::Semaphore> {
         .clone()
 }
 
+/// 流式请求的收尾守卫：无论流正常结束还是被客户端中断，都回填耗时/结果到请求日志。
+struct StreamGuard {
+    store: Arc<credit_core::db::Store>,
+    log_id: i64,
+    t0: std::time::Instant,
+    finished: Arc<std::sync::atomic::AtomicBool>,
+    error: Arc<std::sync::Mutex<Option<String>>>,
+}
+
+impl Drop for StreamGuard {
+    fn drop(&mut self) {
+        let elapsed = self.t0.elapsed().as_millis() as i64;
+        let finished = self.finished.load(std::sync::atomic::Ordering::Relaxed);
+        if finished {
+            let _ = self.store.finish_gateway_log(self.log_id, elapsed, None, None, None);
+        } else {
+            let msg = self.error.lock().ok().and_then(|g| g.clone())
+                .unwrap_or_else(|| "客户端中断或流未正常结束".to_string());
+            let _ = self.store.finish_gateway_log(self.log_id, elapsed, Some(false), Some(502), Some(&msg));
+        }
+    }
+}
+
 /// SSE 流式响应（OpenAI chat.completion.chunk 线格式）
-fn stream_response(st: &Arc<GatewayState>, model: &str, platform: &str, account_ref: &str, events: EventStream) -> Response {
+fn stream_response(
+    st: &Arc<GatewayState>,
+    model: &str,
+    platform: &str,
+    events: EventStream,
+    log_id: i64,
+    t0: std::time::Instant,
+) -> Response {
     let platform = platform.to_string();
     let model = model.to_string();
     let id = format!("chatcmpl-{}", uuid::Uuid::new_v4().simple());
@@ -817,26 +850,31 @@ fn stream_response(st: &Arc<GatewayState>, model: &str, platform: &str, account_
         })).unwrap_or_default(),
     );
 
-    // 流结束时补写一条失败日志：正常（收到 Done 且无错误）则跳过
-    let stats = Arc::new(std::sync::Mutex::new((0u64, 0u64, false, Option::<String>::None)));
     // 工具调用计数：上游常以 finish=stop 结束但携带 tool_calls，Agent 客户端要求 finish=tool_calls
     let tool_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let tool_seen2 = tool_seen.clone();
-    let stats2 = stats.clone();
-    let store2 = st.store.clone();
-    let platform2 = platform.clone();
-    let model2 = model.clone();
-    let account2 = account_ref.to_string();
+    // 流结束状态（守卫在流被 drop 时回填日志）
+    let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let finished2 = finished.clone();
+    let error = Arc::new(std::sync::Mutex::new(None::<String>));
+    let error2 = error.clone();
+    let guard = StreamGuard {
+        store: st.store.clone(),
+        log_id,
+        t0,
+        finished,
+        error,
+    };
 
     let body_stream = events.map(move |ev| -> Result<Event, std::convert::Infallible> {
-        if let Ok(mut s) = stats2.lock() {
-            match &ev {
-                Ok(StreamEvent::Text(_)) => s.0 += 1,
-                Ok(StreamEvent::Reasoning(_)) => s.1 += 1,
-                Ok(StreamEvent::Done { .. }) => s.2 = true,
-                Ok(StreamEvent::Error(m, _)) | Err(m) => s.3 = Some(m.clone()),
-                _ => {}
+        // guard 随闭包存活 → 流结束/中断时 Drop 回填耗时
+        let _keep_alive = &guard;
+        match &ev {
+            Ok(StreamEvent::Done { .. }) => finished2.store(true, std::sync::atomic::Ordering::Relaxed),
+            Ok(StreamEvent::Error(m, _)) | Err(m) => {
+                if let Ok(mut g) = error2.lock() { *g = Some(m.clone()); }
             }
+            _ => {}
         }
         let payload = match ev {
             Ok(StreamEvent::Text(t)) => json!({
@@ -894,25 +932,9 @@ fn stream_response(st: &Arc<GatewayState>, model: &str, platform: &str, account_
         Ok::<_, std::convert::Infallible>(Event::default().data("[DONE]"))
     });
 
-    // 流结束钩子：异常结束（无 Done 或上游错误）才补一条失败日志，正常结束不重复记
-    let tail_log = futures_util::stream::once(async move {
-        if let Ok(s) = stats.lock() {
-            let (text_chunks, reasoning_chunks, finished, err) = (s.0, s.1, s.2, s.3.clone());
-            drop(s);
-            if !finished || err.is_some() {
-                let msg = match err {
-                    Some(e) => format!("stream interrupted after {text_chunks} text chunks: {e}"),
-                    None => format!("stream ended without finish event (text chunks={text_chunks}, reasoning={reasoning_chunks})"),
-                };
-                let _ = store2.log_gateway_request(&platform2, &account2, &model2, false, Some(502), Some(&msg), Some(text_chunks as i64));
-            }
-        }
-        None::<Result<Event, std::convert::Infallible>>
-    });
-
+    // 收尾（耗时/失败标记）由 StreamGuard 在流 drop 时统一回填，无需额外日志行
     Sse::new(futures_util::stream::iter([Ok::<_, std::convert::Infallible>(prelude)])
         .chain(body_stream)
-        .chain(tail_log.filter_map(|x| async move { x }))
         .chain(done))
         .keep_alive(KeepAlive::default())
         .into_response()

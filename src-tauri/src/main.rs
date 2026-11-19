@@ -517,7 +517,7 @@ async fn gateway_status() -> Result<serde_json::Value, String> {
     let logs: Vec<serde_json::Value> = s.store.list_gateway_logs(100).unwrap_or_default().into_iter()
         .map(|l| serde_json::json!({
             "id": l.id, "at": l.at, "platform": l.platform, "account": l.account,
-            "model": l.model, "ok": l.ok, "status": l.status_code, "message": l.message, "tokens": l.tokens,
+            "model": l.model, "ok": l.ok, "status": l.status_code, "message": l.message, "tokens": l.tokens, "duration": l.duration_ms,
         })).collect();
     Ok(serde_json::json!({
         "running": true,

@@ -489,6 +489,40 @@ function bindGwSave(btnId, inputId, field) {
   });
 }
 
+// 请求日志：时间格式化 / 耗时格式化 / 列表与统计渲染（刷新按钮复用）
+function fmtLogTime(at) {
+  if (!at) return '—';
+  return String(at).replace('T', ' ').replace(/\.\d+/, '').replace(/([+-]\d{2}:\d{2}|Z)$/, '');
+}
+function fmtLogDuration(ms) {
+  if (ms == null || ms === '') return '—';
+  const n = Number(ms);
+  if (!Number.isFinite(n)) return '—';
+  return n < 1000 ? n + 'ms' : (n / 1000).toFixed(2) + 's';
+}
+function buildLogRows(logs) {
+  return (logs || []).slice(0, 30).map(l => {
+    const detail = '请求时间 ' + fmtLogTime(l.at) + ' · 耗时 ' + fmtLogDuration(l.duration) + ' · ' + l.platform +
+      (l.account ? ' · ' + l.account : '') + (l.message ? ' · ' + l.message : '');
+    return '<div class="route-row" style="font-size:12.5px" title="' + esc(detail) + '">' +
+      '<div style="flex:1;min-width:0;display:flex;align-items:center;gap:8px">' +
+      '<span style="font-weight:700;flex:0 0 auto">' + (l.ok ? '<span style="color:var(--green,#16a34a)">✓</span>' : '<span style="color:var(--red,#dc2626)">✗</span>') + '</span>' +
+      '<div style="min-width:0"><strong style="font-size:12.5px"><code style="font-size:12px">' + esc(l.model || '(无模型)') + '</code></strong>' +
+      '<div class="subtle" style="margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' +
+      '请求时间 ' + esc(fmtLogTime(l.at)) +
+      ' · 耗时 ' + esc(fmtLogDuration(l.duration)) +
+      ' · ' + esc(l.platform) +
+      (l.account ? ' · ' + esc(l.account) : '') + (l.message && !l.ok ? ' · <span style="color:var(--red,#dc2626)">' + esc(l.message) + '</span>' : '') + '</div></div></div>' +
+      '</div>';
+  }).join('') || '<div class="empty" style="padding:16px">暂无请求日志</div>';
+}
+function buildLogStats(st) {
+  const s = st?.logStats || { total: 0, ok: 0, fail: 0 };
+  return ' · 最近 ' + Math.min(st?.logs?.length || 0, 30) + ' 条 · 总计 ' + s.total +
+    ' · <span style="color:var(--green,#16a34a)">成功 ' + s.ok + '</span>' +
+    ' · <span style="color:var(--red,#dc2626)">失败 ' + s.fail + '</span>';
+}
+
 function renderRouting() {
   const el = $('#route-matrix');
   if (!GW_STATUS) { el.innerHTML = '<div class="empty">网关状态读取失败</div>'; return; }
@@ -496,14 +530,7 @@ function renderRouting() {
   const logStats = st.logStats || { total: 0, ok: 0, fail: 0 };
   const curMeta = GW_PLATFORMS[st.platform] || {};
 
-  const logRows = (st.logs || []).slice(0, 30).map(l =>
-    '<div class="route-row" style="font-size:12.5px">' +
-    '<div style="flex:1;min-width:0;display:flex;align-items:center;gap:8px">' +
-    '<span style="font-weight:700;flex:0 0 auto">' + (l.ok ? '<span style="color:var(--green,#16a34a)">✓</span>' : '<span style="color:var(--red,#dc2626)">✗</span>') + '</span>' +
-    '<div style="min-width:0"><strong style="font-size:12.5px"><code style="font-size:12px">' + esc(l.model || '(无模型)') + '</code></strong>' +
-    '<div class="subtle" style="margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(l.at) + ' · ' + esc(l.platform) +
-    (l.account ? ' · ' + esc(l.account) : '') + (l.message && !l.ok ? ' · <span style="color:var(--red,#dc2626)">' + esc(l.message) + '</span>' : '') + '</div></div></div>' +
-    '</div>').join('') || '<div class="empty" style="padding:16px">暂无请求日志</div>';
+  const logRows = buildLogRows(st.logs);
 
   el.innerHTML =
     // ===== 网关卡 =====
@@ -568,9 +595,11 @@ function renderRouting() {
     // ===== 请求日志卡 =====
     '<section class="surface route-card">' +
     '<div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px"><h3 style="font-size:14px">请求日志' +
-    '<span class="subtle" style="font-size:11.5px;font-weight:400"> · 最近 ' + Math.min(st.logs?.length || 0, 30) + ' 条 · 总计 ' + logStats.total + ' · <span style="color:var(--green,#16a34a)">成功 ' + logStats.ok + '</span> · <span style="color:var(--red,#dc2626)">失败 ' + logStats.fail + '</span></span></h3>' +
-    ((logStats.total || 0) > 0 ? '<button id="gw-logs-clear" class="small danger-ghost">清空日志</button>' : '') + '</div>' +
-    '<div style="margin-top:10px">' + logRows + '</div></section>';
+    '<span class="subtle" id="gw-logs-stats" style="font-size:11.5px;font-weight:400">' + buildLogStats(st) + '</span></h3>' +
+    '<div style="display:flex;align-items:center;gap:8px">' +
+    '<button id="gw-logs-refresh" class="small">刷新</button>' +
+    ((logStats.total || 0) > 0 ? '<button id="gw-logs-clear" class="small danger-ghost">清空日志</button>' : '') + '</div></div>' +
+    '<div id="gw-logs-list" style="margin-top:10px">' + logRows + '</div></section>';
 
   // ===== 账号切换卡 =====
   refreshGatewayAccounts();
@@ -607,6 +636,26 @@ function renderRouting() {
       toast('已切换请求平台：' + (GW_PLATFORMS[p]?.label || p));
       await refreshGateway(); renderRouting();
     } catch (e) { toast('切换失败: ' + e, 4200); renderRouting(); }
+  });
+  // 请求日志刷新：只重取最新日志并就地更新列表/统计，不重渲染整页（保留输入状态）
+  const refreshLogsBtn = el.querySelector('#gw-logs-refresh');
+  if (refreshLogsBtn) refreshLogsBtn.addEventListener('click', async () => {
+    refreshLogsBtn.disabled = true;
+    const old = refreshLogsBtn.textContent;
+    refreshLogsBtn.textContent = '刷新中…';
+    try {
+      await refreshGateway();
+      if (!GW_STATUS) { toast('网关状态读取失败', 4200); return; }
+      const listEl = el.querySelector('#gw-logs-list');
+      const statsEl = el.querySelector('#gw-logs-stats');
+      if (listEl) listEl.innerHTML = buildLogRows(GW_STATUS.logs);
+      if (statsEl) statsEl.innerHTML = buildLogStats(GW_STATUS);
+      toast('已刷新请求日志');
+    } catch (e) { toast('刷新失败: ' + e, 4200); }
+    finally {
+      refreshLogsBtn.disabled = false;
+      refreshLogsBtn.textContent = old;
+    }
   });
   const clearBtn = el.querySelector('#gw-logs-clear');
   if (clearBtn) clearBtn.addEventListener('click', async () => {
