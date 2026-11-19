@@ -972,22 +972,68 @@ fn find_node() -> Result<String, PlatformError> {
     Err(PlatformError::Local("node.js not found; install Node.js or set NODE_BIN".into()))
 }
 
+/// 编译期嵌入 Qoder 签名器（开发运行 / 未打包资源时也能用；无需依赖 Node 之外的运行时文件布局）
+const QODER_SIGNER_JS: &str = include_str!("../sidecar/qoder-signer.mjs");
+const QODER_SIGNER_WASM: &[u8] = include_bytes!("../sidecar/qoder_auth_wasm_bg.wasm");
+
 fn sidecar_script() -> Result<std::path::PathBuf, PlatformError> {
-    // sidecar 目录：开发时 crates/credit-gateway/sidecar/；打包后在 resource 目录（exe 同级 sidecar/）
-    let candidates = [
-        std::env::var("QODER_SIGNER").ok().map(std::path::PathBuf::from),
-        std::env::current_exe().ok().and_then(|e| e.parent().map(|p| p.join("sidecar/qoder-signer.mjs"))),
-        // Tauri NSIS 安装布局：resources 放在安装根/resources/ 下
-        std::env::current_exe().ok().and_then(|e| e.parent().and_then(|p| p.parent()).map(|p| p.join("resources/sidecar/qoder-signer.mjs"))),
-        std::env::current_exe().ok().and_then(|e| e.parent().map(|p| p.join("../resources/sidecar/qoder-signer.mjs"))),
-        std::env::current_dir().ok().map(|d| d.join("crates/credit-gateway/sidecar/qoder-signer.mjs")),
-    ];
-    for c in candidates.into_iter().flatten() {
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(p) = std::env::var("QODER_SIGNER") {
+        candidates.push(std::path::PathBuf::from(p));
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        let dir = exe.parent().map(|p| p.to_path_buf());
+        if let Some(d) = &dir {
+            // ① 打包后 exe 同级 sidecar/；② Tauri 资源目录；③ 数组式 resources 的 _up_ 布局
+            for rel in [
+                "sidecar/qoder-signer.mjs",
+                "resources/sidecar/qoder-signer.mjs",
+                "_up_/crates/credit-gateway/sidecar/qoder-signer.mjs",
+                "_up_/sidecar/qoder-signer.mjs",
+            ] {
+                candidates.push(d.join(rel));
+            }
+        }
+        // ④ 从 exe 所在目录逐级向上找仓库布局（dev: target/debug → 项目根）
+        let mut cur = dir;
+        for _ in 0..6 {
+            let Some(d) = cur else { break };
+            candidates.push(d.join("crates/credit-gateway/sidecar/qoder-signer.mjs"));
+            candidates.push(d.join("sidecar/qoder-signer.mjs"));
+            cur = d.parent().map(|p| p.to_path_buf());
+        }
+    }
+    // ⑤ 当前工作目录（本地启动项目时通常是仓库根）
+    if let Ok(cwd) = std::env::current_dir() {
+        candidates.push(cwd.join("crates/credit-gateway/sidecar/qoder-signer.mjs"));
+        candidates.push(cwd.join("sidecar/qoder-signer.mjs"));
+    }
+    // ⑥ 编译期源码目录（本机编译出的程序直接命中）
+    candidates.push(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("sidecar/qoder-signer.mjs"));
+
+    for c in candidates {
         if c.exists() {
             return Ok(c);
         }
     }
-    Err(PlatformError::Local("qoder-signer.mjs not found (set QODER_SIGNER)".into()))
+
+    // ⑦ 兜底：把内嵌的 js+wasm 释放到临时目录（安装到其它机器、资源缺失时仍可用）
+    let dir = std::env::temp_dir().join("credit-rs-sidecar");
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| PlatformError::Local(format!("sidecar dir: {e}")))?;
+    let js = dir.join("qoder-signer.mjs");
+    let wasm = dir.join("qoder_auth_wasm_bg.wasm");
+    let js_stale = std::fs::read(&js).map(|b| b != QODER_SIGNER_JS.as_bytes()).unwrap_or(true);
+    if js_stale {
+        std::fs::write(&js, QODER_SIGNER_JS)
+            .map_err(|e| PlatformError::Local(format!("sidecar extract: {e}")))?;
+    }
+    let wasm_stale = std::fs::read(&wasm).map(|b| b != QODER_SIGNER_WASM).unwrap_or(true);
+    if wasm_stale {
+        std::fs::write(&wasm, QODER_SIGNER_WASM)
+            .map_err(|e| PlatformError::Local(format!("sidecar extract: {e}")))?;
+    }
+    Ok(js)
 }
 
 /// 由账号 uid 派生稳定的会话 UUID（同一账号所有请求复用一个上游会话）。
