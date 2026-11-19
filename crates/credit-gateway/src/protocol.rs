@@ -343,6 +343,7 @@ pub fn trae_chat_body(messages: &[Value], model: &str, function: &str, max_token
 }
 
 /// OpenAI messages → 上游 messages（string content 展平为 [{type:"text"}]；developer→system）
+/// 保留 Agent 多轮工具调用所需的 assistant.tool_calls / tool.tool_call_id。
 pub fn normalize_messages(openai_messages: &[Value]) -> (Vec<Value>, String) {
     let mut out: Vec<Value> = Vec::new();
     let mut system_parts: Vec<String> = Vec::new();
@@ -366,12 +367,25 @@ pub fn normalize_messages(openai_messages: &[Value]) -> (Vec<Value>, String) {
         };
         match role {
             "system" | "developer" => system_parts.push(text),
-            "user" | "assistant" | "tool" => {
-                let role = if role == "tool" { "user" } else { role };
-                out.push(json!({
+            "tool" => {
+                // OpenAI 线格式：tool 消息 content 必须是字符串，且需带 tool_call_id
+                let mut msg = json!({ "role": "tool", "content": text });
+                if let Some(id) = m.get("tool_call_id") {
+                    msg["tool_call_id"] = id.clone();
+                }
+                out.push(msg);
+            }
+            "user" | "assistant" => {
+                let mut msg = json!({
                     "role": role,
                     "content": [{ "type": "text", "text": text }],
-                }));
+                });
+                if role == "assistant" {
+                    if let Some(tc) = m.get("tool_calls") {
+                        msg["tool_calls"] = tc.clone();
+                    }
+                }
+                out.push(msg);
             }
             _ => {}
         }
@@ -386,13 +400,20 @@ pub fn wb_chat_body(messages: &[Value], system: &str, model: &str, max_tokens: O
         msgs.push(json!({ "role": "system", "content": system }));
     }
     for m in messages {
-        // 上游要求 content 为数组形状；消息白名单字段（role/content），丢弃外部客户端附加字段（name/tool_calls 等指纹噪声）
+        // 上游要求 content 为数组形状；保留 Agent 工具调用回合的 tool_calls / tool_call_id
         let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("user").to_string();
         let content = m.get("content").cloned().unwrap_or(json!([]));
         let mut mm = json!({ "role": role, "content": content });
-        if mm.get("content").map(|c| c.is_string()).unwrap_or(false) {
+        // tool 消息的 content 保持字符串（OpenAI 线格式要求）
+        if role != "tool" && mm.get("content").map(|c| c.is_string()).unwrap_or(false) {
             let text = mm["content"].as_str().unwrap_or("").to_string();
             mm["content"] = json!([{ "type": "text", "text": text }]);
+        }
+        if role == "assistant" {
+            if let Some(tc) = m.get("tool_calls") { mm["tool_calls"] = tc.clone(); }
+        }
+        if role == "tool" {
+            if let Some(id) = m.get("tool_call_id") { mm["tool_call_id"] = id.clone(); }
         }
         msgs.push(mm);
     }
@@ -677,4 +698,60 @@ pub fn codearts_chat_body(messages: &[Value], system: &str, model: &str, max_tok
 
 // 码道 chat 请求头在 upstream::codearts_chat_stream 内构造（需要 Cred 全量字段）
 // 此处仅保留 body 构造。
+
+// ============================ 工具调用（function calling）透传 ============================
+
+/// OpenAI 风格透传：tools 原样 + tool_choice（codearts / workbuddy / qoder / zcode 普通 OpenAI 端点）
+pub fn attach_openai_tools(body: &mut Value, tools: &[Value], tool_choice: Option<&Value>) {
+    if tools.is_empty() { return; }
+    body["tools"] = json!(tools);
+    if let Some(tc) = tool_choice {
+        // OpenAI: "auto" | "none" | "required" | {type:"function", function:{name}}
+        body["tool_choice"] = tc.clone();
+    }
+}
+
+/// Anthropic 风格转换：{name, description, input_schema} + tool_choice {type:auto|any|tool}
+pub fn attach_anthropic_tools(body: &mut Value, tools: &[Value], tool_choice: Option<&Value>) {
+    if tools.is_empty() { return; }
+    let converted: Vec<Value> = tools.iter().filter_map(|t| {
+        let f = t.get("function")?;
+        let name = f.get("name").and_then(|n| n.as_str())?;
+        Some(json!({
+            "name": name,
+            "description": f.get("description").cloned().unwrap_or(Value::Null),
+            "input_schema": f.get("parameters").cloned().unwrap_or(json!({ "type": "object", "properties": {} })),
+        }))
+    }).collect();
+    if converted.is_empty() { return; }
+    body["tools"] = json!(converted);
+    if let Some(tc) = tool_choice {
+        let mapped = match tc {
+            Value::String(s) if s == "auto" => json!({ "type": "auto" }),
+            Value::String(s) if s == "none" => Value::Null,
+            Value::String(s) if s == "required" => json!({ "type": "any" }),
+            Value::Object(o) => {
+                let name = o.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str()).unwrap_or("");
+                if name.is_empty() { json!({ "type": "auto" }) } else { json!({ "type": "tool", "name": name }) }
+            }
+            _ => json!({ "type": "auto" }),
+        };
+        if !mapped.is_null() { body["tool_choice"] = mapped; }
+    }
+}
+
+/// Trae SOLO：tools[].function.parameters 需要是 **JSON 字符串**（官方 prepareSoloBody 行为）
+pub fn attach_trae_tools(body: &mut Value, tools: &[Value]) {
+    if tools.is_empty() { return; }
+    let converted: Vec<Value> = tools.iter().map(|t| {
+        let mut t = t.clone();
+        if let Some(params) = t.pointer_mut("/function/parameters") {
+            if !matches!(params, Value::String(_)) {
+                *params = json!(params.to_string());
+            }
+        }
+        t
+    }).collect();
+    body["tools"] = json!(converted);
+}
 

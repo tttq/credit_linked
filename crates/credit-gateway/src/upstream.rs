@@ -19,6 +19,8 @@ use crate::protocol::*;
 pub enum StreamEvent {
     Text(String),
     Reasoning(String),
+    /// 工具调用增量（OpenAI `choices[].delta.tool_calls[]` 语义）
+    ToolCall { index: u32, id: Option<String>, name: Option<String>, arguments: Option<String> },
     Usage { input: u64, output: u64, total: Option<u64> },
     Done { finish: String },
     Error(String, String),
@@ -460,6 +462,18 @@ fn parse_event_block(block: &str) -> Option<(String, String)> {
     Some((event_name, data))
 }
 
+/// 工具参数归一化为字符串：上游可能给 string（增量片段）或已解析的 object。
+fn tool_args_str(v: Option<&Value>) -> Option<String> {
+    match v {
+        Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
+        Some(Value::Null) | None => None,
+        Some(other) => {
+            let s = other.to_string();
+            if s.is_empty() { None } else { Some(s) }
+        }
+    }
+}
+
 /// OpenAI 线格式 chunk → 事件列表
 pub fn parse_openai_chunk(v: &Value) -> Vec<StreamEvent> {
     let mut out = Vec::new();
@@ -489,6 +503,25 @@ pub fn parse_openai_chunk(v: &Value) -> Vec<StreamEvent> {
             if let Some(c) = delta.get("content").and_then(|c| c.as_str()) {
                 if !c.is_empty() {
                     out.push(StreamEvent::Text(c.to_string()));
+                }
+            }
+            // 工具调用增量（Agent 客户端依赖）：delta.tool_calls[] 或兼容旧式 delta.function_call
+            if let Some(tcs) = delta.get("tool_calls").and_then(|t| t.as_array()) {
+                for tc in tcs {
+                    let index = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as u32;
+                    let id = tc.get("id").and_then(|i| i.as_str()).filter(|s| !s.is_empty()).map(|s| s.to_string());
+                    let func = tc.get("function").cloned().unwrap_or(Value::Null);
+                    let name = func.get("name").and_then(|n| n.as_str()).filter(|s| !s.is_empty()).map(|s| s.to_string());
+                    let args = tool_args_str(func.get("arguments"));
+                    if id.is_some() || name.is_some() || args.is_some() {
+                        out.push(StreamEvent::ToolCall { index, id, name, arguments: args });
+                    }
+                }
+            } else if let Some(func) = delta.get("function_call") {
+                let name = func.get("name").and_then(|n| n.as_str()).filter(|s| !s.is_empty()).map(|s| s.to_string());
+                let args = tool_args_str(func.get("arguments"));
+                if name.is_some() || args.is_some() {
+                    out.push(StreamEvent::ToolCall { index: 0, id: None, name, arguments: args });
                 }
             }
             if let Some(fr) = ch.get("finish_reason").and_then(|f| f.as_str()) {
@@ -957,6 +990,19 @@ fn sidecar_script() -> Result<std::path::PathBuf, PlatformError> {
     Err(PlatformError::Local("qoder-signer.mjs not found (set QODER_SIGNER)".into()))
 }
 
+/// 由账号 uid 派生稳定的会话 UUID（同一账号所有请求复用一个上游会话）。
+/// 码道上游限制「并发会话数 ≤ 3」：早期实现每请求生成新 user-session-id，
+/// Agent 并发/多轮调用时瞬间创建多个会话，触发 TM.00001041 直接失败（表现为请求断掉/无法处理）。
+fn stable_session_id(uid: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(b"credit-rs/session/");
+    h.update(uid.as_bytes());
+    let d = h.finalize();
+    let hex = d.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    format!("{}-{}-{}-{}-{}", &hex[0..8], &hex[8..12], &hex[12..16], &hex[16..20], &hex[20..32])
+}
+
 /// 华为码道 chat：POST {snap-access}/api/v2/chat/completions（OpenAI 兼容 SSE）。
 /// 签名头集与 PromptCenter 门面不同：无 agent-type；x-auth-token 与 x-security-token 同值。
 /// desktop/IDE 仅影响通道头（x-ot-client-type / ide-name / plugin-name）。
@@ -997,7 +1043,7 @@ pub async fn codearts_chat_stream(cred: &Cred, body: Value, desktop: bool) -> Re
     let extra: Vec<(String, String)> = vec![
         ("x-security-token".into(), sts.to_string()),
         ("x-auth-token".into(), sts.to_string()),
-        ("user-session-id".into(), uuid::Uuid::new_v4().to_string()),
+        ("user-session-id".into(), stable_session_id(&cred.uid)),
         ("x-snap-traceid".into(), trace.clone()),
         ("x-span-id".into(), uuid::Uuid::new_v4().to_string()),
         ("traceid".into(), trace.clone()),
@@ -1015,25 +1061,40 @@ pub async fn codearts_chat_stream(cred: &Cred, body: Value, desktop: bool) -> Re
         ("model-name".into(), model),
     ];
     let host_of = host.to_string();
-    let (auth, signed) = credit_core::adapters::codearts::sign_codearts(ak, sk, "POST", &host_of, path, "", &extra, &body_str, Some(sts));
     let client = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(20))
         .read_timeout(std::time::Duration::from_secs(180))
         .build().unwrap();
     let url = format!("https://{host}{path}");
-    let mut req = client.post(&url).header("Content-Type", "application/json");
-    for (k, v) in &signed {
-        req = req.header(k, v);
-    }
-    req = req.header("Authorization", &auth).body(body_str);
-    let resp = req.send().await.map_err(|e| format!("network: {e}"))?;
-    let status = resp.status().as_u16();
-    if !(200..300).contains(&status) {
+    // 并发会话上限（TM.00001041）自动退避重试：Agent 并发调用时偶发，等前序会话结束后即可成功
+    let mut last_err = String::new();
+    for attempt in 0..4u32 {
+        if attempt > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(500 * attempt as u64 + 300)).await;
+        }
+        let (auth, signed) = credit_core::adapters::codearts::sign_codearts(ak, sk, "POST", &host_of, path, "", &extra, &body_str, Some(sts));
+        let mut req = client.post(&url).header("Content-Type", "application/json");
+        for (k, v) in &signed {
+            req = req.header(k, v);
+        }
+        req = req.header("Authorization", &auth).body(body_str.clone());
+        let resp = match req.send().await {
+            Ok(r) => r,
+            Err(e) => return Err(format!("network: {e}")),
+        };
+        let status = resp.status().as_u16();
+        if (200..300).contains(&status) {
+            return Ok(parse_openai_sse(resp.bytes_stream()));
+        }
         let text = resp.text().await.unwrap_or_default();
-        return Err(format!("CodeArts chat HTTP {status}: {}", truncate(&text, 300)));
+        let busy = text.contains("TM.00001041") || text.contains("并发会话数");
+        last_err = format!("CodeArts chat HTTP {status}: {}", truncate(&text, 300));
+        if !busy {
+            return Err(last_err);
+        }
+        eprintln!("[codearts] 并发会话已满，退避重试 {}/4", attempt + 1);
     }
-    // OpenAI 兼容 SSE（data: 帧 + [DONE]），reasoning_content 已被 parse_openai_chunk 支持
-    Ok(parse_openai_sse(resp.bytes_stream()))
+    Err(last_err)
 }
 
 /// 华为码道模型清单：GET {API_BASE}/v1/model/builtin（HWS 签名 + x-security-token）

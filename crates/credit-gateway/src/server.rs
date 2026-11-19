@@ -550,6 +550,9 @@ async fn chat_completions(
     let max_tokens = body.get("max_tokens").and_then(|v| v.as_u64()).map(|v| v as u32)
         .or_else(|| body.get("max_completion_tokens").and_then(|v| v.as_u64()).map(|v| v as u32));
     let reasoning_effort = body.get("reasoning_effort").and_then(|v| v.as_str()).map(|s| s.to_string());
+    // Agent 客户端（Cline/Roo/DSH/Cherry 等）依赖的 function calling 字段
+    let tools: Vec<Value> = body.get("tools").and_then(|t| t.as_array()).cloned().unwrap_or_default();
+    let tool_choice = body.get("tool_choice").cloned();
     let stream = body.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
     let _ = body.get("temperature"); // 上游不接受 temperature 的通道直接忽略
 
@@ -590,7 +593,7 @@ async fn chat_completions(
         }
         for cred in &creds {
             let mut attempt_cred = cred.clone();
-            let mut outcome = dispatch_stream(&st, platform, &attempt_cred, &model, &messages, &system, max_tokens, reasoning_effort.as_deref()).await;
+            let mut outcome = dispatch_stream(&st, platform, &attempt_cred, &model, &messages, &system, max_tokens, reasoning_effort.as_deref(), &tools, tool_choice.as_ref()).await;
             // 凭据自愈：minimax/zcode/码道的 token 由本机客户端持续轮换，401 时重读客户端存储
             // （token 未变则自动拉起客户端并等其刷新）再试一次
             if let Err((code, msg)) = &outcome {
@@ -615,7 +618,7 @@ async fn chat_completions(
                                 .and_then(|(_, _, _, _, auth)| serde_json::from_str::<Cred>(auth).ok()));
                         if let Some(nc) = pick {
                             attempt_cred = nc;
-                            outcome = dispatch_stream(&st, platform, &attempt_cred, &model, &messages, &system, max_tokens, reasoning_effort.as_deref()).await;
+                            outcome = dispatch_stream(&st, platform, &attempt_cred, &model, &messages, &system, max_tokens, reasoning_effort.as_deref(), &tools, tool_choice.as_ref()).await;
                         }
                     }
                 }
@@ -709,10 +712,13 @@ async fn dispatch_stream(
     system: &str,
     max_tokens: Option<u32>,
     reasoning_effort: Option<&str>,
+    tools: &[Value],
+    tool_choice: Option<&Value>,
 ) -> Result<EventStream, (String, String)> {
     match platform {
         Platform::WorkBuddy | Platform::WorkBuddyIntl => {
-            let body = crate::protocol::wb_chat_body(messages, system, model, max_tokens, reasoning_effort, &cred.uid);
+            let mut body = crate::protocol::wb_chat_body(messages, system, model, max_tokens, reasoning_effort, &cred.uid);
+            crate::protocol::attach_openai_tools(&mut body, tools, tool_choice);
             // 设备身份（同步派生 + token 缓存刷新，避免跨 await 持锁）
             let (dev_token, machine, session) = wb_device_identity(st, &cred.uid);
             let device = if dev_token.is_empty() && machine.is_empty() { None } else { Some((dev_token.as_str(), machine.as_str(), session.as_str())) };
@@ -730,7 +736,8 @@ async fn dispatch_stream(
             let mut last: Result<EventStream, (String, String)> =
                 Err(("upstream".to_string(), "trae: no attempt".to_string()));
             for f in funcs {
-                let body = crate::protocol::trae_chat_body(messages, model, &f, max_tokens, reasoning_effort, enterprise);
+                let mut body = crate::protocol::trae_chat_body(messages, model, &f, max_tokens, reasoning_effort, enterprise);
+                crate::protocol::attach_trae_tools(&mut body, tools);
                 match upstream::trae_chat_stream(cred, intl, enterprise, body).await {
                     Ok(s) => return Ok(s),
                     Err(e) => {
@@ -747,24 +754,49 @@ async fn dispatch_stream(
         }
         Platform::Zcode => {
             let thinking = !matches!(reasoning_effort, Some("off") | Some("none"));
-            let body = crate::protocol::zcode_chat_body(messages, system, model, max_tokens, thinking);
+            let mut body = crate::protocol::zcode_chat_body(messages, system, model, max_tokens, thinking);
+            crate::protocol::attach_anthropic_tools(&mut body, tools, tool_choice);
             upstream::zcode_chat_stream(cred, body).await.map_err(|e| ("upstream".to_string(), e))
         }
         Platform::Minimax => {
-            let body = crate::protocol::minimax_chat_body(messages, system, model, max_tokens);
+            let mut body = crate::protocol::minimax_chat_body(messages, system, model, max_tokens);
+            crate::protocol::attach_anthropic_tools(&mut body, tools, tool_choice);
             upstream::minimax_chat_stream(cred, body).await.map_err(|e| ("upstream".to_string(), e))
         }
         Platform::Qoder => {
-            let body = crate::protocol::qoder_chat_body(messages, model);
+            let mut body = crate::protocol::qoder_chat_body(messages, model);
+            crate::protocol::attach_openai_tools(&mut body, tools, tool_choice);
             upstream::qoder_chat_stream(cred, body).await.map_err(|e| ("upstream".to_string(), e))
         }
         Platform::CodeArts => {
             // 码道对话：desktop/IDE 通道头区分，凭据共用同一 STS 会话
             let desktop = cred.provider == "codearts-desktop";
-            let body = crate::protocol::codearts_chat_body(messages, system, model, max_tokens, reasoning_effort.as_deref());
-            upstream::codearts_chat_stream(cred, body, desktop).await.map_err(|e| ("upstream".to_string(), e))
+            let mut body = crate::protocol::codearts_chat_body(messages, system, model, max_tokens, reasoning_effort.as_deref());
+            crate::protocol::attach_openai_tools(&mut body, tools, tool_choice);
+            // 码道上游限制「并发会话数 ≤ 3」：按账号做并发闸门（最多 2 个在途），其余排队，
+            // 避免 Agent 并发调用时被打满返回 TM.00001041（表现为请求失败/断掉）
+            let sem = account_semaphore(&format!("codearts:{}", cred.uid), 2);
+            let permit = sem.acquire_owned().await.map_err(|_| ("upstream".to_string(), "codearts 并发闸门已关闭".to_string()))?;
+            let events = upstream::codearts_chat_stream(cred, body, desktop).await.map_err(|e| ("upstream".to_string(), e))?;
+            // permit 随流存活：流读完/断开前不释放槽位
+            Ok(Box::pin(futures_util::StreamExt::map(events, move |ev| {
+                let _ = &permit;
+                ev
+            })))
         }
     }
+}
+
+/// 按账号的在途请求信号量（key = provider:uid）。用于上游有并发上限的平台（如码道 3 并发）。
+fn account_semaphore(key: &str, permits: usize) -> Arc<tokio::sync::Semaphore> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static MAP: OnceLock<Mutex<HashMap<String, Arc<tokio::sync::Semaphore>>>> = OnceLock::new();
+    let map = MAP.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut g = map.lock().unwrap();
+    g.entry(key.to_string())
+        .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(permits)))
+        .clone()
 }
 
 /// SSE 流式响应（OpenAI chat.completion.chunk 线格式）
@@ -787,6 +819,9 @@ fn stream_response(st: &Arc<GatewayState>, model: &str, platform: &str, account_
 
     // 流结束时补写一条失败日志：正常（收到 Done 且无错误）则跳过
     let stats = Arc::new(std::sync::Mutex::new((0u64, 0u64, false, Option::<String>::None)));
+    // 工具调用计数：上游常以 finish=stop 结束但携带 tool_calls，Agent 客户端要求 finish=tool_calls
+    let tool_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let tool_seen2 = tool_seen.clone();
     let stats2 = stats.clone();
     let store2 = st.store.clone();
     let platform2 = platform.clone();
@@ -812,6 +847,18 @@ fn stream_response(st: &Arc<GatewayState>, model: &str, platform: &str, account_
                 "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
                 "choices": [{ "index": 0, "delta": { "reasoning_content": t }, "finish_reason": null }],
             }),
+            Ok(StreamEvent::ToolCall { index, id: tool_id, name, arguments }) => {
+                tool_seen2.store(true, std::sync::atomic::Ordering::Relaxed);
+                let mut tc = json!({ "index": index });
+                if let Some(tid) = &tool_id { tc["id"] = json!(tid); }
+                tc["type"] = json!("function");
+                if let Some(n) = &name { tc["function"]["name"] = json!(n); }
+                if let Some(a) = &arguments { tc["function"]["arguments"] = json!(a); }
+                json!({
+                    "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
+                    "choices": [{ "index": 0, "delta": { "tool_calls": [tc] }, "finish_reason": null }],
+                })
+            },
             Ok(StreamEvent::Usage { input, output, total }) => json!({
                 "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
                 "choices": [],
@@ -821,10 +868,14 @@ fn stream_response(st: &Arc<GatewayState>, model: &str, platform: &str, account_
                     "total_tokens": total.unwrap_or(input + output),
                 },
             }),
-            Ok(StreamEvent::Done { finish }) => json!({
-                "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
-                "choices": [{ "index": 0, "delta": {}, "finish_reason": normalize_finish(&finish) }],
-            }),
+            Ok(StreamEvent::Done { finish }) => {
+                let mut fr = normalize_finish(&finish);
+                if fr == "stop" && tool_seen2.load(std::sync::atomic::Ordering::Relaxed) { fr = "tool_calls".to_string(); }
+                json!({
+                    "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
+                    "choices": [{ "index": 0, "delta": {}, "finish_reason": fr }],
+                })
+            },
             Ok(StreamEvent::Error(msg, code)) => json!({
                 "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
                 "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }],
@@ -885,12 +936,20 @@ async fn blocking_response(
     let mut reasoning = String::new();
     let mut usage: Option<(u64, u64, Option<u64>)> = None;
     let mut failure: Option<String> = None;
+    // 工具调用聚合：index → (id, name, arguments 片段)
+    let mut tool_calls: std::collections::BTreeMap<u32, (Option<String>, String, String)> = Default::default();
 
     let mut stream = std::pin::pin!(events);
     while let Some(ev) = stream.next().await {
         match ev {
             Ok(StreamEvent::Text(t)) => text.push_str(&t),
             Ok(StreamEvent::Reasoning(t)) => reasoning.push_str(&t),
+            Ok(StreamEvent::ToolCall { index, id, name, arguments }) => {
+                let entry = tool_calls.entry(index).or_default();
+                if let Some(i) = id { entry.0 = Some(i); }
+                if let Some(n) = name { entry.1.push_str(&n); }
+                if let Some(a) = arguments { entry.2.push_str(&a); }
+            }
             Ok(StreamEvent::Usage { input, output, total }) => usage = Some((input, output, total)),
             Ok(StreamEvent::Done { .. }) => {}
             Ok(StreamEvent::Error(msg, _)) => failure = Some(msg),
@@ -903,7 +962,7 @@ async fn blocking_response(
             return (err_response(StatusCode::BAD_GATEWAY, "upstream", &msg), false);
         }
     }
-    if text.is_empty() && reasoning.is_empty() {
+    if text.is_empty() && reasoning.is_empty() && tool_calls.is_empty() {
         empty_stream = true;
     }
     let created = std::time::SystemTime::now()
@@ -915,6 +974,18 @@ async fn blocking_response(
     if !reasoning.is_empty() {
         message["reasoning_content"] = json!(reasoning);
     }
+    let finish_reason = if tool_calls.is_empty() { "stop" } else { "tool_calls" };
+    if !tool_calls.is_empty() {
+        let arr: Vec<serde_json::Value> = tool_calls.into_iter().map(|(idx, (id, name, args))| {
+            json!({
+                "index": idx,
+                "id": id.unwrap_or_else(|| format!("call_{}", uuid::Uuid::new_v4().simple())),
+                "type": "function",
+                "function": { "name": name, "arguments": args },
+            })
+        }).collect();
+        message["tool_calls"] = json!(arr);
+    }
     let resp = Json(json!({
         "id": format!("chatcmpl-{}", uuid::Uuid::new_v4().simple()),
         "object": "chat.completion",
@@ -924,7 +995,7 @@ async fn blocking_response(
         "choices": [{
             "index": 0,
             "message": message,
-            "finish_reason": "stop",
+            "finish_reason": finish_reason,
         }],
         "usage": {
             "prompt_tokens": input,
