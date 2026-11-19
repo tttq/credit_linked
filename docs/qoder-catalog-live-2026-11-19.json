@@ -1,0 +1,459 @@
+{
+  "ok": true,
+  "via": "live",
+  "count": 14,
+  "models": [
+    {
+      "value": "auto",
+      "displayName": "Auto",
+      "description": "",
+      "descriptionEn": "",
+      "modelId": "auto",
+      "source": "system",
+      "isDefault": true,
+      "isEnabled": true,
+      "isReasoning": true,
+      "isVl": true,
+      "priceFactor": 0.3,
+      "maxInputTokens": 200000,
+      "availableContextWindows": [
+        200000,
+        400000,
+        1000000
+      ],
+      "defaultContextWindow": 200000,
+      "format": "openai",
+      "serverScene": "assistant"
+    },
+    {
+      "value": "fast",
+      "displayName": "Fast",
+      "description": "",
+      "descriptionEn": "",
+      "modelId": "fast",
+      "source": "system",
+      "isEnabled": true,
+      "isReasoning": true,
+      "isVl": true,
+      "priceFactor": 0.6,
+      "maxInputTokens": 200000,
+      "availableContextWindows": [
+        200000,
+        400000,
+        1000000
+      ],
+      "defaultContextWindow": 200000,
+      "format": "openai",
+      "serverScene": "assistant"
+    },
+    {
+      "value": "qmodel_latest",
+      "displayName": "Qwen4-Max",
+      "description": "",
+      "descriptionEn": "",
+      "modelId": "qmodel_latest",
+      "source": "system",
+      "isEnabled": true,
+      "isNew": true,
+      "isReasoning": true,
+      "isVl": true,
+      "priceFactor": 0.4,
+      "maxInputTokens": 1000000,
+      "efforts": [
+        "xhigh",
+        "high",
+        "low"
+      ],
+      "defaultEffort": "high",
+      "supportsDisabled": true,
+      "availableContextWindows": [
+        200000,
+        400000,
+        1000000
+      ],
+      "defaultContextWindow": 200000,
+      "tags": [
+        "new"
+      ],
+      "format": "openai",
+      "serverScene": "assistant",
+      "icon": "QoderQwenAiFill"
+    },
+    {
+      "value": "qmodel_latest_preview",
+      "displayName": "Qwen4-Max-Preview",
+      "description": "",
+      "descriptionEn": "",
+      "modelId": "qmodel_latest_preview",
+      "source": "system",
+      "isEnabled": true,
+      "isNew": true,
+      "isReasoning": true,
+      "isVl": true,
+      "priceFactor": 0.1,
+      "originalPriceFactor": 0.5,
+      "maxInputTokens": 1000000,
+      "efforts": [
+        "xhigh",
+        "high",
+        "low"
+      ],
+      "defaultEffort": "high",
+      "supportsDisabled": true,
+      "availableContextWindows": [
+        200000,
+        400000,
+        1000000
+      ],
+      "defaultContextWindow": 200000,
+      "tags": [
+        "new"
+      ],
+      "format": "openai",
+      "serverScene": "assistant",
+      "icon": "QoderQwenAiFill"
+    },
+    {
+      "value": "qmodel_38max",
+      "displayName": "Qwen3.8-Max",
+      "description": "",
+      "descriptionEn": "",
+      "modelId": "qmodel_38max",
+      "source": "system",
+      "isEnabled": true,
+      "isNew": true,
+      "isReasoning": true,
+      "isVl": true,
+      "priceFactor": 0.5,
+      "maxInputTokens": 180000,
+      "efforts": [
+        "xhigh",
+        "low",
+        "medium"
+      ],
+      "defaultEffort": "medium",
+      "supportsDisabled": true,
+      "availableContextWindows": [
+        200000,
+        400000,
+        1000000
+      ],
+      "defaultContextWindow": 200000,
+      "format": "openai",
+      "serverScene": "assistant",
+      "icon": "QoderQwenAiFill",
+      "promotion": {
+        "active": false,
+        "badge": {
+          "en": "Off-Peak 60% off",
+          "zh": "错峰 4 折"
+        },
+        "description": {
+          "en": "Off-Peak 60% off (10 PM-8 AM UTC+8)",
+          "zh": "错峰时段4折优惠（10 PM-8 AM UTC+8）"
+        },
+        "discount_factor": 0.4,
+        "before_promotion_price_factor": 0.5,
+        "timezone": "Asia/Shanghai",
+        "rule_id": "idle_time_model_credit_discount",
+        "window_start": "22:00",
+        "window_end": "08:00"
+      }
+    },
+    {
+      "value": "qfmodel",
+      "displayName": "Qwen3.8-Flash",
+      "description": "",
+      "descriptionEn": "",
+      "modelId": "qfmodel",
+      "source": "system",
+      "isEnabled": true,
+      "isNew": true,
+      "isFree": true,
+      "isReasoning": true,
+      "isVl": true,
+      "priceFactor": 0.1,
+      "maxInputTokens": 180000,
+      "efforts": [
+        "xhigh",
+        "low",
+        "medium"
+      ],
+      "defaultEffort": "medium",
+      "supportsDisabled": true,
+      "availableContextWindows": [
+        200000,
+        400000,
+        1000000
+      ],
+      "defaultContextWindow": 200000,
+      "format": "openai",
+      "serverScene": "assistant",
+      "icon": "QoderQwenAiFill",
+      "promotion": {
+        "active": false,
+        "badge": {
+          "en": "Off-Peak 60% off",
+          "zh": "错峰 4 折"
+        },
+        "description": {
+          "en": "Off-Peak 60% off (10 PM-8 AM UTC+8)",
+          "zh": "错峰时段4折优惠（10 PM-8 AM UTC+8）"
+        },
+        "discount_factor": 0.4,
+        "before_promotion_price_factor": 0.1,
+        "timezone": "Asia/Shanghai",
+        "rule_id": "idle_time_model_credit_discount",
+        "window_start": "22:00",
+        "window_end": "08:00"
+      }
+    },
+    {
+      "value": "dmodel",
+      "displayName": "DeepSeek-V4-Pro",
+      "description": "",
+      "descriptionEn": "",
+      "modelId": "dmodel",
+      "source": "system",
+      "isEnabled": true,
+      "isNew": true,
+      "isReasoning": true,
+      "isVl": true,
+      "priceFactor": 0.5,
+      "maxInputTokens": 96000,
+      "efforts": [
+        "high",
+        "max"
+      ],
+      "defaultEffort": "max",
+      "supportsDisabled": true,
+      "availableContextWindows": [
+        200000,
+        400000,
+        1000000
+      ],
+      "defaultContextWindow": 200000,
+      "format": "openai",
+      "serverScene": "assistant",
+      "icon": "QoderDeepseekFill"
+    },
+    {
+      "value": "dfmodel",
+      "displayName": "DeepSeek-Flash",
+      "description": "",
+      "descriptionEn": "",
+      "modelId": "dfmodel",
+      "source": "system",
+      "isEnabled": true,
+      "isNew": true,
+      "isReasoning": true,
+      "isVl": true,
+      "priceFactor": 0.1,
+      "maxInputTokens": 180000,
+      "efforts": [
+        "high",
+        "max",
+        "low"
+      ],
+      "defaultEffort": "high",
+      "supportsDisabled": true,
+      "availableContextWindows": [
+        200000,
+        400000,
+        1000000
+      ],
+      "defaultContextWindow": 200000,
+      "format": "openai",
+      "serverScene": "assistant",
+      "icon": "QoderDeepseekFill"
+    },
+    {
+      "value": "gmodel",
+      "displayName": "GLM-5.3",
+      "description": "",
+      "descriptionEn": "",
+      "modelId": "gmodel",
+      "source": "system",
+      "isEnabled": true,
+      "isNew": true,
+      "isFree": false,
+      "isReasoning": true,
+      "isVl": true,
+      "priceFactor": 0.8,
+      "maxInputTokens": 180000,
+      "efforts": [
+        "high",
+        "low",
+        "max"
+      ],
+      "defaultEffort": "high",
+      "supportsDisabled": true,
+      "availableContextWindows": [
+        200000,
+        400000,
+        1000000
+      ],
+      "defaultContextWindow": 200000,
+      "format": "openai",
+      "serverScene": "assistant",
+      "icon": "QoderZhipuAiFill"
+    },
+    {
+      "value": "gfmodel",
+      "displayName": "GLM-5.3-Flash",
+      "description": "",
+      "descriptionEn": "",
+      "modelId": "gfmodel",
+      "source": "system",
+      "isEnabled": true,
+      "isNew": true,
+      "isReasoning": true,
+      "isVl": true,
+      "priceFactor": 0.1,
+      "maxInputTokens": 1000000,
+      "efforts": [
+        "high",
+        "max"
+      ],
+      "defaultEffort": "max",
+      "supportsDisabled": true,
+      "availableContextWindows": [
+        200000,
+        400000,
+        1000000
+      ],
+      "defaultContextWindow": 200000,
+      "format": "openai",
+      "serverScene": "assistant"
+    },
+    {
+      "value": "kmodel_latest",
+      "displayName": "Kimi-K3.1-Pro",
+      "description": "",
+      "descriptionEn": "",
+      "modelId": "kmodel_latest",
+      "source": "system",
+      "isEnabled": true,
+      "isNew": true,
+      "isFree": false,
+      "isReasoning": true,
+      "isVl": true,
+      "priceFactor": 1,
+      "maxInputTokens": 180000,
+      "efforts": [
+        "high",
+        "low",
+        "max"
+      ],
+      "defaultEffort": "high",
+      "supportsDisabled": true,
+      "availableContextWindows": [
+        200000,
+        400000,
+        1000000
+      ],
+      "defaultContextWindow": 200000,
+      "tags": [
+        "new"
+      ],
+      "format": "openai",
+      "serverScene": "assistant"
+    },
+    {
+      "value": "kmodel",
+      "displayName": "Kimi-K2.8-Preview",
+      "description": "",
+      "descriptionEn": "",
+      "modelId": "kmodel",
+      "source": "system",
+      "isEnabled": true,
+      "isNew": true,
+      "isReasoning": true,
+      "isVl": true,
+      "priceFactor": 0.8,
+      "maxInputTokens": 180000,
+      "efforts": [
+        "high",
+        "low",
+        "max"
+      ],
+      "defaultEffort": "high",
+      "supportsDisabled": true,
+      "availableContextWindows": [
+        200000,
+        400000,
+        1000000
+      ],
+      "defaultContextWindow": 200000,
+      "format": "openai",
+      "serverScene": "assistant",
+      "icon": "QoderKimiFill"
+    },
+    {
+      "value": "jmodel",
+      "displayName": "Step-5-Preview",
+      "description": "",
+      "descriptionEn": "",
+      "modelId": "jmodel",
+      "source": "system",
+      "isEnabled": true,
+      "isNew": true,
+      "isFree": false,
+      "isReasoning": true,
+      "isVl": true,
+      "priceFactor": 0.3,
+      "maxInputTokens": 1000000,
+      "efforts": [
+        "high",
+        "low",
+        "medium"
+      ],
+      "defaultEffort": "high",
+      "supportsDisabled": true,
+      "availableContextWindows": [
+        200000,
+        400000,
+        1000000
+      ],
+      "defaultContextWindow": 200000,
+      "tags": [
+        "new"
+      ],
+      "format": "openai",
+      "serverScene": "assistant",
+      "icon": "QoderStepfunFill"
+    },
+    {
+      "value": "mmodel",
+      "displayName": "MiniMax-M3.1-Flash",
+      "description": "",
+      "descriptionEn": "",
+      "modelId": "mmodel",
+      "source": "system",
+      "isEnabled": true,
+      "isNew": true,
+      "isReasoning": true,
+      "isVl": true,
+      "priceFactor": 0.1,
+      "maxInputTokens": 180000,
+      "efforts": [
+        "xhigh",
+        "high",
+        "low",
+        "max",
+        "medium"
+      ],
+      "defaultEffort": "xhigh",
+      "supportsDisabled": true,
+      "availableContextWindows": [
+        200000,
+        400000,
+        1000000
+      ],
+      "defaultContextWindow": 200000,
+      "format": "openai",
+      "serverScene": "assistant",
+      "icon": "QoderMinimaxFill"
+    }
+  ]
+}

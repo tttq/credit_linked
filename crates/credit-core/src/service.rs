@@ -66,6 +66,128 @@ impl Service {
         Ok(nc)
     }
 
+    /// 按 provider+uid 从库里取最新凭据
+    fn pick_cred(&self, provider: &str, uid: &str) -> Option<Cred> {
+        let rows = self.store.list_accounts().ok()?;
+        rows.iter()
+            .find(|(p, u, _, _, _)| p == provider && u == uid)
+            .and_then(|(_, _, _, _, auth)| serde_json::from_str::<Cred>(auth).ok())
+    }
+
+    /// CodeArts 凭据自动续期（STS 一次性 RT 场景的标准做法）：
+    /// ① 本机客户端会话已变化（客户端自己刷新过）→ 重新扫描导入；
+    /// ② 客户端在运行且会话未变 → 等它刷新（最多 20s）后再导入；
+    /// ③ 客户端没在跑 → 网关自己用 STS refresh（RT+PKCE+DPoP）续期，成功后
+    ///    把新 AK/SK/ST/RT 落库并**回写客户端 secretStorage**（两边保持同一份 RT）；
+    /// ④ 续期失败且客户端已安装 → 拉起客户端等它刷新/重新登录后再导入。
+    pub async fn ensure_codearts_fresh(&self, cred: &Cred) -> Result<Cred, PlatformError> {
+        use crate::adapters::codearts_local as local;
+        let desktop = cred.provider == "codearts-desktop";
+        let stale_st = cred.meta.get("security_token").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        // ① 本地会话已更新 → 重新导入（使用磁盘上客户端回写的最新 STS）
+        if let Some(live) = local::read_live_session(desktop).or_else(|| local::read_live_session(!desktop)) {
+            let cur_st = live.session.pointer("/session/securityToken").and_then(|v| v.as_str()).unwrap_or("");
+            if !cur_st.is_empty() && cur_st != stale_st {
+                if self.import_account(&cred.provider, false).await.is_ok() {
+                    if let Some(c) = self.pick_cred(&cred.provider, &cred.uid) {
+                        return Ok(c);
+                    }
+                }
+            }
+            // ② 客户端在跑 → 等它按自己的周期刷新（不抢它的 RT）
+            if local::client_running() {
+                let old_fp = local::session_fingerprint(desktop);
+                let changed = tokio::task::spawn_blocking(move || {
+                    local::wait_for_session_change(desktop, old_fp.as_deref(), std::time::Duration::from_secs(20))
+                })
+                .await
+                .ok()
+                .flatten();
+                if changed.is_some() && self.import_account(&cred.provider, false).await.is_ok() {
+                    if let Some(c) = self.pick_cred(&cred.provider, &cred.uid) {
+                        return Ok(c);
+                    }
+                }
+            }
+        }
+        // ③ 网关自己续期（客户端没在跑，或 20s 内没等到客户端刷新）
+        let adapter = adapter_for(&cred.provider)
+            .ok_or_else(|| PlatformError::Local(format!("no adapter for {}", cred.provider)))?;
+        match adapter.refresh(cred).await {
+            Ok(nc) => {
+                if let Ok(auth) = serde_json::to_string(&nc) {
+                    let _ = self.store.upsert_account(&nc.provider, &nc.uid, &nc.name, "", &auth);
+                }
+                if let Some(exp) = &nc.expires_at {
+                    let _ = self.store.update_account_expires(&nc.provider, &nc.uid, Some(exp));
+                }
+                // 回写客户端会话（best-effort；失败不阻塞请求）
+                let ak = nc.meta.get("access_key_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let sk = nc.meta.get("secret_access_key").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let st = nc.meta.get("security_token").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let rt = nc.refresh_token.clone().unwrap_or_default();
+                let exp_ms = nc.expires_at.as_deref().and_then(crate::adapters::codearts::iso_to_epoch_ms).unwrap_or(0);
+                if !ak.is_empty() && !rt.is_empty() {
+                    if let Err(e) = local::write_session_credentials(desktop, &ak, &sk, &st, &rt, exp_ms) {
+                        eprintln!("[codearts] 续期成功但回写客户端会话失败: {e}");
+                    }
+                }
+                Ok(nc)
+            }
+            Err(e) => {
+                // ④ 兜底：拉起客户端等它刷新/重新登录
+                if !local::client_running() && local::find_client_exe().is_some() {
+                    eprintln!("[codearts] STS 续期失败（{e}），拉起客户端等待刷新…");
+                    let old_fp = local::session_fingerprint(desktop);
+                    local::launch_client();
+                    let changed = tokio::task::spawn_blocking(move || {
+                        local::wait_for_session_change(desktop, old_fp.as_deref(), std::time::Duration::from_secs(20))
+                    })
+                    .await
+                    .ok()
+                    .flatten();
+                    if changed.is_some() && self.import_account(&cred.provider, false).await.is_ok() {
+                        if let Some(c) = self.pick_cred(&cred.provider, &cred.uid) {
+                            return Ok(c);
+                        }
+                    }
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// 自动续期巡检：对即将过期的 CodeArts 账号执行 ensure_codearts_fresh。
+    /// `within` = 提前多久开始续期（秒）。
+    pub async fn renew_expiring(&self, within: i64) -> Vec<(String, String, String)> {
+        let mut out = Vec::new();
+        let Ok(rows) = self.store.list_accounts() else { return out };
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+        for (p, u, _n, _s, auth) in rows {
+            if !p.starts_with("codearts") {
+                continue;
+            }
+            let Ok(cred) = serde_json::from_str::<Cred>(&auth) else { continue };
+            // 以客户端会话里的 expiresAt 为准（比 DB 里的 ISO 更精确）
+            let desktop = p == "codearts-desktop";
+            let exp_ms = crate::adapters::codearts_local::read_live_session(desktop)
+                .or_else(|| crate::adapters::codearts_local::read_live_session(!desktop))
+                .and_then(|l| l.session.pointer("/session/expiresAt").and_then(|e| e.as_i64()))
+                .or_else(|| cred.expires_at.as_deref().and_then(crate::adapters::codearts::iso_to_epoch_ms));
+            let Some(exp_ms) = exp_ms else { continue };
+            if exp_ms - now_ms > within * 1000 {
+                continue;
+            }
+            match self.ensure_codearts_fresh(&cred).await {
+                Ok(_) => out.push((p.clone(), u.clone(), "renewed".into())),
+                Err(e) => out.push((p.clone(), u.clone(), format!("failed: {e}"))),
+            }
+        }
+        out
+    }
     /// trae 多账号设备号仲裁：上游 claim 校验 x-device-id 必须是已注册设备号，
     /// 且一个设备号一天只能签一个账号（9074/9095）。规则：
     /// ① 账号未配设备号 → 从本机已注册设备号里挑一个未被其他 trae 账号占用的；
@@ -383,43 +505,42 @@ impl Service {
                 let name = sess.pointer("/session/userName").and_then(|a| a.as_str())
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| if desktop { "码道桌面".into() } else { "华为云码道".into() });
-                // expiresAt 是 epoch 毫秒 → 转 ISO（显示用）
-                let expires_iso = sess.pointer("/session/expiresAt").and_then(|e| e.as_i64()).map(|ms| {
-                    let days = ms / 1000 / 86400;
-                    let (y, mo, d) = crate::adapters::civil_from_days(days);
-                    format!("{y:04}-{mo:02}-{d:02}")
-                });
+                // expiresAt 是 epoch 毫秒 → 转完整 ISO（自动续期判断用）
+                let expires_iso = sess.pointer("/session/expiresAt").and_then(|e| e.as_i64())
+                    .map(crate::adapters::codearts::epoch_ms_to_iso);
+                let rt = sess.pointer("/session/refreshToken").and_then(|a| a.as_str()).unwrap_or_default().to_string();
                 let mut cred = crate::adapters::Cred {
                     provider: platform.into(),
                     uid: uid.clone(),
                     name: name.clone(),
                     token: String::new(),
                     // RT 入库：客户端回写的 RT 几乎总是最新可用的一条
-                    refresh_token: sess.pointer("/session/refreshToken").and_then(|a| a.as_str()).map(|s| s.to_string()),
+                    refresh_token: if rt.is_empty() { None } else { Some(rt.clone()) },
                     expires_at: expires_iso,
                     meta: json!({
                         "access_key_id": ak, "secret_access_key": sk, "security_token": st_,
                         // PKCE verifier + DPoP 私钥：refresh 续期必需
                         "verifier": sess.pointer("/loginContext/pkcePair/codeVerifier").and_then(|a| a.as_str()).unwrap_or_default(),
-                        "privateJwk": sess.pointer("/loginContext/dpopKeyPair/privateKey").cloned().unwrap_or(Value::Null),
+                        "privateJwk": crate::adapters::codearts::jwk_value(
+                            sess.pointer("/loginContext/dpopKeyPair/privateKey").unwrap_or(&Value::Null)
+                        ),
                         "client": if desktop { "desktop" } else { "agent" },
+                        "refresh_token": rt,
                     }),
                 };
                 if cred.uid.is_empty() {
                     cred.uid = format!("local-{}", if desktop { "desktop" } else { "agent" });
                 }
-                // verify 校验（caller-identity；失败不阻塞导入）
+                // verify 校验（caller-identity；失败不阻塞导入）：补齐规范化 uid/name/domain
                 let adapter = crate::adapters::codearts::CodeArtsAdapter { desktop };
                 if let Ok(id) = crate::adapters::Adapter::verify(&adapter, &cred).await {
-                    // caller-identity 返回 {account_id, principal_id, principal_urn}
-                    if let Some(pn) = id.get("principal_urn").and_then(|u| u.as_str()) {
-                        if let Some(n) = pn.rsplit(":user:").nth(1) {
-                            if !n.is_empty() { cred.name = n.to_string(); }
-                        }
+                    let (pid, pname, domain) = crate::adapters::codearts::identity_of(&id);
+                    if !pid.is_empty() && cred.uid.starts_with("local-") { cred.uid = pid; }
+                    // 客户端会话里的 userName 是权威显示名；principal_urn 解析作为兜底
+                    if cred.name.is_empty() || cred.name == "华为云码道" || cred.name == "码道桌面" {
+                        if !pname.is_empty() { cred.name = pname; }
                     }
-                    if let Some(pid) = id.get("principal_id").and_then(|u| u.as_str()) {
-                        if !pid.is_empty() && cred.uid.starts_with("local-") { cred.uid = pid.to_string(); }
-                    }
+                    if !domain.is_empty() { cred.meta["domain_id"] = json!(domain); }
                 }
                 cred
             }

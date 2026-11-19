@@ -48,7 +48,7 @@ GET  /v1/platforms           平台清单与当前平台
 - **设备指纹**：各平台请求逐字对齐官方客户端（WorkBuddy Turing 设备签名、
   Qoder sidecar 官方签名、MiniMax mavis 会话头等）
 - **请求日志**：每次调用记录成功/失败、状态码、耗时与原因，可一键清空
-- **模型清单**：96 个模型（workbuddy 33 / trae 33 / qoder 20 / zcode 6 / minimax 4），
+- **模型清单**：90 个模型（workbuddy 33 / trae 33 / qoder 14 / zcode 6 / minimax 4），
   全部来自各平台官方客户端目录并去重
 - **模型展示差异说明**：网关 `/v1/models` 返回的模型来自各平台**官方客户端的本地目录/配置文件**，
   与平台客户端 UI 当前展示的模型列表**可能不完全一致**——Qoder 云端为 auto 自动路由、无公开

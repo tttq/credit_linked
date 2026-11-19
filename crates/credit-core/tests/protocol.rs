@@ -193,3 +193,54 @@ fn test_tc_envelope_node_cross_language_kat() {
     );
     assert_eq!(v["expireAt"], 9999999999i64);
 }
+
+// ===== CodeArts 身份 / DPoP JWK / 时间格式（自动续期相关回归） =====
+
+#[test]
+fn test_codearts_identity_of_principal_urn() {
+    use credit_core::adapters::codearts::identity_of;
+    // 真实 caller-identity 响应样例（2026-11-19 实测）
+    let v = json!({
+        "account_id": "01a1e7d54e5d714fb3ab60e95388d025",
+        "principal_id": "01a1e7d54e5d7bcea9258c502a4ccb26",
+        "principal_urn": "iam::01a1e7d54e5d714fb3ab60e95388d025:user:hw083373957922722"
+    });
+    let (uid, name, domain) = identity_of(&v);
+    assert_eq!(uid, "01a1e7d54e5d7bcea9258c502a4ccb26");
+    assert_eq!(name, "hw083373957922722");
+    assert_eq!(domain, "01a1e7d54e5d714fb3ab60e95388d025");
+    // user_name 兜底 + 去 '/' 前缀
+    let v2 = json!({"principal_id": "u1", "user_name": "acc/zhangsan"});
+    let (_, name2, _) = identity_of(&v2);
+    assert_eq!(name2, "zhangsan");
+}
+
+#[test]
+fn test_codearts_jwk_value_unwraps_json_string() {
+    use credit_core::adapters::codearts::jwk_value;
+    // 本机 secretStorage 的真实形态：privateKey 是 JSON 字符串（含 d）
+    let inner = json!({"kty":"EC","crv":"P-256","x":"aaa","y":"bbb","d":"ccc"});
+    let wrapped = json!(inner.to_string());
+    let jwk = jwk_value(&wrapped);
+    assert!(jwk.is_object());
+    assert_eq!(jwk["d"], "ccc");
+    // 已经是对象时原样返回
+    let jwk2 = jwk_value(&inner);
+    assert_eq!(jwk2["d"], "ccc");
+    // 非法字符串/Null 不 panic
+    assert!(jwk_value(&json!("not-json")).is_string());
+    assert!(jwk_value(&json!(null)).is_null());
+}
+
+#[test]
+fn test_codearts_iso_epoch_roundtrip() {
+    use credit_core::adapters::codearts::{epoch_ms_to_iso, iso_to_epoch_ms};
+    // 2026-11-19T12:16:17.000Z = 1795090577000ms（UTC+8 展示为 20:16:17）
+    let ms = iso_to_epoch_ms("2026-11-19T12:16:17.000Z").unwrap();
+    assert_eq!(ms, 1795090577000);
+    let iso = epoch_ms_to_iso(ms);
+    assert!(iso.starts_with("2026-11-19T20:16:17"), "UTC+8 展示，实际 {iso}");
+    // 无毫秒 / 带 +08:00 偏移
+    assert_eq!(iso_to_epoch_ms("2026-11-19T12:16:17Z").unwrap(), 1795090577000);
+    assert_eq!(iso_to_epoch_ms("2026-11-19T20:16:17+08:00").unwrap(), 1795090577000);
+}

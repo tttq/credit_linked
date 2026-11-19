@@ -445,7 +445,286 @@ pub fn wb_chat_body(messages: &[Value], system: &str, model: &str, max_tokens: O
     body
 }
 
-// ============================ ZCode（智谱） ============================
+// ============================ OpenAI ↔ Anthropic 消息转换 ============================
+
+/// OpenAI content（字符串 / 块数组）→ 纯文本（非文本块忽略）
+fn content_text(content: Option<&Value>) -> String {
+    match content {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .filter_map(|p| {
+                if p.get("type").and_then(|t| t.as_str()) == Some("text") {
+                    p.get("text").and_then(|t| t.as_str()).map(|s| s.to_string())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
+/// OpenAI data/url 图片 → Anthropic image block（data URL → base64 source；http(s) → url source）
+fn anthropic_image_block(url: &str) -> Option<Value> {
+    if let Some(rest) = url.strip_prefix("data:") {
+        let (meta, data) = rest.split_once(',')?;
+        if data.is_empty() {
+            return None;
+        }
+        let media = meta.strip_suffix(";base64").unwrap_or(meta);
+        Some(json!({
+            "type": "image",
+            "source": { "type": "base64", "media_type": media, "data": data },
+        }))
+    } else if url.starts_with("http://") || url.starts_with("https://") {
+        Some(json!({
+            "type": "image",
+            "source": { "type": "url", "url": url },
+        }))
+    } else {
+        None
+    }
+}
+
+/// OpenAI content（字符串 / 块数组）→ Anthropic content blocks（文本 + 可选图片）
+fn content_blocks_of(content: Option<&Value>, allow_images: bool) -> Vec<Value> {
+    match content {
+        Some(Value::String(s)) if !s.is_empty() => vec![json!({ "type": "text", "text": s })],
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .filter_map(|p| match p.get("type").and_then(|t| t.as_str()) {
+                Some("text") => p
+                    .get("text")
+                    .and_then(|t| t.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| json!({ "type": "text", "text": s })),
+                Some("image_url") if allow_images => {
+                    let url = p
+                        .pointer("/image_url/url")
+                        .or_else(|| p.get("url"))
+                        .and_then(|u| u.as_str())?;
+                    anthropic_image_block(url)
+                }
+                Some("image") if allow_images => p
+                    .get("source")
+                    .cloned()
+                    .map(|source| json!({ "type": "image", "source": source })),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Anthropic tool_use.id 约束：`^[a-zA-Z0-9_-]{1,64}$`；不合法/缺失 → None（由调用方兜底）
+fn anthropic_tool_id(raw: Option<&str>) -> Option<String> {
+    let s = raw?.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let cleaned: String = s
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+        .collect();
+    if cleaned.is_empty() || cleaned.len() > 64 {
+        None
+    } else {
+        Some(cleaned)
+    }
+}
+
+/// 追加消息块：相邻同 role 消息合并（Anthropic 要求 user/assistant 交替出现）。
+/// 例外：含 tool_result 的 user 消息只与「同样是 tool_result 组」的消息合并，
+/// 普通用户文本不会被混进工具结果组，避免 tool_result 不再是消息首块。
+fn push_anthropic_blocks(out: &mut Vec<Value>, role: &str, blocks: Vec<Value>) {
+    if blocks.is_empty() {
+        return;
+    }
+    let first_is_tool_result = blocks
+        .first()
+        .and_then(|b| b.get("type"))
+        .and_then(|t| t.as_str())
+        == Some("tool_result");
+    if let Some(last) = out.last_mut() {
+        if last.get("role").and_then(|r| r.as_str()) == Some(role) {
+            let last_is_tool_group = last
+                .get("content")
+                .and_then(|c| c.as_array())
+                .and_then(|a| a.first())
+                .and_then(|b| b.get("type"))
+                .and_then(|t| t.as_str())
+                == Some("tool_result");
+            let mergeable = if first_is_tool_result || last_is_tool_group {
+                first_is_tool_result && last_is_tool_group
+            } else {
+                true
+            };
+            if mergeable {
+                if let Some(arr) = last.get_mut("content").and_then(|c| c.as_array_mut()) {
+                    arr.extend(blocks);
+                    return;
+                }
+            }
+        }
+    }
+    out.push(json!({ "role": role, "content": blocks }));
+}
+
+/// 追加 tool_result 块：必须位于 user 消息内容首位（Anthropic 约束）。
+/// 已存在 tool_result 组则按序插到组末尾；否则插到上一条 user 消息最前面；再否则新建 user 消息。
+fn push_tool_results(out: &mut Vec<Value>, blocks: Vec<Value>) {
+    if blocks.is_empty() {
+        return;
+    }
+    if let Some(last) = out.last_mut() {
+        if last.get("role").and_then(|r| r.as_str()) == Some("user") {
+            if let Some(arr) = last.get_mut("content").and_then(|c| c.as_array_mut()) {
+                let pos = arr
+                    .iter()
+                    .take_while(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_result"))
+                    .count();
+                let tail = arr.split_off(pos);
+                arr.extend(blocks);
+                arr.extend(tail);
+                return;
+            }
+        }
+    }
+    out.push(json!({ "role": "user", "content": blocks }));
+}
+
+/// 为「有 tool_use 但没有对应 tool 结果」的 assistant 回合补 tool_result。
+/// 典型场景：长上下文截断 / 客户端中断 / 历史不完整——官方客户端同样补
+/// `{"content":"No result provided","is_error":true}`，否则上游 400。
+fn synth_missing_tool_results(out: &mut Vec<Value>, pending: &mut std::collections::VecDeque<String>) {
+    if pending.is_empty() {
+        return;
+    }
+    let blocks: Vec<Value> = pending
+        .drain(..)
+        .map(|id| {
+            json!({
+                "type": "tool_result",
+                "tool_use_id": id,
+                "content": "No result provided (request interrupted or context truncated)",
+                "is_error": true,
+            })
+        })
+        .collect();
+    push_tool_results(out, blocks);
+}
+
+/// OpenAI 线格式 messages → Anthropic 线格式 messages（system 由调用方放顶层）。
+///
+/// 关键转换（此前缺失导致 MiniMax 400 `tool result's tool id() not found (2013)`）：
+/// - assistant.tool_calls[] → assistant content 里的 `{type:"tool_use", id, name, input}`
+/// - role=tool + tool_call_id → user content 里的 `{type:"tool_result", tool_use_id, content}`
+/// - 连续 tool_result 合并进同一条 user 消息，且必须是该 user 消息的首块（Anthropic 规范）
+/// - 孤儿 tool_result（id 不在紧邻的 assistant tool_use 里）丢弃，避免 upstream 报 unexpected id
+/// - assistant 有 tool_use 但没有结果时补 `is_error:true` 占位（与官方客户端一致）
+/// - 相邻同 role 消息合并，首条保证是 user
+pub fn to_anthropic_messages(messages: &[Value], system: &str) -> (Vec<Value>, String) {
+    let mut out: Vec<Value> = Vec::new();
+    let mut sys = system.to_string();
+    // 最近一条 assistant 发出、尚未收到结果的 tool_use id 队列
+    let mut pending_tool_ids: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+    let mut synth_seq: u32 = 0;
+    for m in messages {
+        let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("user");
+        // 非 tool 消息到来前，先把上一个 assistant 缺失的工具结果补齐
+        if role != "tool" {
+            synth_missing_tool_results(&mut out, &mut pending_tool_ids);
+        }
+        match role {
+            "system" | "developer" => {
+                let t = content_text(m.get("content"));
+                if !t.is_empty() {
+                    if !sys.is_empty() {
+                        sys.push('\n');
+                    }
+                    sys.push_str(&t);
+                }
+            }
+            "user" => {
+                let blocks = content_blocks_of(m.get("content"), true);
+                push_anthropic_blocks(&mut out, "user", blocks);
+            }
+            "assistant" => {
+                let mut blocks = content_blocks_of(m.get("content"), false);
+                if let Some(tcs) = m.get("tool_calls").and_then(|t| t.as_array()) {
+                    for tc in tcs {
+                        let name = tc
+                            .pointer("/function/name")
+                            .and_then(|n| n.as_str())
+                            .unwrap_or("")
+                            .trim()
+                            .to_string();
+                        if name.is_empty() {
+                            continue;
+                        }
+                        let id = anthropic_tool_id(tc.get("id").and_then(|i| i.as_str()))
+                            .unwrap_or_else(|| {
+                                synth_seq += 1;
+                                format!("toolu_{synth_seq:04}")
+                            });
+                        // tool_use.input 必须是 JSON 对象；arguments 是字符串时解析
+                        let input = match tc.pointer("/function/arguments") {
+                            Some(Value::String(s)) => {
+                                let parsed: Value = serde_json::from_str(s).unwrap_or(Value::Null);
+                                if parsed.is_object() { parsed } else { json!({}) }
+                            }
+                            Some(v) if v.is_object() => v.clone(),
+                            _ => json!({}),
+                        };
+                        if !pending_tool_ids.contains(&id) {
+                            pending_tool_ids.push_back(id.clone());
+                        }
+                        blocks.push(json!({ "type": "tool_use", "id": id, "name": name, "input": input }));
+                    }
+                }
+                push_anthropic_blocks(&mut out, "assistant", blocks);
+            }
+            "tool" => {
+                // tool_result 必须带 tool_use_id 且与紧邻 assistant 的 tool_use 对应：
+                // 优先用消息里的 tool_call_id；缺失时按上游 tool_use 顺序补配；
+                // id 对不上（孤儿结果）直接丢弃 —— 绝不发空 id/未知 id（2013 的直接触发原因）。
+                let raw_id = anthropic_tool_id(m.get("tool_call_id").and_then(|i| i.as_str()));
+                let id = match raw_id {
+                    Some(id) if pending_tool_ids.iter().any(|x| x == &id) => {
+                        pending_tool_ids.retain(|x| x != &id);
+                        id
+                    }
+                    Some(_) => continue, // 孤儿 tool_result：上游不认识该 id
+                    None => match pending_tool_ids.pop_front() {
+                        Some(id) => id,
+                        None => continue,
+                    },
+                };
+                let text = content_text(m.get("content"));
+                let block = if m.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    json!({ "type": "tool_result", "tool_use_id": id, "content": text, "is_error": true })
+                } else {
+                    json!({ "type": "tool_result", "tool_use_id": id, "content": text })
+                };
+                push_tool_results(&mut out, vec![block]);
+            }
+            _ => {}
+        }
+    }
+    // 收尾：最后的 assistant 仍缺工具结果 → 补齐
+    synth_missing_tool_results(&mut out, &mut pending_tool_ids);
+    // Anthropic 要求首条消息必须是 user（长上下文截断后可能以 assistant 开头）
+    if out.first().and_then(|m| m.get("role")).and_then(|r| r.as_str()) == Some("assistant") {
+        out.insert(
+            0,
+            json!({ "role": "user", "content": [{ "type": "text", "text": "(continue)" }] }),
+        );
+    }
+    (out, sys)
+}
+
 
 /// 智谱开放平台 OpenAI 兼容端点
 pub const ZCODE_CHAT_BASE: &str = "https://open.bigmodel.cn";
@@ -458,24 +737,12 @@ pub const ZCODE_ANTHROPIC_PATH: &str = "/v1/messages";
 /// ZCode Start Plan 对话端点（zcode.z.ai；服务端有「仅官方客户端」校验 code=3012）
 pub const ZCODE_PLAN_ANTHROPIC_BASE: &str = "https://zcode.z.ai/api/v1/zcode-plan/anthropic";
 
-/// ZCode Anthropic 格式 body（coding plan 通道）
+/// ZCode Anthropic 格式 body（coding plan 通道）。`messages` 须已经过
+/// `to_anthropic_messages` 转换（Anthropic 线格式），此处只做打包。
 pub fn zcode_anthropic_body(messages: &[Value], system: &str, model: &str, max_tokens: Option<u32>) -> Value {
-    let mut msgs: Vec<Value> = Vec::new();
-    for m in messages {
-        let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("user").to_string();
-        let content = match m.get("content") {
-            Some(Value::String(s)) => s.clone(),
-            Some(Value::Array(arr)) => arr.iter()
-                .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
-                .collect::<Vec<_>>().join("\n"),
-            _ => String::new(),
-        };
-        if role == "system" { continue; }
-        msgs.push(json!({ "role": role, "content": content }));
-    }
     let mut body = json!({
         "model": model,
-        "messages": msgs,
+        "messages": messages,
         "max_tokens": max_tokens.unwrap_or(4096),
         "stream": true,
     });
@@ -537,11 +804,18 @@ pub const MINIMAX_API_BASE: &str = "https://agent.minimax.cn";
 /// MiniMax anthropic 兼容 chat 路径
 pub const MINIMAX_ANTHROPIC_PATH: &str = "/mavis/api/v1/llm/v1/messages";
 
-/// MiniMax chat 请求头（凭据：MMOAT OAuth token 或 API key）
+/// MiniMax chat 请求头（凭据：MMOAT OAuth token 或 API key）。
+/// 对齐 MiniMax Code 官方客户端（pi-ai anthropic provider）：
+/// - Authorization Bearer 是真正鉴权；x-api-key 官方是占位
+/// - X-Mavis-Session-Id 按 token 稳定（影响服务端缓存亲和），Agent-Id 用固定 main
+/// - 时区偏移按秒（UTC+8 = 28800）
 pub fn minimax_chat_headers(token: &str) -> Vec<(String, String)> {
-    // 逐字对齐 MiniMax Code 客户端（asar 逆向：buildLocalProviderHeaders + managed identity）
-    let session_id = uuid::Uuid::new_v4().to_string();
-    let agent_id = uuid::Uuid::new_v4().to_string();
+    use sha2::{Digest, Sha256};
+    let session_id = {
+        let h = Sha256::digest(token.as_bytes());
+        let hex: String = h.iter().take(16).map(|b| format!("{b:02x}")).collect();
+        format!("{}-{}-{}-{}-{}", &hex[0..8], &hex[8..12], &hex[12..16], &hex[16..20], &hex[20..32])
+    };
     vec![
         ("Authorization".to_string(), format!("Bearer {token}")),
         ("x-api-key".to_string(), token.to_string()),
@@ -550,33 +824,38 @@ pub fn minimax_chat_headers(token: &str) -> Vec<(String, String)> {
         ("Accept".to_string(), "application/json".to_string()),
         ("User-Agent".to_string(), "MiniMaxAgent".to_string()),
         ("X-Mavis-Session-Id".to_string(), session_id),
-        ("X-Mavis-Agent-Id".to_string(), agent_id),
-        ("X-Mavis-Timezone-Offset".to_string(), "-28800".to_string()),
+        ("X-Mavis-Agent-Id".to_string(), "main".to_string()),
+        ("X-Mavis-Timezone-Offset".to_string(), "28800".to_string()),
         ("X-Mavis-Turn-Phase".to_string(), "initial".to_string()),
     ]
 }
 
 /// MiniMax Anthropic Messages body（Anthropic 格式与 OpenAI 不同：system 是顶层字段）
 pub fn minimax_chat_body(messages: &[Value], system: &str, model: &str, max_tokens: Option<u32>) -> Value {
-    // Anthropic messages 不支持 system role → 移到顶层 system
-    let msgs: Vec<Value> = messages.iter()
-        .filter(|m| m.get("role").and_then(|r| r.as_str()) != Some("system"))
-        .cloned()
-        .collect();
+    // OpenAI 线格式 → Anthropic 线格式（tool_use / tool_result 必须按 Anthropic 规范成对出现，
+    // 否则上游直接 400：tool result's tool id() not found (2013)）
+    let (msgs, sys) = to_anthropic_messages(messages, system);
     let mut body = json!({
         "model": model,
         "messages": msgs,
         "max_tokens": max_tokens.unwrap_or(4096),
         "stream": true,
     });
-    if !system.is_empty() {
-        body["system"] = json!(system);
+    if !sys.is_empty() {
+        body["system"] = json!(sys);
     }
     body
 }
 
-/// 解析 Anthropic SSE chunk → 事件列表（MiniMax Anthropic 兼容通道返回 Anthropic 线格式）
-pub fn parse_anthropic_chunk(v: &Value) -> Vec<crate::upstream::StreamEvent> {
+/// 解析 Anthropic SSE chunk → 事件列表（MiniMax/ZCode Anthropic 兼容通道返回 Anthropic 线格式）。
+///
+/// `block_tool_index` / `next_tool_index` 维护「Anthropic content block index → OpenAI tool_calls index」
+/// 映射：工具块用块序号（文本块 0、工具块 1…），客户端按 tool_calls[].index 聚合参数分片。
+pub fn anthropic_chunk_with_map(
+    v: &Value,
+    block_tool_index: &mut std::collections::HashMap<u64, u32>,
+    next_tool_index: &mut u32,
+) -> Vec<crate::upstream::StreamEvent> {
     use crate::upstream::StreamEvent;
     let mut out = Vec::new();
     let typ = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
@@ -584,9 +863,37 @@ pub fn parse_anthropic_chunk(v: &Value) -> Vec<crate::upstream::StreamEvent> {
         "error" => {
             let err = v.get("error").cloned().unwrap_or(Value::Null);
             let msg = err.get("message").and_then(|m| m.as_str()).unwrap_or("upstream error").to_string();
-            out.push(StreamEvent::Error(msg, "anthropic_error".into()));
+            let code = err.get("type").and_then(|t| t.as_str()).unwrap_or("anthropic_error").to_string();
+            out.push(StreamEvent::Error(msg, code));
+        }
+        "content_block_start" => {
+            let idx = v.get("index").and_then(|i| i.as_u64()).unwrap_or(0);
+            let block = v.get("content_block").cloned().unwrap_or(Value::Null);
+            match block.get("type").and_then(|t| t.as_str()).unwrap_or("") {
+                "tool_use" => {
+                    let tool_index = *next_tool_index;
+                    *next_tool_index += 1;
+                    block_tool_index.insert(idx, tool_index);
+                    let id = block.get("id").and_then(|i| i.as_str()).filter(|s| !s.is_empty()).map(|s| s.to_string());
+                    let name = block.get("name").and_then(|n| n.as_str()).filter(|s| !s.is_empty()).map(|s| s.to_string());
+                    // 部分上游会把初始 input 放在 content_block_start 里（通常是 {}）
+                    let args = block.get("input").filter(|i| i.is_object() && i.as_object().map(|o| !o.is_empty()).unwrap_or(false)).map(|i| i.to_string());
+                    if id.is_some() || name.is_some() || args.is_some() {
+                        out.push(StreamEvent::ToolCall { index: tool_index, id, name, arguments: args });
+                    }
+                }
+                "text" => {
+                    if let Some(t) = block.get("text").and_then(|t| t.as_str()) {
+                        if !t.is_empty() {
+                            out.push(StreamEvent::Text(t.to_string()));
+                        }
+                    }
+                }
+                _ => {}
+            }
         }
         "content_block_delta" => {
+            let idx = v.get("index").and_then(|i| i.as_u64()).unwrap_or(0);
             let delta = v.get("delta").cloned().unwrap_or(Value::Null);
             match delta.get("type").and_then(|t| t.as_str()).unwrap_or("") {
                 "text_delta" => {
@@ -603,6 +910,15 @@ pub fn parse_anthropic_chunk(v: &Value) -> Vec<crate::upstream::StreamEvent> {
                         }
                     }
                 }
+                "input_json_delta" => {
+                    // 工具参数增量：Anthropic 用 partial_json 字符串分片（与 OpenAI arguments 分片同语义）
+                    if let Some(pj) = delta.get("partial_json").and_then(|p| p.as_str()) {
+                        if !pj.is_empty() {
+                            let tool_index = block_tool_index.get(&idx).copied().unwrap_or(0);
+                            out.push(StreamEvent::ToolCall { index: tool_index, id: None, name: None, arguments: Some(pj.to_string()) });
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -611,10 +927,18 @@ pub fn parse_anthropic_chunk(v: &Value) -> Vec<crate::upstream::StreamEvent> {
             if let Some(u) = v.get("usage") {
                 let input = u.get("input_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
                 let output = u.get("output_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
-                out.push(StreamEvent::Usage { input, output, total: Some(input + output) });
+                if input > 0 || output > 0 {
+                    out.push(StreamEvent::Usage { input, output, total: Some(input + output) });
+                }
             }
             if let Some(sr) = v.get("delta").and_then(|d| d.get("stop_reason")).and_then(|s| s.as_str()) {
-                out.push(StreamEvent::Done { finish: sr.to_string() });
+                // Anthropic stop_reason → OpenAI finish_reason
+                let finish = match sr {
+                    "tool_use" => "tool_calls",
+                    "max_tokens" => "length",
+                    _ => "stop",
+                };
+                out.push(StreamEvent::Done { finish: finish.to_string() });
             }
         }
         "message_stop" => {
@@ -634,6 +958,13 @@ pub fn parse_anthropic_chunk(v: &Value) -> Vec<crate::upstream::StreamEvent> {
         _ => {}
     }
     out
+}
+
+/// 解析 Anthropic SSE chunk（无状态便捷入口；工具块 index 即 content block index）
+pub fn parse_anthropic_chunk(v: &Value) -> Vec<crate::upstream::StreamEvent> {
+    let mut map = std::collections::HashMap::new();
+    let mut next = 0u32;
+    anthropic_chunk_with_map(v, &mut map, &mut next)
 }
 
 /// Anthropic SSE 缓冲类型（data: 行，与 OpenAI 相同帧格式）
@@ -730,11 +1061,15 @@ pub fn attach_anthropic_tools(body: &mut Value, tools: &[Value], tool_choice: Op
     let converted: Vec<Value> = tools.iter().filter_map(|t| {
         let f = t.get("function")?;
         let name = f.get("name").and_then(|n| n.as_str())?;
-        Some(json!({
+        let mut out = json!({
             "name": name,
-            "description": f.get("description").cloned().unwrap_or(Value::Null),
             "input_schema": f.get("parameters").cloned().unwrap_or(json!({ "type": "object", "properties": {} })),
-        }))
+        });
+        // description 缺省时省略（官方客户端不发送 null description）
+        if let Some(d) = f.get("description").and_then(|d| d.as_str()).filter(|s| !s.is_empty()) {
+            out["description"] = json!(d);
+        }
+        Some(out)
     }).collect();
     if converted.is_empty() { return; }
     body["tools"] = json!(converted);

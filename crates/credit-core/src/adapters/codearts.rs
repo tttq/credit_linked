@@ -20,14 +20,144 @@ pub const STS_BASE: &str = "https://sts.cn-north-4.myhuaweicloud.com";
 /// 码道业务 API host（ops delivery/claim/confirm、用量统计）
 pub const API_BASE: &str = "https://snap-access.cn-north-4.myhuaweicloud.com";
 
+/// 从 caller-identity 响应解析身份字段（对齐官方客户端 apiService.getUserInfo）：
+/// - userId = principal_id || user_id || userId
+/// - userName = principal_urn 最后一个 ':' 之后的部分（再去掉 '/' 前缀），如
+///   `iam::<account>:user:hw083373957922722` → `hw083373957922722`
+/// - domainId = account_id || domain_id || domainId
+///
+/// 旧实现用 `rsplit(":user:").nth(1)`，对该 URN 会取到 `iam::<account>` 前缀，
+/// 导致账号名显示为 `iam::01a1e...`（“无法获取账号信息”的直接原因）。
+pub fn identity_of(v: &Value) -> (String, String, String) {
+    let uid = ["principal_id", "user_id", "userId"]
+        .iter()
+        .find_map(|k| v.get(*k).and_then(|x| x.as_str()))
+        .unwrap_or("")
+        .to_string();
+    let mut name = String::new();
+    if let Some(urn) = v.get("principal_urn").and_then(|x| x.as_str()) {
+        if let Some(seg) = urn.rsplit(':').next() {
+            name = seg.to_string();
+        }
+    }
+    if name.is_empty() {
+        name = ["user_name", "userName"]
+            .iter()
+            .find_map(|k| v.get(*k).and_then(|x| x.as_str()))
+            .unwrap_or("")
+            .to_string();
+    }
+    if let Some(slash) = name.find('/') {
+        name = name[slash + 1..].to_string();
+    }
+    let domain = ["account_id", "domain_id", "domainId"]
+        .iter()
+        .find_map(|k| v.get(*k).and_then(|x| x.as_str()))
+        .unwrap_or("")
+        .to_string();
+    (uid, name, domain)
+}
+
+/// epoch 毫秒 → ISO 字符串（UTC+8，落库/展示统一格式）
+pub fn epoch_ms_to_iso(ms: i64) -> String {
+    // 与 now_iso 一致：按 UTC+8 偏移表达
+    let secs = ms / 1000 + 8 * 3600;
+    let days = secs / 86400;
+    let rem = secs % 86400;
+    let (y, mo, d) = crate::adapters::civil_from_days(days);
+    format!("{y:04}-{mo:02}-{d:02}T{:02}:{:02}:{:02}.000+08:00", rem / 3600, (rem % 3600) / 60, rem % 60)
+}
+
+/// ISO 8601（"2026-11-19T12:16:00.000Z" / 无毫秒 / 带偏移）→ epoch 毫秒。
+/// 用于把 STS 返回的 expiration 同步回客户端 secretStorage 的 expiresAt（毫秒）。
+pub fn iso_to_epoch_ms(s: &str) -> Option<i64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let (date, rest) = s.split_once('T')?;
+    let mut dparts = date.split('-');
+    let y: i64 = dparts.next()?.parse().ok()?;
+    let mo: i64 = dparts.next()?.parse().ok()?;
+    let day: i64 = dparts.next()?.parse().ok()?;
+    // 解析时区后缀：Z = UTC；+HH:MM / -HH:MM = 本地时间相对 UTC 的偏移
+    let mut time = rest;
+    let mut offset_secs: i64 = 0;
+    if let Some(stripped) = time.strip_suffix('Z') {
+        time = stripped;
+    } else if let Some(pos) = time.find('+') {
+        offset_secs = parse_tz_offset(&time[pos + 1..])?;
+        time = &time[..pos];
+    } else if let Some(pos) = time.rfind('-') {
+        // 时间部分里的 '-' 只可能是时区偏移分隔（日期已在前面拆掉）
+        if pos > 2 {
+            offset_secs = -parse_tz_offset(&time[pos + 1..])?;
+            time = &time[..pos];
+        }
+    }
+    let (hms, frac) = time.split_once('.').unwrap_or((time, ""));
+    let mut tparts = hms.split(':');
+    let h: i64 = tparts.next()?.parse().ok()?;
+    let mi: i64 = tparts.next().unwrap_or("0").parse().ok()?;
+    let se: i64 = tparts.next().unwrap_or("0").parse().ok()?;
+    let ms: i64 = if frac.is_empty() {
+        0
+    } else {
+        let digits: String = frac.chars().take(3).collect();
+        let padded = format!("{digits:0<3}");
+        padded.parse().unwrap_or(0)
+    };
+    let days = crate::adapters::days_from_civil(y, mo, day);
+    let local = days * 86400 + h * 3600 + mi * 60 + se;
+    Some(((local - offset_secs) * 1000) + ms)
+}
+
+/// 解析 "08:00" / "0800" / "8" 形式的时区偏移为秒
+fn parse_tz_offset(s: &str) -> Option<i64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if let Some((h, m)) = s.split_once(':') {
+        let h: i64 = h.parse().ok()?;
+        let m: i64 = m.parse().ok()?;
+        return Some(h * 3600 + m * 60);
+    }
+    if s.len() == 4 && s.chars().all(|c| c.is_ascii_digit()) {
+        let h: i64 = s[..2].parse().ok()?;
+        let m: i64 = s[2..].parse().ok()?;
+        return Some(h * 3600 + m * 60);
+    }
+    Some(s.parse::<i64>().ok()? * 3600)
+}
+
 /// 码道适配器；desktop=true 走 DESKTOP 渠道（否则 IDE）
 pub struct CodeArtsAdapter { pub desktop: bool }
 
 // ===== DPoP =====
 
+/// DPoP 私钥 JWK 归一化：本机 secretStorage 里 `loginContext.dpopKeyPair.privateKey`
+/// 是 **JSON 字符串**（"{\"kty\":\"EC\",...}"），而登录流程写入的是对象。
+/// 旧实现直接取 json 字段 d，遇到字符串就报 `jwk missing d` —— 这是「码道账号无法
+/// 自动续期」的根因（DPoP 签名永远失败）。这里对两种形态做兼容（最多解两层字符串）。
+pub fn jwk_value(v: &Value) -> Value {
+    let mut cur = v.clone();
+    for _ in 0..2 {
+        if let Value::String(s) = &cur {
+            if let Ok(parsed) = serde_json::from_str::<Value>(s) {
+                cur = parsed;
+                continue;
+            }
+        }
+        break;
+    }
+    cur
+}
+
 /// 构造 DPoP proof JWT：ES256（p1363 r||s 签名），payload 带 htu/htm/iat/jti
 pub fn dpop_header(private_jwk: &Value, htu: &str) -> Result<String, PlatformError> {
-    let sk = SigningKey::from(JwkDec::from_jwk(private_jwk)?);
+    let jwk = jwk_value(private_jwk);
+    let sk = SigningKey::from(JwkDec::from_jwk(&jwk)?);
     let header = B64URL.encode(json!({
         "typ": "dpop+jwt", "alg": "ES256", "jwk": public_jwk_of(&sk),
     }).to_string());
@@ -323,45 +453,85 @@ impl Adapter for CodeArtsAdapter {
         Ok(Quota { remaining: remain, parts: json!([]), sampled_at: now_iso() })
     }
 
-    /// STS refresh_token 续期（须带 PKCE verifier）；RT 一次性轮换，作废需重新授权
+    /// STS refresh_token 续期（须带 PKCE verifier + DPoP）；RT 一次性轮换，作废需重新授权。
+    ///
+    /// 修复点：
+    /// - RT 优先取凭据顶层 `refresh_token`（本机扫描/同步导入只写顶层，旧实现只读 meta，
+    ///   导致「本机导入的账号永远无法自动续期」）；
+    /// - client_id 按通道区分：desktop = `codearts`，IDE/agent = `codearts-agent`
+    ///   （与 login.rs / 客户端 product.json 一致）；
+    /// - 新 RT 同时写回顶层与 meta，避免两种写入路径互相覆盖后丢 RT。
     async fn refresh(&self, c: &Cred) -> Result<Cred, PlatformError> {
-        let Some(rt) = c.meta.get("refresh_token").and_then(|r| r.as_str()) else { return Err(PlatformError::Auth) };
-        let jwk = c.meta.get("privateJwk").cloned().unwrap_or(Value::Null);
+        let rt = c
+            .refresh_token
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .or_else(|| c.meta.get("refresh_token").and_then(|r| r.as_str()))
+            .ok_or(PlatformError::Auth)?
+            .to_string();
+        let jwk = jwk_value(&c.meta.get("privateJwk").cloned().unwrap_or(Value::Null));
+        if !jwk.is_object() || jwk.get("d").and_then(|d| d.as_str()).unwrap_or("").is_empty() {
+            return Err(PlatformError::Identity(
+                "码道凭据缺少 DPoP 私钥（privateJwk），无法续期：请重新授权或在码道客户端登录后「扫描本机」".into(),
+            ));
+        }
         let verifier = c.meta.get("verifier").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let client_id = if self.desktop { "codearts" } else { "codearts-agent" };
         let mut pairs = vec![
             ("grant_type", "refresh_token"),
-            ("refresh_token", rt),
-            // 客户端逆向：client_id 恒为 "codearts"（product.json 固定值，desktop/agent 相同）
-            ("client_id", "codearts"),
+            ("refresh_token", rt.as_str()),
+            ("client_id", client_id),
         ];
         // 官方实现要求带 code_verifier（PKCE 续期），否则服务端拒绝/轮换失效
         if !verifier.is_empty() {
-            pairs.push(("code_verifier", &verifier));
+            pairs.push(("code_verifier", verifier.as_str()));
         }
         let v = sts_token(&pairs, &jwk).await?;
-        // 错误响应（refresh_token 轮换作废等）
+        // 错误响应：OAuth 风格 {error:{message}} 或 HWS 风格 {error_code,error_msg}
+        if let Some(err) = v.get("error") {
+            let msg = err
+                .get("message")
+                .or_else(|| v.get("error_description"))
+                .and_then(|m| m.as_str())
+                .unwrap_or("STS refresh failed")
+                .to_string();
+            let code = err.get("code").or_else(|| v.get("error_code")).and_then(|c| c.as_str()).unwrap_or("");
+            if code.contains("1806") || msg.contains("refresh token") || msg.contains("invalid_grant") {
+                return Err(PlatformError::Identity(
+                    "码道授权已失效（refresh token 已被轮换/作废）：请重新在码道客户端登录后点「扫描本机」，或在「账号管理」重新添加账号授权".into(),
+                ));
+            }
+            return Err(PlatformError::Format(format!("STS refresh {code}: {msg}")));
+        }
         if let Some(ec) = v.get("error_code").and_then(|e| e.as_str()) {
             let msg = v.get("error_msg").and_then(|m| m.as_str()).unwrap_or("STS refresh failed");
             if ec.contains("1806") || msg.contains("refresh token") {
-                // RT 一次性且已作废（被客户端/其它实例轮换消费）——唯一出路是重新授权
                 return Err(PlatformError::Identity(format!(
-                    "码道授权已失效（refresh token 已被使用 {ec}）：请在「账号管理」删除该账号后重新「添加账号」授权，或先在码道客户端登录后点「扫描本机」"
+                    "码道授权已失效（refresh token 已被使用 {ec}）：请在码道客户端重新登录后点「扫描本机」，或重新添加账号授权"
                 )));
             }
             return Err(PlatformError::Format(format!("STS {ec}: {msg}")));
         }
+        let cred = v.get("credentials").or_else(|| v.get("result").and_then(|r| r.get("credentials")));
+        let Some(cred) = cred else {
+            return Err(PlatformError::Format(format!(
+                "STS refresh 响应缺少 credentials：{}",
+                v.to_string().chars().take(200).collect::<String>()
+            )));
+        };
         let mut out = c.clone();
-        if let Some(cred) = v.get("credentials") {
-            out.meta["access_key_id"] = cred.get("access_key_id").cloned().unwrap_or(Value::Null);
-            out.meta["secret_access_key"] = cred.get("secret_access_key").cloned().unwrap_or(Value::Null);
-            out.meta["security_token"] = cred.get("security_token").cloned().unwrap_or(Value::Null);
-        }
-        // refresh_token 一次性轮换：新 RT 必须保存，否则旧 RT 立即作废
+        out.meta["access_key_id"] = cred.get("access_key_id").cloned().unwrap_or(Value::Null);
+        out.meta["secret_access_key"] = cred.get("secret_access_key").cloned().unwrap_or(Value::Null);
+        out.meta["security_token"] = cred.get("security_token").cloned().unwrap_or(Value::Null);
+        // refresh_token 一次性轮换：新 RT 必须保存（顶层 + meta 同步），否则旧 RT 立即作废
         if let Some(nrt) = v.get("refresh_token").and_then(|r| r.as_str()) {
-            out.meta["refresh_token"] = json!(nrt);
+            if !nrt.is_empty() {
+                out.refresh_token = Some(nrt.to_string());
+                out.meta["refresh_token"] = json!(nrt);
+            }
         }
         // 响应结构：{ credentials: { …, expiration(ISO) }, refresh_token }
-        if let Some(exp) = v.pointer("/credentials/expiration").and_then(|e| e.as_str()) {
+        if let Some(exp) = cred.get("expiration").and_then(|e| e.as_str()) {
             out.expires_at = Some(exp.to_string());
         }
         Ok(out)

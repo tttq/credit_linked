@@ -154,3 +154,180 @@ fn test_stream_ends_without_done_frame_keeps_tool_events() {
         other => panic!("expected tool call, got {other:?}"),
     }
 }
+
+// ===== OpenAI → Anthropic 消息转换（MiniMax/ZCode 工具回合） =====
+
+#[test]
+fn test_to_anthropic_messages_tool_round() {
+    use credit_gateway::protocol::to_anthropic_messages;
+    let msgs = serde_json::json!([
+        {"role": "user", "content": "查北京天气"},
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "call_1", "type": "function", "function": {"name": "get_weather", "arguments": "{\"city\":\"北京\"}"}}
+        ]},
+        {"role": "tool", "tool_call_id": "call_1", "content": "{\"temp\":18}"}
+    ]);
+    let (out, sys) = to_anthropic_messages(msgs.as_array().unwrap(), "sys");
+    assert_eq!(sys, "sys");
+    assert_eq!(out.len(), 3);
+    assert_eq!(out[0]["role"], "user");
+    assert_eq!(out[1]["role"], "assistant");
+    // assistant.tool_calls → tool_use（input 必须是对象）
+    assert_eq!(out[1]["content"][0]["type"], "tool_use");
+    assert_eq!(out[1]["content"][0]["id"], "call_1");
+    assert_eq!(out[1]["content"][0]["name"], "get_weather");
+    assert_eq!(out[1]["content"][0]["input"]["city"], "北京");
+    // tool → user.tool_result（tool_use_id 与上游一致）
+    assert_eq!(out[2]["role"], "user");
+    assert_eq!(out[2]["content"][0]["type"], "tool_result");
+    assert_eq!(out[2]["content"][0]["tool_use_id"], "call_1");
+}
+
+#[test]
+fn test_to_anthropic_messages_merges_tool_results_and_fills_missing_id() {
+    use credit_gateway::protocol::to_anthropic_messages;
+    // 两个连续 tool 消息必须合并进同一条 user 消息；第一个缺 tool_call_id 时按顺序补配
+    let msgs = serde_json::json!([
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "call_a", "type": "function", "function": {"name": "f1", "arguments": "{}"}},
+            {"id": "call_b", "type": "function", "function": {"name": "f2", "arguments": "{}"}}
+        ]},
+        {"role": "tool", "content": "r1"},
+        {"role": "tool", "tool_call_id": "call_b", "content": "r2"}
+    ]);
+    let (out, _) = to_anthropic_messages(msgs.as_array().unwrap(), "");
+    // 首条被补 (continue) user，随后 assistant，两条 tool_result 合并为一条 user
+    assert_eq!(out.len(), 3);
+    let results = out[2]["content"].as_array().unwrap();
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0]["tool_use_id"], "call_a");
+    assert_eq!(results[1]["tool_use_id"], "call_b");
+}
+
+#[test]
+fn test_anthropic_sse_tool_events() {
+    use credit_gateway::protocol::parse_anthropic_chunk;
+    use credit_gateway::upstream::StreamEvent;
+    let start = serde_json::json!({"type":"content_block_start","index":1,
+        "content_block":{"type":"tool_use","id":"call_x","name":"read_file"}});
+    let evs = parse_anthropic_chunk(&start);
+    match &evs[0] {
+        StreamEvent::ToolCall { index, id, name, .. } => {
+            assert_eq!(*index, 0);
+            assert_eq!(id.as_deref(), Some("call_x"));
+            assert_eq!(name.as_deref(), Some("read_file"));
+        }
+        other => panic!("expected tool start, got {other:?}"),
+    }
+    // 参数分片：input_json_delta.partial_json → arguments 增量
+    let delta = serde_json::json!({"type":"content_block_delta","index":1,
+        "delta":{"type":"input_json_delta","partial_json":"{\"path\":"}});
+    match &parse_anthropic_chunk(&delta)[0] {
+        StreamEvent::ToolCall { index, arguments, .. } => {
+            assert_eq!(*index, 0);
+            assert_eq!(arguments.as_deref(), Some("{\"path\":"));
+        }
+        other => panic!("expected args delta, got {other:?}"),
+    }
+    // stop_reason=tool_use → finish_reason=tool_calls
+    let stop = serde_json::json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":5}});
+    let evs2 = parse_anthropic_chunk(&stop);
+    assert!(evs2.iter().any(|e| matches!(e, StreamEvent::Done { finish } if finish == "tool_calls")));
+    assert!(evs2.iter().any(|e| matches!(e, StreamEvent::Usage { .. })));
+}
+
+// ===== Qoder 外层信封错误帧（此前被静默丢弃 → 客户端只看到空流/502） =====
+
+#[test]
+fn test_qoder_envelope_surfaces_invalid_model_error() {
+    // 实测帧：HTTP 200 + 外层 statusCode=BAD_REQUEST，body 是 invalid_model_error
+    let frame = serde_json::json!({
+        "headers": {"Content-Type": ["application/json"]},
+        "body": "{\"code\":\"invalid_model_error\",\"message\":\"Unsupported model \\\"performance\\\"\",\"request_id\":\"x\",\"type\":\"invalid_model_error\"}\n",
+        "statusCodeValue": 400,
+        "statusCode": "BAD_REQUEST"
+    }).to_string();
+    match credit_gateway::upstream::qoder_envelope_event(&frame) {
+        Some(credit_gateway::upstream::StreamEvent::Error(msg, code)) => {
+            assert_eq!(code, "invalid_model_error");
+            assert!(msg.contains("Unsupported model"));
+        }
+        other => panic!("expected error event, got {other:?}"),
+    }
+    // 正常 chunk 仍按 OpenAI 解析
+    let ok = serde_json::json!({
+        "body": "{\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}",
+        "statusCodeValue": 200, "statusCode": "OK"
+    }).to_string();
+    match credit_gateway::upstream::qoder_envelope_event(&ok) {
+        Some(credit_gateway::upstream::StreamEvent::Text(t)) => assert_eq!(t, "hi"),
+        other => panic!("expected text event, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_to_anthropic_messages_synthesizes_missing_tool_result() {
+    use credit_gateway::protocol::to_anthropic_messages;
+    // 截断/中断后历史里 assistant 有 tool_use 但缺 tool 结果：官方客户端会补 is_error 占位
+    let msgs = serde_json::json!([
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "call_z", "type": "function", "function": {"name": "read_file", "arguments": "{\"path\":\"a\"}"}}
+        ]}
+    ]);
+    let (out, _) = to_anthropic_messages(msgs.as_array().unwrap(), "");
+    // assistant 开头会补一条 user 占位（(continue)），随后 assistant，最后补齐的 tool_result
+    assert_eq!(out.len(), 3);
+    assert_eq!(out[0]["role"], "user");
+    assert_eq!(out[1]["role"], "assistant");
+    assert_eq!(out[2]["role"], "user");
+    assert_eq!(out[2]["content"][0]["type"], "tool_result");
+    assert_eq!(out[2]["content"][0]["tool_use_id"], "call_z");
+    assert_eq!(out[2]["content"][0]["is_error"], true);
+}
+
+#[test]
+fn test_to_anthropic_messages_drops_orphan_tool_result() {
+    use credit_gateway::protocol::to_anthropic_messages;
+    // tool 结果的 id 不在紧邻 assistant 的 tool_use 里（历史断裂）：必须丢弃，避免上游 unexpected id
+    let msgs = serde_json::json!([
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "call_ok", "type": "function", "function": {"name": "f", "arguments": "{}"}}
+        ]},
+        {"role": "tool", "tool_call_id": "call_orphan", "content": "bogus"}
+    ]);
+    let (out, _) = to_anthropic_messages(msgs.as_array().unwrap(), "");
+    let has_orphan = out.iter().any(|m| {
+        m.get("content").and_then(|c| c.as_array()).map(|a| {
+            a.iter().any(|b| b.get("tool_use_id").and_then(|i| i.as_str()) == Some("call_orphan"))
+        }).unwrap_or(false)
+    });
+    assert!(!has_orphan, "孤儿 tool_result 必须丢弃");
+    // 同时真正缺失的 call_ok 被补上占位
+    let has_synth = out.iter().any(|m| {
+        m.get("content").and_then(|c| c.as_array()).map(|a| {
+            a.iter().any(|b| b.get("tool_use_id").and_then(|i| i.as_str()) == Some("call_ok"))
+        }).unwrap_or(false)
+    });
+    assert!(has_synth);
+}
+
+#[test]
+fn test_to_anthropic_messages_tool_result_is_first_block() {
+    use credit_gateway::protocol::to_anthropic_messages;
+    // 用户文本与工具结果混合时，tool_result 必须是 user 消息首个块
+    let msgs = serde_json::json!([
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "call_1", "type": "function", "function": {"name": "f", "arguments": "{}"}}
+        ]},
+        {"role": "tool", "tool_call_id": "call_1", "content": "r1"},
+        {"role": "user", "content": "继续"}
+    ]);
+    let (out, _) = to_anthropic_messages(msgs.as_array().unwrap(), "");
+    let tool_msg = out.iter().find(|m| {
+        m.get("content").and_then(|c| c.as_array())
+            .map(|a| a.first().and_then(|b| b.get("type")).and_then(|t| t.as_str()) == Some("tool_result"))
+            .unwrap_or(false)
+    }).expect("应有以 tool_result 开头的 user 消息");
+    let arr = tool_msg["content"].as_array().unwrap();
+    assert_eq!(arr[0]["type"], "tool_result");
+}

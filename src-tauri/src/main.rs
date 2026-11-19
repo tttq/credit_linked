@@ -302,16 +302,25 @@ async fn codearts_sync_local() -> Result<serde_json::Value, String> {
             cred.meta["access_key_id"] = s.pointer("/session/accessKey").cloned().unwrap_or(serde_json::Value::Null);
             cred.meta["secret_access_key"] = s.pointer("/session/secretKey").cloned().unwrap_or(serde_json::Value::Null);
             cred.meta["security_token"] = s.pointer("/session/securityToken").cloned().unwrap_or(serde_json::Value::Null);
-            cred.refresh_token = s.pointer("/session/refreshToken").and_then(|v| v.as_str()).map(|x| x.to_string());
+            let rt = s.pointer("/session/refreshToken").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+            cred.refresh_token = if rt.is_empty() { None } else { Some(rt.clone()) };
+            cred.meta["refresh_token"] = serde_json::json!(rt);
             cred.meta["verifier"] = s.pointer("/loginContext/pkcePair/codeVerifier").cloned().unwrap_or(serde_json::Value::Null);
-            cred.meta["privateJwk"] = s.pointer("/loginContext/dpopKeyPair/privateKey").cloned().unwrap_or(serde_json::Value::Null);
-            let exp_ms = s.pointer("/session/expiresAt").and_then(|e| e.as_i64());
-            if let Some(ms) = exp_ms {
-                let (y, mo, d) = credit_core::adapters::civil_from_days(ms / 1000 / 86400);
-                cred.expires_at = Some(format!("{y:04}-{mo:02}-{d:02}"));
+            cred.meta["privateJwk"] = credit_core::adapters::codearts::jwk_value(
+                s.pointer("/loginContext/dpopKeyPair/privateKey").unwrap_or(&serde_json::Value::Null)
+            );
+            // 会话 userName 是权威显示名（修复历史导入的 iam::... 错误名字）
+            if let Some(uname) = s.pointer("/session/userName").and_then(|v| v.as_str()) {
+                if !uname.is_empty() {
+                    cred.name = uname.to_string();
+                }
+            }
+            if let Some(ms) = s.pointer("/session/expiresAt").and_then(|e| e.as_i64()) {
+                cred.expires_at = Some(credit_core::adapters::codearts::epoch_ms_to_iso(ms));
             }
             let auth_js = serde_json::to_string(&cred).map_err(|e| e.to_string())?;
-            s_svc.store.upsert_account(prov, uid_existing, name, "", &auth_js).map_err(|e| e.to_string())?;
+            s_svc.store.upsert_account(prov, uid_existing, &cred.name, "", &auth_js).map_err(|e| e.to_string())?;
+            let _ = name;
             synced.push(provider.to_string());
         }
         let _ = uid;
@@ -461,10 +470,76 @@ async fn login_close_window(app: tauri::AppHandle, session_id: String) -> Result
 
 // ===== 自动签到调度器（消费设置：auto/time/catchup） =====
 
+/// 修复历史导入的码道账号元数据：
+/// - 旧版本把 principal_urn 解析错，账号名落库成 `iam::<account>`；这里用客户端会话里的
+///   `session.userName` 纠正；
+/// - 旧导入的 DPoP 私钥是 JSON 字符串（续期会 `jwk missing d`）→ 归一化为对象；
+/// - 顺带用客户端当前会话补齐 refresh_token 与 expiresAt（自动续期判断用）。
+/// 已修复的账号（名字正常 + 私钥是对象 + 有 RT）直接跳过，开销可忽略。
+fn repair_codearts_accounts(s: &Service) {
+    use credit_core::adapters::codearts_local;
+    let Ok(rows) = s.store.list_accounts() else { return };
+    for (p, u, name, _, auth) in rows {
+        if !p.starts_with("codearts") {
+            continue;
+        }
+        let Ok(mut cred) = serde_json::from_str::<credit_core::adapters::Cred>(&auth) else { continue };
+        let bad_name = name.starts_with("iam::") || name.is_empty();
+        let bad_jwk = cred.meta.get("privateJwk").map(|j| j.is_string()).unwrap_or(true);
+        let no_rt = cred.refresh_token.as_deref().unwrap_or("").is_empty();
+        if !(bad_name || bad_jwk || no_rt) {
+            continue;
+        }
+        let desktop = p == "codearts-desktop";
+        let Some(live) = codearts_local::read_live_session(desktop)
+            .or_else(|| codearts_local::read_live_session(!desktop))
+        else {
+            continue;
+        };
+        if let Some(uname) = live.session.pointer("/session/userName").and_then(|v| v.as_str()) {
+            if !uname.is_empty() {
+                cred.name = uname.to_string();
+            }
+        }
+        let rt = live.session.pointer("/session/refreshToken").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+        if !rt.is_empty() {
+            cred.refresh_token = Some(rt.clone());
+            cred.meta["refresh_token"] = serde_json::json!(rt);
+        }
+        cred.meta["privateJwk"] = credit_core::adapters::codearts::jwk_value(
+            live.session.pointer("/loginContext/dpopKeyPair/privateKey").unwrap_or(&serde_json::Value::Null),
+        );
+        if let Some(ms) = live.session.pointer("/session/expiresAt").and_then(|e| e.as_i64()) {
+            cred.expires_at = Some(credit_core::adapters::codearts::epoch_ms_to_iso(ms));
+        }
+        if let Ok(js) = serde_json::to_string(&cred) {
+            let _ = s.store.upsert_account(&p, &u, &cred.name, "", &js);
+        }
+    }
+}
+
 /// 调度 tick：到计划时间（含随机偏移/补跑）后对开启自动且今日未签的账号执行签到
 async fn auto_tick(app: &tauri::AppHandle) -> Result<(), String> {
     let s = match svc() { Ok(s) => s, Err(e) => return Err(format!("svc: {e}")) };
     let get = |k: &str, d: &str| s.store.get_setting(k, d).unwrap_or_else(|_| d.to_string());
+    // 码道历史账号元数据修复（名字 / DPoP 私钥 / RT / 到期时间）
+    repair_codearts_accounts(&s);
+    // 码道 STS 自动续期（与自动签到开关无关）：每 10 分钟巡检一次，
+    // 剩余有效期 < 10 分钟时按「客户端会话 → 客户端刷新等待 → STS RT 续期并回写」链路处理。
+    let now_secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
+    let last_renew: i64 = get("last_renew_tick", "0").parse().unwrap_or(0);
+    if now_secs - last_renew >= 600 {
+        let _ = s.store.set_setting("last_renew_tick", &now_secs.to_string());
+        if let Ok(rows) = s.store.list_accounts() {
+            if rows.iter().any(|(p, _, _, _, _)| p.starts_with("codearts")) {
+                for (p, u, r) in s.renew_expiring(600).await {
+                    if r != "renewed" {
+                        let _ = s.store.set_setting("last_auto_error", &format!("{p}:{u} 凭据续期 {r}"));
+                    }
+                }
+            }
+        }
+    }
     let auto = get("auto", "1") == "1";
     if !auto { return Ok(()); }
     let time = get("time", "09:00");

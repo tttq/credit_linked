@@ -61,19 +61,23 @@ fn is_session_json(v: &Value) -> bool {
 
 /// 读客户端会话：优先精确哈希文件名，失败则遍历 secretStorage/*.enc
 fn read_secret_storage(app: &std::path::Path, key: &[u8; 32]) -> Option<Value> {
+    find_secret_storage(app, key).map(|(_, v)| v)
+}
+
+/// 定位并解密会话文件：优先精确哈希文件名 sha256("authSession:cn-north-4")，失败则遍历
+fn find_secret_storage(app: &std::path::Path, key: &[u8; 32]) -> Option<(std::path::PathBuf, Value)> {
     let dir = app.join("secretStorage");
     if !dir.is_dir() { return None; }
-    // 精确：sha256("authSession:cn-north-4")
     let hashed: String = Sha256::digest(b"authSession:cn-north-4").iter().map(|b| format!("{b:02x}")).collect();
-    if let Some(v) = decrypt_enc_file(&dir.join(format!("{hashed}.enc")), key) {
-        if is_session_json(&v) { return Some(v); }
+    let exact = dir.join(format!("{hashed}.enc"));
+    if let Some(v) = decrypt_enc_file(&exact, key) {
+        if is_session_json(&v) { return Some((exact, v)); }
     }
-    // 兜底：逐个尝试（region/版本变化）
     for entry in std::fs::read_dir(&dir).ok()?.flatten() {
         let p = entry.path();
         if p.extension().and_then(|e| e.to_str()) != Some("enc") { continue; }
         if let Some(v) = decrypt_enc_file(&p, key) {
-            if is_session_json(&v) { return Some(v); }
+            if is_session_json(&v) { return Some((p, v)); }
         }
     }
     None
@@ -156,4 +160,75 @@ pub fn wait_for_session_change(desktop: bool, old_fp: Option<&str>, timeout: std
         if start.elapsed() >= timeout { return None; }
         std::thread::sleep(std::time::Duration::from_millis(1500));
     }
+}
+
+/// 本机码道客户端是否在运行（Electron 进程名 CodeArts.exe）。
+/// 用于决定续期策略：客户端在跑时它自己会按 1h 周期刷新并回写 secretStorage，
+/// 网关只应等待读取；客户端没跑时网关才自己走 STS refresh（并把新会话回写磁盘）。
+pub fn client_running() -> bool {
+    #[cfg(windows)]
+    {
+        let mut cmd = std::process::Command::new("tasklist");
+        cmd.args(["/FI", "IMAGENAME eq CodeArts.exe", "/NH"]);
+        if let Ok(out) = crate::proc_util::hide_console(cmd).output() {
+            let s = String::from_utf8_lossy(&out.stdout).to_ascii_lowercase();
+            return s.contains("codearts.exe");
+        }
+        false
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+/// 把续期后的凭据回写到客户端 secretStorage（保持网关与客户端同一份会话）。
+///
+/// 为什么需要：码道 refresh_token 是**一次性轮换**的。网关若自己用磁盘上的 RT 刷新，
+/// 服务端会作废旧 RT；若不把新 RT 写回客户端文件，客户端下次刷新必然 invalid_grant，
+/// 表现为「账号无法自动续期 / 必须重新登录」。写回后两边一致。
+///
+/// 返回 Ok(()) = 已写回；Err = 未找到会话文件或解密/加密失败（调用方记录即可，不阻塞）。
+pub fn write_session_credentials(
+    desktop: bool,
+    access_key: &str,
+    secret_key: &str,
+    security_token: &str,
+    refresh_token: &str,
+    expires_at_ms: i64,
+) -> anyhow::Result<()> {
+    let mut last_err = anyhow::anyhow!("未找到码道客户端会话文件");
+    for dir in candidate_dirs() {
+        let name = dir.file_name().and_then(|n| n.to_str()).unwrap_or("").to_lowercase();
+        let is_desktop_dir = name == "codearts";
+        if desktop != is_desktop_dir { continue; }
+        let key = match load_aes_key(&dir) { Ok(k) => k, Err(e) => { last_err = e; continue; } };
+        let Some((path, mut session)) = find_secret_storage(&dir, &key) else {
+            last_err = anyhow::anyhow!("secretStorage 里没有可解密的码道会话");
+            continue;
+        };
+        // 只更新凭据字段，保留 loginContext（PKCE verifier / DPoP 私钥）
+        session["session"]["accessKey"] = serde_json::json!(access_key);
+        session["session"]["secretKey"] = serde_json::json!(secret_key);
+        session["session"]["securityToken"] = serde_json::json!(security_token);
+        if !refresh_token.is_empty() {
+            session["session"]["refreshToken"] = serde_json::json!(refresh_token);
+        }
+        if expires_at_ms > 0 {
+            session["session"]["expiresAt"] = serde_json::json!(expires_at_ms);
+        }
+        let pt = serde_json::to_vec(&session)?;
+        let blob = crate::crypto::aes_gcm::encrypt_v10_blob(&pt, &key, b"")
+            .map_err(|e| anyhow::anyhow!(e))?;
+        let b64 = B64.encode(&blob);
+        // 原子写：同目录临时文件 → 替换（Windows 上先删再 rename）
+        let tmp = path.with_extension("enc.tmp");
+        std::fs::write(&tmp, b64.as_bytes())?;
+        if std::fs::rename(&tmp, &path).is_err() {
+            let _ = std::fs::remove_file(&path);
+            std::fs::rename(&tmp, &path)?;
+        }
+        return Ok(());
+    }
+    Err(last_err)
 }

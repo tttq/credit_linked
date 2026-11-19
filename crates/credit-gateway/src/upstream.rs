@@ -663,74 +663,86 @@ pub fn parse_trae_sse(stream: impl Stream<Item = Result<bytes::Bytes, reqwest::E
 
 // ============================ ZCode（智谱） ============================
 
-/// 智谱模型清单：与官方 ZCode 客户端 Start Plan 目录对齐（GLM 系列）。
-/// 按用户要求不再请求公开平台 API（open.bigmodel.cn），目录直接取官方客户端 catalog。
+/// 智谱模型清单：对齐官方 ZCode 客户端 builtin 目录（3.18.2，~/.zcode/v2/runtime/provider/
+/// …/zcode-builtin.json 逆向）——Start Plan（account:zai/bigmodel-start-plan）可用模型为
+/// GLM-5.3-Flash / GLM-5.2 / GLM-5-Turbo；GLM-5.3 属 Coding Plan 档。
+/// 旧清单（glm-5.3-flash 小写 / glm-5-flash / glm-5.3-air / glm-4.7）是错的，上游不认识。
 pub async fn zcode_fetch_models(_cred: &Cred) -> Result<Vec<ModelInfo>, PlatformError> {
     let mut out = Vec::new();
     for (id, name, ctx) in [
-        ("glm-5.3", "GLM-5.3", 200_000u64),
-        ("glm-5.3-flash", "GLM-5.3-Flash", 200_000),
-        ("glm-5.2", "GLM-5.2", 128_000),
-        ("glm-5-flash", "GLM-5-Flash", 128_000),
-        ("glm-5.3-air", "GLM-5.3-Air", 200_000),
-        ("glm-4.7", "GLM-4.7", 200_000),
+        ("GLM-5.3-Flash", "GLM-5.3-Flash", 200_000u64),
+        ("GLM-5.2", "GLM-5.2", 128_000),
+        ("GLM-5-Turbo", "GLM-5-Turbo", 128_000),
+        // Coding Plan 档模型（账号带 coding plan 权益时可用）
+        ("GLM-5.3", "GLM-5.3", 200_000),
     ] {
         out.push(ModelInfo { id: id.into(), name: name.into(), context_window: Some(ctx), max_tokens: None, credit_multiplier: None, supports_images: None });
     }
     Ok(out)
 }
 
-/// ZCode chat 通道：**只走本地 ZCode 软件的真实请求地址**（不走公开平台 API）。
-/// 逆向确认（桌面客户端 host 包 + 内核 zcode.cjs）：
-///   POST https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages
-///   凭据 = 本机 credentials.json 解密出的 zcodejwttoken（Start Plan 专用）
-///   请求头 = 官方客户端同款（X-Device-Mid / X-ZCode-App-Version / X-Platform …）
-/// 注意：该端点有服务端「仅官方客户端」校验（code=3012），非官方客户端会被拒；
-/// 这是服务端限制，网关会返回明确提示而不是回退到公开平台 API。
+/// ZCode chat 通道（双级路由，2026-11-19 端点矩阵实测结论）：
+///
+/// ① **首选：bigmodel Coding-Plan Anthropic 端点**
+///    `POST https://open.bigmodel.cn/api/anthropic/v1/messages`
+///    凭据 = 用长效 zcodejwttoken（无 exp）经 `GET /api/v1/oauth/profile` 动态换取的
+///    新鲜 bigmodel access_token（官方客户端的取票通道，实测返回 code=0）。
+///    认证有效（429=额度不足是上游业务错误，非鉴权失败）。
+/// ② Start Plan 专属端点（zcode.z.ai/api/v1/zcode-plan/anthropic）有服务端深度校验
+///    （HTTP 405 code=3012），连官方 @anthropic-ai/sdk 指纹头都被拒 —— 属服务端限制，
+///    网关不再尝试（此前把它当唯一通道导致所有对话 502）。
 pub async fn zcode_chat_stream(cred: &Cred, body: Value) -> Result<EventStream, String> {
     let mid = cred.meta.get("deviceMid").and_then(|d| d.as_str()).unwrap_or("");
     let model = body.get("model").and_then(|m| m.as_str()).unwrap_or("").to_string();
     let max_tokens = body.get("max_tokens").and_then(|v| v.as_u64()).map(|v| v as u32);
-    // 从 OpenAI messages 里分离 system（Anthropic 线格式用独立 system 字段）
+    // OpenAI messages → Anthropic 线格式（system 顶层 + tool_use/tool_result 转换）
     let msgs: Vec<Value> = body.get("messages").and_then(|m| m.as_array()).cloned().unwrap_or_default();
-    let mut system = String::new();
-    let mut rest: Vec<Value> = Vec::new();
-    for m in &msgs {
-        if m.get("role").and_then(|r| r.as_str()) == Some("system") {
-            if let Some(s) = m.get("content").and_then(|c| c.as_str()) {
-                if system.is_empty() { system = s.to_string(); } else { system.push('\n'); system.push_str(s); }
-            }
-            continue;
-        }
-        rest.push(m.clone());
-    }
+    let system = body.get("system").and_then(|s| s.as_str()).unwrap_or("").to_string();
+    let (a_msgs, sys) = crate::protocol::to_anthropic_messages(&msgs, &system);
+    let mut a_body = crate::protocol::zcode_anthropic_body(&a_msgs, &sys, &model, max_tokens);
+    // 工具（Anthropic 风格）与 thinking 开关
+    let tools: Vec<Value> = body.get("tools").and_then(|t| t.as_array()).cloned().unwrap_or_default();
+    let tool_choice = body.get("tool_choice").cloned();
+    crate::protocol::attach_anthropic_tools(&mut a_body, &tools, tool_choice.as_ref());
+
     let jwt = cred.meta.get("zcodeJwt").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
     if jwt.is_empty() {
-        return Err("本机 ZCode 凭据缺少 zcodejwttoken（Start Plan 对话令牌），请重新登录 ZCode 客户端并「扫描本机」".into());
+        return Err("本机 ZCode 凭据缺少 zcodejwttoken（对话取票令牌），请重新登录 ZCode 客户端并「扫描本机」".into());
     }
-    let a_body = crate::protocol::zcode_anthropic_body(&rest, &system, &model, max_tokens);
-    let url = format!("{}{}", crate::protocol::ZCODE_PLAN_ANTHROPIC_BASE, crate::protocol::ZCODE_ANTHROPIC_PATH);
-    let mut hs = crate::protocol::zcode_chat_headers(&jwt, Some(mid));
+
+    // 取新鲜 bigmodel token（长效 jwt → /api/v1/oauth/profile → data.bigmodel.access_token）
+    let fresh = credit_core::adapters::zcode::fresh_bigmodel_token(cred)
+        .await
+        .map_err(|e| format!("ZCode 取票失败（zcodejwttoken → oauth/profile）：{e}；请在 ZCode 客户端重新登录后「扫描本机」"))?;
+
+    let url = format!("{}{}", crate::protocol::ZCODE_ANTHROPIC_BASE, crate::protocol::ZCODE_ANTHROPIC_PATH);
+    let mut hs = crate::protocol::zcode_chat_headers(&fresh, Some(mid));
     hs.push(("anthropic-version".to_string(), "2023-06-01".to_string()));
     let mut req = stream_client().post(&url).json(&a_body);
     for (k, v) in &hs { req = req.header(k, v); }
     let resp = match req.send().await {
         Ok(r) => r,
-        Err(e) => return Err(format!("ZCode 本地客户端端点请求失败（{url}）：{e}")),
+        Err(e) => return Err(format!("ZCode 对话端点请求失败（{url}）：{e}")),
     };
     let st = resp.status().as_u16();
     if st == 200 {
         return Ok(parse_anthropic_sse(resp.bytes_stream()));
     }
     let txt = resp.text().await.unwrap_or_default();
-    if txt.contains("3012") || txt.contains("official ZCode client") {
+    // 1113 = 额度不足（账号无 coding plan 权益/资源包），给出可执行指引
+    if txt.contains("1113") {
         return Err(format!(
-            "ZCode 本地客户端端点拒绝第三方调用（HTTP {st} code=3012 This client is not supported）：\
-             该 Start Plan 对话端点由服务端校验官方客户端身份，第三方网关无法代替官方客户端发起对话；\
-             本网关已支持 ZCode 的模型目录/余额等账号功能，对话请使用 ZCode 客户端本身（{url}）"
+            "ZCode 对话被拒（HTTP {st} code=1113 余额不足或无可用资源包）：当前账号在 bigmodel 平台没有可用的 \
+             Coding Plan 权益（Start Plan 权益只挂在官方客户端专属端点上）。请确认 ZCode 客户端里已激活套餐，\
+             或改用其它平台的模型"
         ));
     }
-    Err(format!("ZCode 本地客户端端点返回 HTTP {st}：{}", truncate(&txt, 240)))
+    if txt.contains("401") || st == 401 {
+        return Err(format!(
+            "ZCode 取票 token 被拒（HTTP {st}）：zcodejwttoken 可能已失效，请在 ZCode 客户端重新登录后「扫描本机」"
+        ));
+    }
+    Err(format!("ZCode 对话端点返回 HTTP {st}：{}", truncate(&txt, 240)))
 }
 
 // ============================ MiniMax ============================
@@ -789,17 +801,31 @@ pub fn parse_anthropic_sse(stream: impl Stream<Item = Result<bytes::Bytes, reqwe
     }))
 }
 
-/// Anthropic SSE 泵（帧格式与 OpenAI 相同：data: 行）
+/// Anthropic SSE 泵（帧格式与 OpenAI 相同：data: 行）。
+/// 持有「content block index → tool_calls index」映射：工具参数分片按块归组，
+/// 客户端才能把 input_json_delta 拼回对应 tool call（否则工具调用参数丢失）。
 struct AnthropicPump {
     buf: Vec<u8>,
     queue: std::collections::VecDeque<StreamEvent>,
     stream: std::pin::Pin<Box<dyn Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send>>,
     done: bool,
+    /// 已发出结束事件（message_delta stop_reason / message_stop）：之后不再重复 Done
+    finished: bool,
+    block_tool_index: std::collections::HashMap<u64, u32>,
+    next_tool_index: u32,
 }
 
 impl AnthropicPump {
     fn new(stream: impl Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static) -> Self {
-        Self { buf: Vec::new(), queue: Default::default(), stream: Box::pin(stream), done: false }
+        Self {
+            buf: Vec::new(),
+            queue: Default::default(),
+            stream: Box::pin(stream),
+            done: false,
+            finished: false,
+            block_tool_index: Default::default(),
+            next_tool_index: 0,
+        }
     }
     fn feed(&mut self, chunk: &[u8]) {
         self.buf.extend_from_slice(chunk);
@@ -815,10 +841,12 @@ impl AnthropicPump {
                 if let Some(data) = line.strip_prefix("data:") {
                     let d = data.trim();
                     if d.is_empty() { continue; }
-                    evs.extend(anthropic_frame_decode(d));
+                    evs.extend(self.decode(d));
                 }
             }
-            if let Some(first) = evs.into_iter().next() {
+            let mut it = evs.into_iter();
+            if let Some(first) = it.next() {
+                self.queue.extend(it);
                 return Some(first);
             }
         }
@@ -832,6 +860,25 @@ impl AnthropicPump {
             return Some(block);
         }
     }
+    /// data 帧解码：统一走 protocol 的映射解析；Done 只发一次（message_delta 与 message_stop 常同时出现）
+    fn decode(&mut self, data: &str) -> Vec<StreamEvent> {
+        if data == "[DONE]" {
+            if self.finished { return Vec::new(); }
+            self.finished = true;
+            return vec![StreamEvent::Done { finish: "stop".into() }];
+        }
+        let Ok(v) = serde_json::from_str::<Value>(data) else { return Vec::new() };
+        let evs = crate::protocol::anthropic_chunk_with_map(&v, &mut self.block_tool_index, &mut self.next_tool_index);
+        let mut out = Vec::new();
+        for ev in evs {
+            if matches!(ev, StreamEvent::Done { .. }) {
+                if self.finished { continue; }
+                self.finished = true;
+            }
+            out.push(ev);
+        }
+        out
+    }
     fn take_tail(&mut self) -> Option<StreamEvent> {
         if let Some(ev) = self.queue.pop_front() {
             return Some(ev);
@@ -843,7 +890,7 @@ impl AnthropicPump {
             if let Some(data) = line.strip_prefix("data:") {
                 let d = data.trim();
                 if !d.is_empty() {
-                    if let Some(ev) = anthropic_frame_decode(d).into_iter().next() {
+                    if let Some(ev) = self.decode(d).into_iter().next() {
                         return Some(ev);
                     }
                 }
@@ -858,32 +905,35 @@ impl AnthropicPump {
 
 /// Qoder 模型清单：云端 chat 的模型是网关自动路由（"auto"），
 /// 公开目录无 models 端点 → 静态发布网关模型。
+///
+/// 2026-11-19 逆向校准（Qoder CN 0.5.14）：
+/// - 权威目录来自客户端 worker `models.list`（GET gateway.qoder.com.cn/algo/api/v2/model/list，
+///   需 Cosy 签名）live 拉取，共 14 个；完整快照见 `docs/qoder-catalog-live-2026-11-19.json`。
+/// - `efficient` / `performance` / `ultimate` 已被官方删除（上游实测 invalid_model_error），
+///   旧清单里的 `lite`/`cmodel`/`gm51model`/`q37fmodel`/`qmodel` 也已下架（部分仍可路由，不再对外发布）。
+/// - 新增 `jmodel`(Step-5-Preview) / `qmodel_latest_preview`(Qwen4-Max-Preview)；
+///   `qmodel_latest` 线上显示名已变为 Qwen4-Max。
 pub async fn qoder_fetch_models(_cred: &Cred) -> Result<Vec<ModelInfo>, PlatformError> {
-    // 对齐官方客户端 UI 模型选择器（dynamic-text/qoder-cn.json 逆向，20 个）
     Ok([
-        ("auto", "Auto", 128_000u64),
-        ("fast", "Fast", 128_000),
-        ("efficient", "Efficient", 128_000),
-        ("lite", "Lite", 128_000),
-        ("performance", "Performance", 128_000),
-        ("ultimate", "Ultimate", 128_000),
-        ("cmodel", "Cantus", 128_000),
-        ("dfmodel", "DeepSeek-Flash", 128_000),
-        ("dmodel", "DeepSeek-V4-Pro", 128_000),
-        ("gfmodel", "GLM-5.3-Flash", 128_000),
-        ("gm51model", "GLM-5.2", 128_000),
-        ("gmodel", "GLM-5.3", 128_000),
-        ("kmodel", "Kimi-K2.8-Preview", 128_000),
-        ("kmodel_latest", "Kimi-K3.1-Pro", 128_000),
-        ("mmodel", "MiniMax-M3.1-Flash", 128_000),
-        ("q37fmodel", "Qwen3.7-Flash", 128_000),
-        ("qfmodel", "Qwen3.8-Flash", 128_000),
-        ("qmodel", "Qwen3.7-Plus", 128_000),
-        ("qmodel_38max", "Qwen3.8-Max", 128_000),
-        ("qmodel_latest", "Qwen3.7-Max", 128_000),
+        ("auto", "Auto", 200_000u64),
+        ("fast", "Fast", 200_000),
+        ("qmodel_latest", "Qwen4-Max", 1_000_000),
+        ("qmodel_latest_preview", "Qwen4-Max-Preview", 1_000_000),
+        ("qmodel_38max", "Qwen3.8-Max", 180_000),
+        ("qfmodel", "Qwen3.8-Flash", 180_000),
+        ("dmodel", "DeepSeek-V4-Pro", 96_000),
+        ("dfmodel", "DeepSeek-Flash", 180_000),
+        ("gmodel", "GLM-5.3", 180_000),
+        ("gfmodel", "GLM-5.3-Flash", 1_000_000),
+        ("kmodel_latest", "Kimi-K3.1-Pro", 180_000),
+        ("kmodel", "Kimi-K2.8-Preview", 180_000),
+        ("jmodel", "Step-5-Preview", 1_000_000),
+        ("mmodel", "MiniMax-M3.1-Flash", 180_000),
     ].into_iter().map(|(id, name, ctx)| ModelInfo {
         id: id.into(), name: name.into(), context_window: Some(ctx),
-        max_tokens: None, credit_multiplier: None, supports_images: None,
+        max_tokens: None, credit_multiplier: None,
+        // 当前目录 14 个模型全部 isVl=true（原生多模态）
+        supports_images: Some(true),
     }).collect())
 }
 
@@ -1281,6 +1331,18 @@ pub async fn qoder_chat_stream(cred: &Cred, body: Value) -> Result<EventStream, 
     Ok(parse_qoder_envelope_sse(resp.bytes_stream()))
 }
 
+/// 仅做 Qoder 签名（诊断/测试用）：返回 sidecar 给出的 url/body/headers 原样。
+#[doc(hidden)]
+pub async fn qoder_sign_request(cred: &Cred, body: Value) -> Result<Value, String> {
+    qoder_sign(&json!({
+        "deviceToken": cred.token,
+        "endpoint": "https://gateway.qoder.com.cn",
+        "bodyJson": body.to_string(),
+        "modelKey": body.get("model").and_then(|m| m.as_str()).unwrap_or("mmodel"),
+        "modelSource": "official",
+    })).await
+}
+
 /// Qoder 双层信封 SSE → EventStream
 pub fn parse_qoder_envelope_sse(stream: impl Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static) -> EventStream {
     Box::pin(futures_util::stream::unfold(QoderPump::new(stream), |mut p| async move {
@@ -1311,11 +1373,13 @@ struct QoderPump {
     buf: Vec<u8>,
     stream: std::pin::Pin<Box<dyn Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send>>,
     done: bool,
+    /// 已产出错误事件：后续 event:error 栈帧/兜底错误不再重复上报（只保留根因）
+    errored: bool,
 }
 
 impl QoderPump {
     fn new(stream: impl Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static) -> Self {
-        Self { buf: Vec::new(), stream: Box::pin(stream), done: false }
+        Self { buf: Vec::new(), stream: Box::pin(stream), done: false, errored: false }
     }
     fn feed(&mut self, chunk: &[u8]) {
         self.buf.extend_from_slice(chunk);
@@ -1325,14 +1389,31 @@ impl QoderPump {
             let pos = find_block_end(&self.buf)?;
             let block = String::from_utf8_lossy(&self.buf[..pos.0]).to_string();
             self.buf.drain(..pos.1);
-            for line in block.lines() {
-                if let Some(data) = line.strip_prefix("data:") {
-                    let d = data.trim();
-                    if d.is_empty() { continue; }
-                    if let Some(ev) = decode_qoder_envelope(d) {
-                        return Some(ev);
-                    }
+            // 帧可能是 "event:error\ndata:{...}" 或纯 "data:{...}"；event 名参与错误判定
+            let (event_name, data) = match parse_event_block(&block) {
+                Some(x) => x,
+                None => continue,
+            };
+            if event_name == "error" {
+                if self.errored {
+                    continue;
                 }
+                self.errored = true;
+                let detail: String = data.chars().take(200).collect();
+                return Some(StreamEvent::Error(
+                    format!("Qoder 上游流错误：{detail}"),
+                    "qoder_stream_error".into(),
+                ));
+            }
+            if data.is_empty() { continue; }
+            if let Some(ev) = decode_qoder_envelope(&data) {
+                if matches!(ev, StreamEvent::Error(..)) {
+                    if self.errored {
+                        continue;
+                    }
+                    self.errored = true;
+                }
+                return Some(ev);
             }
         }
     }
@@ -1340,25 +1421,121 @@ impl QoderPump {
         if self.buf.is_empty() { return None; }
         let block = String::from_utf8_lossy(&self.buf).to_string();
         self.buf.clear();
-        for line in block.lines() {
-            if let Some(data) = line.strip_prefix("data:") {
-                if let Some(ev) = decode_qoder_envelope(data.trim()) {
-                    return Some(ev);
-                }
+        let (event_name, data) = parse_event_block(&block)?;
+        if event_name == "error" {
+            if self.errored {
+                return None;
             }
+            self.errored = true;
+            return Some(StreamEvent::Error(
+                format!("Qoder 上游流错误：{}", data.chars().take(200).collect::<String>()),
+                "qoder_stream_error".into(),
+            ));
         }
-        None
+        if data.is_empty() { return None; }
+        let ev = decode_qoder_envelope(&data);
+        if let Some(StreamEvent::Error(..)) = &ev {
+            if self.errored {
+                return None;
+            }
+            self.errored = true;
+        }
+        ev
     }
 }
 
-/// 外层信封 data:{headers, body:"<json>", statusCode} → 内层 OpenAI chunk → 事件
+/// Qoder 外层信封状态码 → 数字（statusCodeValue 优先，statusCode 字符串兜底）
+fn qoder_http_status(envelope: &Value) -> Option<i64> {
+    if let Some(v) = envelope.get("statusCodeValue").and_then(|s| s.as_i64()) {
+        return Some(v);
+    }
+    let s = envelope.get("statusCode").and_then(|s| s.as_str()).unwrap_or("");
+    Some(match s {
+        "OK" => 200,
+        "BAD_REQUEST" => 400,
+        "UNAUTHORIZED" => 401,
+        "FORBIDDEN" => 403,
+        "NOT_FOUND" => 404,
+        "TOO_MANY_REQUESTS" => 429,
+        "INTERNAL_SERVER_ERROR" => 500,
+        "BAD_GATEWAY" => 502,
+        "SERVICE_UNAVAILABLE" => 503,
+        _ => return None,
+    })
+}
+
+/// 外层信封 data:{headers, body:"<json>", statusCode} → 内层 OpenAI chunk → 事件。
+/// 关键修复：信封内是业务错误（如 invalid_model_error / 额度不足）时，此前会被静默丢弃，
+/// 客户端只看到空流/502；现在显式转成 Error 事件，透出上游真实原因。
 fn decode_qoder_envelope(data: &str) -> Option<StreamEvent> {
     let envelope: Value = serde_json::from_str(data).ok()?;
-    let inner_str = envelope.get("body").and_then(|b| b.as_str())?;
-    let inner: Value = serde_json::from_str(inner_str).ok()?;
-    // 复用 OpenAI chunk 解析（choices/delta 形状一致）
-    let events = parse_openai_chunk(&inner);
-    events.into_iter().next()
+    let status = qoder_http_status(&envelope);
+    let inner_str = envelope.get("body").and_then(|b| b.as_str()).unwrap_or("");
+    if !inner_str.trim().is_empty() {
+        match serde_json::from_str::<Value>(inner_str) {
+            Ok(inner) => {
+                // 业务错误帧：{code:"invalid_model_error", message:"Unsupported model ...", type:...}
+                if inner.get("choices").is_none() {
+                    if let Some(code) = inner.get("code").and_then(|c| c.as_str()) {
+                        let msg = inner
+                            .get("message")
+                            .or_else(|| inner.get("msg"))
+                            .and_then(|m| m.as_str())
+                            .unwrap_or("Qoder 上游错误");
+                        // 模型不支持时给出可执行提示（客户端可换模型/换平台）
+                        let hint = if code == "invalid_model_error" {
+                            "（该模型在当前 Qoder 账号不可用，请在 /v1/models 里选其它模型，或在账号路由页切换请求平台）"
+                        } else {
+                            ""
+                        };
+                        return Some(StreamEvent::Error(
+                            format!("Qoder 上游错误（{code}）：{msg}{hint}"),
+                            code.to_string(),
+                        ));
+                    }
+                    // 其它错误结构（success=false 等）
+                    if inner.get("success").and_then(|s| s.as_bool()) == Some(false) {
+                        let msg = inner
+                            .get("message")
+                            .or_else(|| inner.get("msgInfo"))
+                            .and_then(|m| m.as_str())
+                            .unwrap_or("Qoder 上游内部错误");
+                        return Some(StreamEvent::Error(format!("Qoder 上游错误：{msg}"), "qoder_error".into()));
+                    }
+                }
+                // 复用 OpenAI chunk 解析（choices/delta 形状一致）
+                let events = parse_openai_chunk(&inner);
+                if let Some(ev) = events.into_iter().next() {
+                    return Some(ev);
+                }
+                return None;
+            }
+            Err(_) => {
+                // body 是 HTML/纯文本（网关错误页）
+                return Some(StreamEvent::Error(
+                    format!(
+                        "Qoder 上游返回非 JSON（HTTP {}）：{}",
+                        status.unwrap_or(200),
+                        truncate(inner_str, 200)
+                    ),
+                    "qoder_bad_body".into(),
+                ));
+            }
+        }
+    }
+    // body 为空且状态码非 2xx → 状态错误
+    if let Some(st) = status {
+        if !(200..300).contains(&st) {
+            return Some(StreamEvent::Error(format!("Qoder 上游 HTTP {st}（空响应体）"), format!("qoder_http_{st}")));
+        }
+    }
+    None
+}
+
+/// 诊断/测试用：解码一帧 Qoder 外层信封
+#[doc(hidden)]
+pub fn qoder_envelope_event(data: &str) -> Option<StreamEvent> {
+    decode_qoder_envelope(data)
 }
 
 #[cfg(test)]

@@ -230,12 +230,18 @@ pub fn build_router(state: Arc<GatewayState>) -> AxumRouter {
         .allow_origin(tower_http::cors::Any)
         .allow_methods(tower_http::cors::Any)
         .allow_headers(tower_http::cors::Any);
+    // 请求体上限：axum `Json` extractor 默认只有 2MB —— Agent 客户端（dsh/Cline 等）
+    // 长上下文 + 工具结果很容易超过 2MB，超限会在进入 handler 前被框架直接拒绝，
+    // 表现为 `413 Failed to buffer the request body: length limit exceeded`。
+    // 网关自身有「按模型上下文窗口截断」保护，这里放宽到 64MB。
+    let body_limit = axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024);
     AxumRouter::new()
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/platforms", get(list_platforms))
         .route("/admin/rules", get(list_rules).post(add_rule))
         .route("/admin/rules/:id", delete(delete_rule).put(update_rule))
+        .layer(body_limit)
         .layer(cors)
         .with_state(state)
 }
@@ -333,33 +339,12 @@ async fn refresh_creds_from_local(st: &Arc<GatewayState>, platform: Platform, st
             }
         }
         Platform::CodeArts => {
-            let desktop = stale.provider == "codearts-desktop";
-            let read = || credit_core::adapters::codearts_local::read_live_session(desktop)
-                .or_else(|| credit_core::adapters::codearts_local::read_live_session(!desktop));
-            let stale_st = stale.meta.get("security_token").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            // 1) 本地会话已更新 → 直接导入
-            if let Some(l) = read() {
-                let cur = l.session.pointer("/session/securityToken").and_then(|v| v.as_str()).unwrap_or("");
-                if !cur.is_empty() && cur != stale_st {
-                    return svc.import_account(&stale.provider, false).await.is_ok();
-                }
-            }
-            // 2) 拉起本机客户端等刷新
-            let old_fp = credit_core::adapters::codearts_local::session_fingerprint(desktop);
-            match credit_core::adapters::codearts_local::launch_client() {
-                Some(exe) => eprintln!("[gateway] 码道 STS 过期，已拉起客户端 {}，等待其刷新…", exe.display()),
-                None => {
-                    eprintln!("[gateway] 码道 STS 过期且本机未安装 CodeArts 客户端");
-                    return false;
-                }
-            }
-            let wait = tokio::task::spawn_blocking(move || {
-                credit_core::adapters::codearts_local::wait_for_session_change(desktop, old_fp.as_deref(), std::time::Duration::from_secs(15))
-            }).await.ok().flatten();
-            match wait {
-                Some(_) => svc.import_account(&stale.provider, false).await.is_ok(),
-                None => {
-                    eprintln!("[gateway] 码道客户端 15s 内未刷新 STS（可能需要在客户端里重新登录）");
+            // 码道续期链：客户端会话已变 → 重新导入；客户端在跑 → 等它刷新；
+            // 否则网关用 STS RT 自己续期并回写客户端 secretStorage（见 Service::ensure_codearts_fresh）
+            match svc.ensure_codearts_fresh(stale).await {
+                Ok(_) => true,
+                Err(e) => {
+                    eprintln!("[gateway] 码道凭据续期失败: {e}");
                     false
                 }
             }
@@ -422,19 +407,18 @@ async fn launch_wait_and_import(st: &Arc<GatewayState>, platform: Platform, prov
 /// 拉取一个平台的模型列表（含码道双通道兜底）
 async fn fetch_models_for(st: &Arc<GatewayState>, platform: Platform, raw: &str) -> Option<Vec<upstream::ModelInfo>> {
     let all = st.router.accounts_for(platform);
-    let prefer = |desktop: bool| -> Vec<Cred> {
-        if raw == "codearts-desktop" {
-            if desktop {
-                all.iter().filter(|c| c.provider == "codearts-desktop").cloned().collect()
-            } else {
-                all.iter().filter(|c| c.provider != "codearts-desktop").cloned().collect()
-            }
-        } else {
-            all.iter().filter(|c| (c.provider == "codearts-desktop") == desktop).cloned().collect()
-        }
+    // 码道通道偏好：raw=codearts-desktop 用桌面凭据、raw=codearts 用 IDE 凭据，
+    // 另一通道作为兜底（同账号共用 STS 会话）。旧实现偏好方向写反了，
+    // 导致 IDE 通道永远优先用桌面凭据、失败兜底也选反。
+    let want_desktop = raw == "codearts-desktop";
+    let (pool, fallback): (Vec<Cred>, Vec<Cred>) = if platform == Platform::CodeArts {
+        (
+            all.iter().filter(|c| (c.provider == "codearts-desktop") == want_desktop).cloned().collect(),
+            all.iter().filter(|c| (c.provider == "codearts-desktop") != want_desktop).cloned().collect(),
+        )
+    } else {
+        (all.clone(), Vec::new())
     };
-    let pool = prefer(true);
-    let fallback = prefer(false);
     let mut cred = pool.first().cloned();
     if cred.is_none() {
         cred = fallback.first().cloned();
@@ -598,34 +582,41 @@ const MODEL_INFO_TTL: std::time::Duration = std::time::Duration::from_secs(600);
 /// 目录缺失/拉取失败时的兜底上下文窗口（平台静态目录大多 ≤128k）
 const DEFAULT_CONTEXT_WINDOW: u64 = 128_000;
 
-/// 查询模型的上下文窗口与输出上限（带 10min 平台级缓存；拉取失败退回默认值）
-async fn model_limits(st: &Arc<GatewayState>, platform: Platform, raw: &str, model: &str) -> (u64, Option<u64>) {
+/// 平台模型目录（id → 模型信息；10 分钟缓存；拉取失败返回 None，不阻塞请求）。
+/// 供长上下文截断、模型归属校验与跨平台自动寻址共用。
+async fn platform_catalog(
+    st: &Arc<GatewayState>,
+    platform: Platform,
+    raw: &str,
+) -> Option<std::collections::HashMap<String, upstream::ModelInfo>> {
     {
         let map = st.models_info.lock().unwrap();
         if let Some((at, m)) = map.get(raw) {
             if at.elapsed() < MODEL_INFO_TTL {
-                return match m.get(model) {
-                    Some(info) => (info.context_window.unwrap_or(DEFAULT_CONTEXT_WINDOW), info.max_tokens),
-                    None => (DEFAULT_CONTEXT_WINDOW, None),
-                };
+                return Some(m.clone());
             }
         }
     }
-    if let Some(models) = fetch_models_for(st, platform, raw).await {
-        let mut m = std::collections::HashMap::new();
-        for info in models {
-            m.insert(info.id.clone(), info);
-        }
-        let hit = m.get(model).map(|i| (i.context_window.unwrap_or(DEFAULT_CONTEXT_WINDOW), i.max_tokens));
-        if let Ok(mut map) = st.models_info.lock() {
-            map.insert(raw.to_string(), (Instant::now(), m));
-        }
-        if let Some(hit) = hit {
-            return hit;
-        }
-        return (DEFAULT_CONTEXT_WINDOW, None);
+    let models = fetch_models_for(st, platform, raw).await?;
+    let mut m = std::collections::HashMap::new();
+    for info in models {
+        m.insert(info.id.clone(), info);
     }
-    (DEFAULT_CONTEXT_WINDOW, None)
+    if let Ok(mut map) = st.models_info.lock() {
+        map.insert(raw.to_string(), (Instant::now(), m.clone()));
+    }
+    Some(m)
+}
+
+/// 查询模型的上下文窗口与输出上限（带 10min 平台级缓存；拉取失败退回默认值）
+async fn model_limits(st: &Arc<GatewayState>, platform: Platform, raw: &str, model: &str) -> (u64, Option<u64>) {
+    match platform_catalog(st, platform, raw).await {
+        Some(map) => match map.get(model) {
+            Some(info) => (info.context_window.unwrap_or(DEFAULT_CONTEXT_WINDOW), info.max_tokens),
+            None => (DEFAULT_CONTEXT_WINDOW, None),
+        },
+        None => (DEFAULT_CONTEXT_WINDOW, None),
+    }
 }
 
 /// 保守 token 估算：UTF-8 字节数 / 3 + 少量结构开销。
@@ -816,6 +807,53 @@ async fn chat_completions(
         return err_response(StatusCode::NOT_IMPLEMENTED, "chat_unavailable",
             &format!("平台 {} 暂无可用的对话通道（该平台仅支持签到与额度管理）", platform.display()));
     }
+    let current_raw = st.router.current_platform_raw();
+    let mut raw_for_models = if platform == current { current_raw.clone() } else { platform.as_str().to_string() };
+    // 模型校验 + 跨平台自动寻址（strict=off 且未固定账号时）：
+    // 客户端（如 dsh/Cherry）常用裸模型 id，切换请求平台后模型可能不属于新平台。
+    // 旧行为是把请求原样打给新平台 → 上游 400/空流/502；现在按各平台模型目录找到真正
+    // 拥有该模型的平台并自动路由；都找不到则返回明确的 400 model_not_found + 可用模型。
+    if !strict && pinned_account.is_none() {
+        if let Some(cat) = platform_catalog(&st, platform, &raw_for_models).await {
+            if !cat.contains_key(&model) {
+                let mut owner: Option<(Platform, String)> = None;
+                for p in Platform::all() {
+                    if p == platform || !p.chat_capable() {
+                        continue;
+                    }
+                    if st.router.accounts_for(p).is_empty() {
+                        continue;
+                    }
+                    let raw_p = if p == current { current_raw.clone() } else { p.as_str().to_string() };
+                    if let Some(cat2) = platform_catalog(&st, p, &raw_p).await {
+                        if cat2.contains_key(&model) {
+                            owner = Some((p, raw_p));
+                            break;
+                        }
+                    }
+                }
+                if let Some((p, raw_p)) = owner {
+                    eprintln!("[gateway] 模型 {} 不属于 {}，按平台目录自动路由到 {}", model, platform.as_str(), p.as_str());
+                    platform = p;
+                    raw_for_models = raw_p;
+                } else {
+                    let mut avail: Vec<String> = cat.keys().cloned().collect();
+                    avail.sort();
+                    avail.truncate(12);
+                    let _ = st.store.log_gateway_request(platform.as_str(), "", &model, false, Some(400), Some("model_not_found"), None);
+                    return openai_error_response(
+                        StatusCode::BAD_REQUEST,
+                        "model_not_found",
+                        &format!(
+                            "模型 \"{model}\" 不存在于平台 {}。可用模型：{}；也可用 \"平台/模型\" 指定其它平台（如 minimax/MiniMax-M3.1-Flash）",
+                            platform.display(),
+                            avail.join(", ")
+                        ),
+                    );
+                }
+            }
+        }
+    }
     let creds: Vec<Cred> = match pinned_account {
         Some(c) => vec![c],
         None => st.router.accounts_for(platform),
@@ -827,8 +865,6 @@ async fn chat_completions(
 
     // 长上下文保护：按所选模型的上下文窗口截断请求（Agent 累积历史/超大 system 会在上游
     // 挂死或长时间无响应）。截断在 normalize 之前做，保留 assistant.tool_calls 与 tool 回复的配对。
-    let current_raw = st.router.current_platform_raw();
-    let raw_for_models = if platform == current { current_raw.clone() } else { platform.as_str().to_string() };
     let (context_window, model_max_tokens) = model_limits(&st, platform, &raw_for_models, &model).await;
     let dropped = truncate_openai_messages(&mut openai_messages, &tools, context_window, max_tokens);
     if dropped > 0 {
@@ -1017,9 +1053,19 @@ async fn dispatch_stream(
             last
         }
         Platform::Zcode => {
-            let thinking = !matches!(reasoning_effort, Some("off") | Some("none"));
-            let mut body = crate::protocol::zcode_chat_body(messages, system, model, max_tokens, thinking);
-            crate::protocol::attach_anthropic_tools(&mut body, tools, tool_choice);
+            // 传 OpenAI 线格式 body（zcode_chat_stream 内部转换 Anthropic + profile 取票）
+            let mut body = serde_json::json!({
+                "model": model,
+                "messages": messages,
+                "system": system,
+                "stream": true,
+            });
+            if let Some(mt) = max_tokens { body["max_tokens"] = serde_json::json!(mt); }
+            if let Some(re) = reasoning_effort { body["reasoning_effort"] = serde_json::json!(re); }
+            if !tools.is_empty() {
+                body["tools"] = serde_json::json!(tools);
+                if let Some(tc) = tool_choice { body["tool_choice"] = tc.clone(); }
+            }
             upstream::zcode_chat_stream(cred, body).await.map_err(|e| ("upstream".to_string(), e))
         }
         Platform::Minimax => {
@@ -1191,6 +1237,10 @@ fn stream_response(
     let tool_buf2 = tool_buf.clone();
     let tool_flushed = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let tool_flushed2 = tool_flushed.clone();
+    // 结束帧只发一次：部分上游（码道/部分 OpenAI 兼容网关）会在同一响应里重复 finish_reason，
+    // 直接透传会让客户端看到两帧 finish_reason（有的客户端会提前截断/报错）
+    let done_sent = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let done_sent2 = done_sent.clone();
     // 收尾流要用 id/model，但 flat_map 的 move 闭包会拿走原值 → 先克隆
     let id_c = id.clone();
     let model_c = model.clone();
@@ -1203,7 +1253,11 @@ fn stream_response(
             Ok(StreamEvent::Done { .. }) => finished2.store(true, std::sync::atomic::Ordering::Relaxed),
             Ok(StreamEvent::ToolCall { .. }) => tool_seen2.store(true, std::sync::atomic::Ordering::Relaxed),
             Ok(StreamEvent::Error(m, _)) | Err(m) => {
-                if let Ok(mut g) = error2.lock() { *g = Some(m.clone()); }
+                if let Ok(mut g) = error2.lock() {
+                    if g.is_none() {
+                        *g = Some(m.clone());
+                    }
+                }
             }
             _ => {}
         }
@@ -1254,6 +1308,10 @@ fn stream_response(
                 },
             }).to_string()))),
             Ok(StreamEvent::Done { finish }) => {
+                // 重复 finish_reason：只处理第一帧（含参数 flush 与结束帧下发）
+                if done_sent2.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    return futures_util::stream::iter(out);
+                }
                 if !tool_flushed2.swap(true, std::sync::atomic::Ordering::Relaxed) {
                     for (index, (_tid, _name, args)) in tool_buf2.lock().unwrap().iter() {
                         let args_str = if args.trim().is_empty() {
@@ -1293,7 +1351,12 @@ fn stream_response(
     // 收尾流：上游未发结束帧就断开时（网络中断/上游非标准关闭），这里补发缓冲的
     // 工具参数与 finish_reason，保证 Agent 拿到完整 tool_calls 继续任务而不是挂死。
     // 正常收到 Done 时 tool_flushed 已置位，本流输出为空，不影响正常路径。
-    let close = futures_util::stream::iter({
+    //
+    // 注意：必须**惰性**构造（once(async).flatten()）。此前用 stream::iter({...}) 在
+    // stream_response 返回时就立即执行了闭包：先把 tool_flushed 置位、把 finish_reason
+    // 按「此刻」的空状态算成 stop，导致①每个响应多一帧 finish_reason，②正常结束路径的
+    // 工具参数永远不 flush（Agent 收到没有参数的 tool_calls 而挂死）。
+    let close = futures_util::stream::once(async move {
         let mut out: Vec<Result<Event, std::convert::Infallible>> = Vec::new();
         if !tool_flushed.swap(true, std::sync::atomic::Ordering::Relaxed) {
             for (index, (_tid, _name, args)) in tool_buf.lock().unwrap().iter() {
@@ -1314,8 +1377,9 @@ fn stream_response(
                 "choices": [{ "index": 0, "delta": {}, "finish_reason": fr }],
             }).to_string())));
         }
-        out
-    });
+        futures_util::stream::iter(out)
+    })
+    .flatten();
 
     let done = futures_util::stream::once(async {
         Ok::<_, std::convert::Infallible>(Event::default().data("[DONE]"))
@@ -1365,8 +1429,17 @@ async fn blocking_response(
             }
             Ok(StreamEvent::Usage { input, output, total }) => usage = Some((input, output, total)),
             Ok(StreamEvent::Done { .. }) => {}
-            Ok(StreamEvent::Error(msg, _)) => failure = Some(msg),
-            Err(e) => failure = Some(e),
+            Ok(StreamEvent::Error(msg, _)) => {
+                // 只保留第一个错误（最接近根因；后续多为上游栈帧噪声）
+                if failure.is_none() {
+                    failure = Some(msg);
+                }
+            }
+            Err(e) => {
+                if failure.is_none() {
+                    failure = Some(e);
+                }
+            }
         }
     }
     let mut empty_stream = false;

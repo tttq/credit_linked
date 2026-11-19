@@ -37,3 +37,19 @@ pub fn decrypt_v10_blob(blob: &[u8], key: &[u8], aad: &[u8]) -> Result<Vec<u8>, 
     let nonce = &blob[3..15];
     gcm_decrypt(key, nonce, &blob[15..], aad)
 }
+
+/// 生成 "v10" 前缀 blob（decrypt_v10_blob 的逆操作；随机 nonce 12B）。
+/// 用途：把续期后的 STS/AK/SK/RT 回写到客户端 secretStorage，保持网关与客户端同一份会话。
+pub fn encrypt_v10_blob(pt: &[u8], key: &[u8], aad: &[u8]) -> Result<Vec<u8>, String> {
+    if key.len() != 32 {
+        return Err("key must be 32B".into());
+    }
+    let mut nonce = [0u8; 12];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
+    let ct = gcm_seal(key, &nonce, pt, aad)?;
+    let mut out = Vec::with_capacity(3 + 12 + ct.len());
+    out.extend_from_slice(b"v10");
+    out.extend_from_slice(&nonce);
+    out.extend_from_slice(&ct);
+    Ok(out)
+}

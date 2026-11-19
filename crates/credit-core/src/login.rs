@@ -336,13 +336,18 @@ async fn codearts_wait_task(
                 "verifier": verifier, "client": client,
             }),
         };
-        // caller-identity 拿 uid/name（走 Adapter verify）
+        // caller-identity 拿 uid/name（走 Adapter verify）：字段规范化与官方客户端一致
         let adapter = crate::adapters::codearts::CodeArtsAdapter { desktop: client == "desktop" };
         let id = crate::adapters::Adapter::verify(&adapter, &c).await.map_err(|e| e.to_string())?;
-        c.uid = id.get("user").and_then(|u| u.get("id")).and_then(|i| i.as_str())
-            .or_else(|| id.get("principal_id").and_then(|i| i.as_str()))
-            .ok_or_else(|| "码道未返回账号标识".to_string())?.to_string();
-        c.name = id.get("user").and_then(|u| u.get("name")).and_then(|n| n.as_str()).unwrap_or("华为云码道").to_string();
+        let (pid, pname, domain) = crate::adapters::codearts::identity_of(&id);
+        if pid.is_empty() {
+            return Err("码道未返回账号标识".into());
+        }
+        c.uid = pid;
+        c.name = if pname.is_empty() { "华为云码道".to_string() } else { pname };
+        if !domain.is_empty() {
+            c.meta["domain_id"] = json!(domain);
+        }
         Ok(c)
     }.await;
     if let Ok(mut m) = flows().lock() {

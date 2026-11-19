@@ -1,6 +1,8 @@
 //! ZCode（智谱）适配器（对齐客户端 3.18.2 逆向）：
 //! 活动发现 GET /billing/preview → claim（响应 code/data.plan 判定）→ 余额 /billing/balance。
-//! billing 类端点只认 zcodejwttoken；无 refresh API（续期 = 重新 OAuth）。
+//! billing/profile 类端点只认 zcodejwttoken（无 exp 的长效会话 JWT）；
+//! 短效 OAuth access_token（exp≈1h）可经 GET /api/v1/oauth/profile 的
+//! `data.bigmodel.access_token` 动态换新 —— 这是官方客户端的取票通道。
 
 use serde_json::{json, Value};
 
@@ -50,10 +52,13 @@ async fn request_with(c: &Cred, path: &str, method: Method, body: Option<Value>,
 impl Adapter for ZcodeAdapter {
     fn provider(&self) -> &'static str { "zcode" }
 
-    /// 校验 token：GET /client/configs（走 OAuth access_token）
+    /// 校验凭据有效性：用长效 zcodejwttoken 经 /api/v1/oauth/profile 换新票。
+    /// 旧实现用磁盘 access_token 调 /client/configs —— 该 token 只有 1h TTL 且客户端
+    /// 不回写刷新，导致「扫描导入成功但 verify 永远 401（一直报登录错误）」。
+    /// profile 端点同时校验 jwt 有效性并返回新鲜 bigmodel token（实测 code=0）。
     async fn verify(&self, c: &Cred) -> Result<Value, PlatformError> {
-        let d = business(request(c, "/api/v1/client/configs", Method::GET, None).await?)?;
-        Ok(d)
+        let tok = fresh_bigmodel_token(c).await?;
+        Ok(json!({ "verified": true, "token_source": "oauth/profile", "access_token": tok }))
     }
 
     /// 查活动：/billing/preview 的 plans + captcha 门（命中则 requires_manual）
@@ -144,9 +149,12 @@ impl Adapter for ZcodeAdapter {
         Ok(Quota { remaining: Some(remaining.max(0.0)), parts, sampled_at: now_iso() })
     }
 
-    /// 不支持续期：token 过期只能重新 OAuth 授权
-    async fn refresh(&self, _c: &Cred) -> Result<Cred, PlatformError> {
-        Err(PlatformError::Auth)
+    /// 「续期」= profile 取票链自检：zcodejwttoken 长效有效（无 exp），磁盘 access_token
+    /// 过期不影响任何功能（verify/chat 都走 fresh_bigmodel_token）。jwt 失效时返回 Auth，
+    /// 由上层走「拉起客户端 → 扫描本机」自愈链。
+    async fn refresh(&self, c: &Cred) -> Result<Cred, PlatformError> {
+        let _ = fresh_bigmodel_token(c).await?;
+        Ok(c.clone())
     }
 }
 
@@ -156,4 +164,57 @@ pub async fn balance(c: &Cred) -> Result<Value, PlatformError> {
     let v = billing_request(c, "/api/v1/zcode-plan/billing/balance?app_version=3.18.2", Method::GET, None).await?;
     let d = business(v)?;
     Ok(d.get("data").cloned().unwrap_or(d))
+}
+
+// ===== 会话取票（对话用 access_token 的唯一可靠来源）=====
+
+/// 对话请求头（对齐官方 buildZCodeSourceHeadersFromContext + billing 端实测必需集）
+fn chat_headers(token: &str, device_mid: &str) -> Vec<(String, String)> {
+    vec![
+        ("Authorization".to_string(), format!("Bearer {token}")),
+        ("Content-Type".to_string(), "application/json".to_string()),
+        ("Accept".to_string(), "application/json".to_string()),
+        ("anthropic-version".to_string(), "2023-06-01".to_string()),
+        ("User-Agent".to_string(), "ZCode/3.18.2".to_string()),
+        ("X-ZCode-App-Version".to_string(), "3.18.2".to_string()),
+        ("X-Platform".to_string(), "win32-x64".to_string()),
+        ("X-Os-Category".to_string(), "windows".to_string()),
+        ("X-Client-Language".to_string(), "zh-CN".to_string()),
+        ("X-Client-Timezone".to_string(), "Asia/Shanghai".to_string()),
+        ("X-Device-Mid".to_string(), device_mid.to_string()),
+    ]
+}
+
+/// 用长效 zcodejwttoken 经 /api/v1/oauth/profile 换**新鲜**的 bigmodel access_token。
+///
+/// 逆向证据（ZCode 3.18.2 asar）：
+/// - `userinfoUrl = As({ZCODE_ENV:"production"}, "/api/v1/oauth/profile")`（bigmodel provider runtime config）；
+/// - 实测响应 `data.bigmodel.access_token` 为 334 字节新鲜 JWT（客户端每次会话取此票）；
+/// - 磁盘 credentials.json 里的 access_token 只有 1 小时 TTL 且客户端不回写刷新——
+///   这就是网关「一直报登录错误」的根因（存的票永远过期）。
+/// zcodejwttoken 本身无 exp（仅 iat/sub/user_id），长效有效（billing/balance 实测 200）。
+pub async fn fresh_bigmodel_token(c: &Cred) -> Result<String, PlatformError> {
+    let jwt = c.meta.get("zcodeJwt").and_then(|d| d.as_str()).filter(|s| !s.is_empty())
+        .ok_or(PlatformError::Auth)?;
+    let mid = c.meta.get("deviceMid").and_then(|d| d.as_str()).unwrap_or("");
+    let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(15)).build().unwrap();
+    let mut req = client.get(format!("{BASE}/api/v1/oauth/profile"));
+    for (k, v) in chat_headers(jwt, mid) {
+        if k != "Content-Type" && k != "Accept" && k != "anthropic-version" {
+            req = req.header(k, v);
+        }
+    }
+    let resp = req.send().await.map_err(|e| PlatformError::Network(e.to_string()))?;
+    let st = resp.status().as_u16();
+    if st != 200 {
+        return Err(if st == 401 { PlatformError::Auth } else {
+            PlatformError::Format(format!("oauth/profile HTTP {st}"))
+        });
+    }
+    let v: Value = resp.json().await.map_err(|e| PlatformError::Format(e.to_string()))?;
+    let tok = v.pointer("/data/bigmodel/access_token").and_then(|t| t.as_str()).unwrap_or("").to_string();
+    if tok.is_empty() {
+        return Err(PlatformError::Format("oauth/profile 未返回 bigmodel access_token（账号未关联 bigmodel？）".into()));
+    }
+    Ok(tok)
 }
