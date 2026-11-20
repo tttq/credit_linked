@@ -64,8 +64,23 @@ jobs:
             fs.writeFileSync(f, JSON.stringify(j, null, 2) + '\n');
           " "$VER"
           # Cargo.toml workspace.package.version（credit-tauri 继承 workspace 版本，CARGO_PKG_VERSION 即应用版本）
-          sed -i '0,/^\[workspace.package\]/s//&/' Cargo.toml
-          sed -ri "0,/^version = \"[0-9]+\.[0-9]+\.[0-9]+\"/s//version = \"$VER\"/" Cargo.toml
+          # macOS 的 BSD sed 不兼容 GNU sed 的 -i/0,/re/ 语法，改用 node 跨平台替换
+          node -e "
+            const fs = require('fs');
+            const f = 'Cargo.toml';
+            const ver = process.argv[1];
+            const lines = fs.readFileSync(f, 'utf8').split('\n');
+            let inSection = false, done = false;
+            for (let i = 0; i < lines.length; i++) {
+              if (/^\[/.test(lines[i])) { inSection = lines[i].trim() === '[workspace.package]'; continue; }
+              if (inSection && !done && /^version\s*=/.test(lines[i])) {
+                lines[i] = 'version = \"' + ver + '\"';
+                done = true;
+              }
+            }
+            if (!done) { console.error('version under [workspace.package] not found'); process.exit(1); }
+            fs.writeFileSync(f, lines.join('\n'));
+          " "$VER"
           echo "tauri.conf.json version: $(node -p "JSON.parse(require('fs').readFileSync('src-tauri/tauri.conf.json','utf8')).version")"
           echo "Cargo.toml workspace version: $(grep -m1 -A1 '\[workspace.package\]' Cargo.toml | grep version)"
 

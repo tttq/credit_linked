@@ -1,4 +1,4 @@
-// AI路由助手 前端逻辑
+// AI Free Router 前端逻辑
 const _T = window.__TAURI__;
 const invoke = _T?.core?.invoke || _T?.invoke;
 window.invoke = invoke; // i18n.js 等外部脚本经 window.invoke 调后端（settings locale 持久化）

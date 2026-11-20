@@ -296,7 +296,7 @@ async fn codearts_wait_task(
         // 授权页可能先发一次 307 中转请求（带 secret/redirect 无 code），真正回调带 code
         let mut query = String::new();
         for _ in 0..3 {
-            let q = wait_callback(&listener, std::time::Duration::from_secs(299), "/oauth/callback", "已收到授权，请返回 AI路由助手。").await.map_err(|e| e.to_string())?;
+            let q = wait_callback(&listener, std::time::Duration::from_secs(299), "/oauth/callback", "已收到授权，请返回 AI Free Router。").await.map_err(|e| e.to_string())?;
             let p = parse_query(&q);
             if p.contains_key("secret") && !p.contains_key("code") {
                 continue;
