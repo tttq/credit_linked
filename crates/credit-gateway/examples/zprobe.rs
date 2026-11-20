@@ -99,8 +99,9 @@ async fn main() -> anyhow::Result<()> {
 
 fn json_cred(jwt: &str, mid: &str) -> credit_core::adapters::Cred {
     // 便捷构造（实验用）：zcodeJwt + deviceMid
-    let mut c = credit_core::adapters::Cred::default();
-    c.provider = "zcode".into();
-    c.meta = serde_json::json!({ "zcodeJwt": jwt, "deviceMid": mid });
-    c
+    credit_core::adapters::Cred {
+        provider: "zcode".into(),
+        meta: serde_json::json!({ "zcodeJwt": jwt, "deviceMid": mid }),
+        ..Default::default()
+    }
 }

@@ -507,6 +507,7 @@ async fn login_close_window(app: tauri::AppHandle, session_id: String) -> Result
 ///   `session.userName` 纠正；
 /// - 旧导入的 DPoP 私钥是 JSON 字符串（续期会 `jwk missing d`）→ 归一化为对象；
 /// - 顺带用客户端当前会话补齐 refresh_token 与 expiresAt（自动续期判断用）。
+///
 /// 已修复的账号（名字正常 + 私钥是对象 + 有 RT）直接跳过，开销可忽略。
 fn repair_codearts_accounts(s: &Service) {
     use credit_core::adapters::codearts_local;

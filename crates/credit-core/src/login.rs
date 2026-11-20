@@ -111,7 +111,7 @@ async fn wait_callback(listener: &TcpListener, timeout: std::time::Duration, pat
             }
             continue;
         }
-        let _ = s.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{reply}", reply.len()).as_bytes()).await;
+        let _ = s.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: *\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{reply}", reply.len()).as_bytes()).await;
         return Ok(query);
     }
 }
@@ -248,11 +248,20 @@ fn new_p256_jwk() -> Value {
 
 async fn trae_wait_task(sid: String, listener: TcpListener, login: crate::adapters::trae::TraeLogin, _shared: Arc<Mutex<Option<Result<Cred, String>>>>) {
     let res: Result<Cred, String> = async {
-        let query = wait_callback(&listener, std::time::Duration::from_secs(299), "/authorize", "授权完成，请返回 AI路由助手。").await.map_err(|e| e.to_string())?;
-        let params = parse_query(&query);
-        if params.get("error").map(|s| !s.is_empty()).unwrap_or(false) {
-            return Err("TRAE 授权未完成或已取消，请重新发起".into());
-        }
+        // 授权页在真正回调前可能先打一发不含 authCode 的请求（OPTIONS 预检、
+        // 监听探活、中转跳转等）——逐个消费，直到出现 authCode 或显式 error，
+        // 总预算约 5 分钟。之前首个请求即被消费，导致 "missing authCode"。
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(299);
+        let params = loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() { return Err("登录回调等待超时（5 分钟未完成）".into()); }
+            let query = wait_callback(&listener, remaining, "/authorize", "授权完成，请返回应用。").await.map_err(|e| e.to_string())?;
+            let p = parse_query(&query);
+            if p.contains_key("authCode") { break p; }
+            if p.get("error").map(|s| !s.is_empty()).unwrap_or(false) {
+                return Err("TRAE 授权未完成或已取消，请重新发起".into());
+            }
+        };
         if let Some(tid) = params.get("loginTraceID") {
             if *tid != login.trace_id { return Err("回调 traceId 不匹配（CSRF 防护），请重新发起".into()); }
         }

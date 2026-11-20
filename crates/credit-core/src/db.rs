@@ -12,6 +12,9 @@ pub struct Store {
 /// 账号原始行：(provider, uid, name, secret, auth)
 pub type RawAccountRow = (String, String, String, String, String);
 
+/// 每日 token 统计行：(day, prompt_sum, completion_sum, total_sum, requests)
+pub type DailyTokenStat = (String, i64, i64, i64, i64);
+
 impl Store {
     /// 打开（必要时创建）数据库：启用 WAL/外键/3s busy 超时，并按序执行 v1→v3 迁移。
     pub fn open(path: &Path) -> anyhow::Result<Self> {
@@ -327,7 +330,7 @@ pub fn list_history(&self, limit: i64) -> anyhow::Result<Vec<HistoryRow>> {
 
     /// 按日期聚合 token 消耗（签到积分统计同源展示）：只统计成功请求。
     /// 返回 Vec<(day, prompt_sum, completion_sum, total_sum, requests)>。
-    pub fn token_stats_daily(&self, limit: i64) -> anyhow::Result<Vec<(String, i64, i64, i64, i64)>> {
+    pub fn token_stats_daily(&self, limit: i64) -> anyhow::Result<Vec<DailyTokenStat>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT substr(at, 1, 10) AS day,

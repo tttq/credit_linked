@@ -1240,7 +1240,6 @@ async function quotaAll(btn) {
 }
 $('#btn-quota-all3').addEventListener('click', (e) => quotaAll(e.currentTarget));
 $('#btn-quota-all2').addEventListener('click', (e) => quotaAll(e.currentTarget));
-$('#btn-refresh').addEventListener('click', refreshAll);
 $$('[data-goto]').forEach(b => b.addEventListener('click', () => showPage(b.dataset.goto)));
 window.addEventListener('resize', () => { charts.ov?.resize(); charts.st?.resize(); });
 window.piconFallback = piconFallback;

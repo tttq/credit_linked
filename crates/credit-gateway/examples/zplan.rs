@@ -16,9 +16,11 @@ async fn main() -> anyhow::Result<()> {
     let jwt = live.zcode_jwt.clone().unwrap_or_default();
     let mid = live.device_mid.clone();
 
-    let mut cred = credit_core::adapters::Cred::default();
-    cred.provider = "zcode".into();
-    cred.meta = serde_json::json!({ "zcodeJwt": jwt, "deviceMid": mid });
+    let cred = credit_core::adapters::Cred {
+        provider: "zcode".into(),
+        meta: serde_json::json!({ "zcodeJwt": jwt, "deviceMid": mid }),
+        ..Default::default()
+    };
 
     // 走 OpenAI 兼容入参（网关对外形态），网关内部转 Anthropic 线格式
     let body = json!({

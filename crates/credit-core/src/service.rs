@@ -87,13 +87,12 @@ impl Service {
         // ① 本地会话已更新 → 重新导入（使用磁盘上客户端回写的最新 STS）
         if let Some(live) = local::read_live_session(desktop).or_else(|| local::read_live_session(!desktop)) {
             let cur_st = live.session.pointer("/session/securityToken").and_then(|v| v.as_str()).unwrap_or("");
-            if !cur_st.is_empty() && cur_st != stale_st {
-                if self.import_account(&cred.provider, false).await.is_ok() {
+            if !cur_st.is_empty() && cur_st != stale_st
+                && self.import_account(&cred.provider, false).await.is_ok() {
                     if let Some(c) = self.pick_cred(&cred.provider, &cred.uid) {
                         return Ok(c);
                     }
                 }
-            }
             // ② 客户端在跑 → 等它按自己的周期刷新（不抢它的 RT）
             if local::client_running() {
                 let old_fp = local::session_fingerprint(desktop);
@@ -298,20 +297,17 @@ impl Service {
         // 签到失败/授权过期 → 自动续期（重新扫描本机客户端会话 → STS RT 续期 → 拉起客户端）
         // 后整链重试一次；重试仍失败才落库失败态
         if matches!(outcome.status.as_str(), "failed" | "auth-expired") && provider.starts_with("codearts") {
-            match self.ensure_codearts_fresh(&cred).await {
-                Ok(fresh) => {
-                    cred = fresh;
-                    match self.state_and_claim(provider, uid, &mut cred, adapter.as_ref()).await {
-                        Ok(retry) if retry.status != "failed" && retry.status != "auth-expired" => {
-                            outcome = retry;
-                            outcome.message = outcome.message.take().map(|m| format!("自动续期后重签成功 · {m}"))
-                                .or_else(|| Some("自动续期后重签成功".into()));
-                        }
-                        _ => {} // 重试仍失败：保留第一次失败结果落库
+            if let Ok(fresh) = self.ensure_codearts_fresh(&cred).await {
+                cred = fresh;
+                match self.state_and_claim(provider, uid, &mut cred, adapter.as_ref()).await {
+                    Ok(retry) if retry.status != "failed" && retry.status != "auth-expired" => {
+                        outcome = retry;
+                        outcome.message = outcome.message.take().map(|m| format!("自动续期后重签成功 · {m}"))
+                            .or_else(|| Some("自动续期后重签成功".into()));
                     }
+                    _ => {} // 重试仍失败：保留第一次失败结果落库
                 }
-                Err(_) => {} // 续期失败：保留失败结果（message 已带平台原始错误）
-            }
+            } // 续期失败：保留失败结果（message 已带平台原始错误）
         }
         let _ = self.store.record_history(provider, uid, name, &cycle, &outcome.status, outcome.amount, outcome.message.as_deref(), &crate::adapters::now_iso());
         let _ = self.store.update_account_status(provider, uid, &outcome.status, outcome.message.as_deref());
@@ -583,9 +579,8 @@ impl Service {
                     let (pid, pname, domain) = crate::adapters::codearts::identity_of(&id);
                     if !pid.is_empty() && cred.uid.starts_with("local-") { cred.uid = pid; }
                     // 客户端会话里的 userName 是权威显示名；principal_urn 解析作为兜底
-                    if cred.name.is_empty() || cred.name == "华为云码道" || cred.name == "码道桌面" {
-                        if !pname.is_empty() { cred.name = pname; }
-                    }
+                    if (cred.name.is_empty() || cred.name == "华为云码道" || cred.name == "码道桌面")
+                        && !pname.is_empty() { cred.name = pname; }
                     if !domain.is_empty() { cred.meta["domain_id"] = json!(domain); }
                 }
                 cred

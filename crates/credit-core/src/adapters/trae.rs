@@ -304,22 +304,14 @@ pub struct TraeLogin {
     pub url: String,
 }
 
-/// 发起登录：优先复用本机已注册设备号，生成 PKCE 并拼出 console 登录页 URL
+/// 发起登录：生成全新设备身份 + PKCE，并拼出 console 登录页 URL
 pub fn start_login() -> TraeLogin {
     // 每次登录生成全新独立设备身份：多账号场景下各账号得到各自的 device_id，
-    // ExchangeToken 时注册到服务端，后续签到按账号各自的设备号执行（规避
-    // 「一设备一天一签」限制）。若本机 Trae 客户端有已注册设备号则优先探测。
-    let identity = {
-        let local = crate::adapters::trae_local::collect_local_device_ids();
-        match local.first() {
-            Some(id) => {
-                let mut base = new_device_identity();
-                base.device_id = id.clone();
-                base
-            }
-            None => new_device_identity(),
-        }
-    };
+    // ExchangeToken(DeviceInfo) 时注册到服务端并绑定到本账号。绝不能复用本机
+    // Trae 客户端/其他账号已注册的设备号——同一设备号重复注册会把旧账号的
+    // 设备绑定顶掉（表现为「登录第二个账号挤掉第一个」），且违反
+    // 「一设备一天一签」限制。
+    let identity = new_device_identity();
     let mut vb = [0u8; 48];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut vb);
     let verifier = B64URL.encode(vb);

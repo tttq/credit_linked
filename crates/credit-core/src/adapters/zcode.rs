@@ -192,6 +192,7 @@ fn chat_headers(token: &str, device_mid: &str) -> Vec<(String, String)> {
 /// - 实测响应 `data.bigmodel.access_token` 为 334 字节新鲜 JWT（客户端每次会话取此票）；
 /// - 磁盘 credentials.json 里的 access_token 只有 1 小时 TTL 且客户端不回写刷新——
 ///   这就是网关「一直报登录错误」的根因（存的票永远过期）。
+///
 /// zcodejwttoken 本身无 exp（仅 iat/sub/user_id），长效有效（billing/balance 实测 200）。
 pub async fn fresh_bigmodel_token(c: &Cred) -> Result<String, PlatformError> {
     let jwt = c.meta.get("zcodeJwt").and_then(|d| d.as_str()).filter(|s| !s.is_empty())
