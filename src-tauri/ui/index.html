@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
-<title>AI路由助手</title>
+<title>AI Free Router</title>
 <script src="vendor/echarts.min.js"></script>
 <script src="i18n.js"></script>
 <style>
@@ -286,8 +286,8 @@ img { max-width: 100%; }
 <body>
 <div id="shell">
   <header class="panel-topbar" data-tauri-drag-region>
-    <div class="app-mark" style="width:24px;height:24px;border-radius:8px;background:linear-gradient(135deg,#6862ed,#9d7bf0);display:flex;align-items:center;justify-content:center;color:#fff;font-weight:700;font-size:12px">路</div>
-    <span class="panel-title" data-tauri-drag-region data-i18n="app_name">AI路由助手</span>
+    <div class="app-mark" style="width:24px;height:24px;border-radius:8px;background:linear-gradient(135deg,#6862ed,#9d7bf0);display:flex;align-items:center;justify-content:center;color:#fff;font-weight:700;font-size:11px;letter-spacing:-.5px">FR</div>
+    <span class="panel-title" data-tauri-drag-region data-i18n="app_name">AI Free Router</span>
     <span class="subtle" id="cycle-label" style="margin-left:2px"></span>
     <div class="spacer" style="flex:1"></div>
     <button id="panel-min" class="icon-btn" data-i18n-title="minimize_to_tray" title="最小化到托盘">–</button>
@@ -297,7 +297,7 @@ img { max-width: 100%; }
   <main class="workspace">
     <div class="account-toolbar">
       <div class="spacer" style="flex:1"></div>
-      <button id="btn-refresh" class="text-button" data-i18n="refresh">刷新</button>
+      <button id="btn-quota-all3" class="text-button" data-i18n="refresh_balance">刷新余额</button>
       <button id="btn-checkin-all" class="primary" data-i18n="one_click_checkin">一键签到</button>
     </div>
     <!-- 首页 -->
@@ -332,9 +332,6 @@ img { max-width: 100%; }
     <section class="page" id="page-checkin">
       <div class="page-header">
         <div><h1 data-i18n="nav_checkin">签到中心</h1><p class="subtle" data-i18n="checkin_sub">按账号查看领取进度；支持多个独立授权账号，逐个执行。</p></div>
-        <div class="actions">
-          <button id="btn-quota-all3" data-i18n="refresh_balance">刷新余额</button>
-        </div>
       </div>
       <div class="progress-hero" id="progress-hero"></div>
       <div class="schedule-strip"><strong id="sched-time">--:--</strong><span data-i18n="sched_checkin_label">计划签到时间（北京时间）</span><span class="subtle" style="margin-left:auto" data-i18n="beijing_note">所有平台统一按北京时间执行</span></div>
@@ -359,7 +356,7 @@ img { max-width: 100%; }
         </div>
       </div>
       <div class="metrics" id="stat-metrics"></div>
-      <section class="surface chart-section"><div class="section-heading"><h3 data-i18n="trend">趋势</h3><span class="legend" style="display:flex;gap:15px;color:var(--subtle);font-size:12px"><span style="display:flex;gap:6px;align-items:center"><i style="width:11px;height:11px;background:var(--accent);border-radius:3px;display:inline-block"></i><span data-i18n="credit_in">签到到账</span></span></span></div><div class="chart-wrap-sm" id="stat-chart"></div></section>
+      <section class="surface chart-section"><div class="section-heading"><h3 data-i18n="trend">趋势</h3><span class="legend" style="display:flex;gap:15px;color:var(--subtle);font-size:12px"><span style="display:flex;gap:6px;align-items:center"><i style="width:11px;height:3px;background:var(--accent);border-radius:2px;display:inline-block"></i><span data-i18n="credit_in">签到到账</span></span><span style="display:flex;gap:6px;align-items:center"><i style="width:11px;height:3px;background:#20b9ec;border-radius:2px;display:inline-block"></i><span data-i18n="token_usage">Token 消耗</span></span></span></div><div class="chart-wrap-sm" id="stat-chart"></div><p class="subtle" id="stat-token-note" style="margin-top:8px"></p></section>
     </section>
     <!-- 账号路由 -->
     <section class="page" id="page-routing">
@@ -402,7 +399,7 @@ img { max-width: 100%; }
 </div>
 <div class="modal-mask" id="quit-mask" style="display:none">
   <div class="modal">
-    <h3 data-i18n="quit_title">关闭 AI路由助手</h3>
+    <h3 data-i18n="quit_title">关闭 AI Free Router</h3>
     <div class="desc" data-i18n="quit_desc">选择窗口关闭行为：最小化到托盘可保持网关与自动签到继续运行。</div>
     <div class="foot" style="display:flex;gap:10px;justify-content:flex-end;flex-wrap:wrap">
       <button id="quit-cancel" data-i18n="cancel">取消</button>

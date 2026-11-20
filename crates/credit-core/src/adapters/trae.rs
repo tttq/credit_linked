@@ -114,6 +114,9 @@ impl Adapter for TraeAdapter {
             PlatformError::Business { code, .. } => match code.as_i64() {
                 Some(9074) => PlatformError::Restricted("9074".into()),
                 Some(9095) => PlatformError::Format("9095 device already checked".into()),
+                // 1001/1002 = TRAE 官方鉴权错误段（1001 鉴权失败 / 1002 令牌过期）
+                // → 映射为 Auth，让上层统一走 refresh_token 续期链路后重试
+                Some(1001) | Some(1002) => PlatformError::Auth,
                 _ => e,
             },
             _ => e,

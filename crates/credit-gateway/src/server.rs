@@ -238,6 +238,7 @@ pub fn build_router(state: Arc<GatewayState>) -> AxumRouter {
     AxumRouter::new()
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/context-usage", get(context_usage))
         .route("/v1/platforms", get(list_platforms))
         .route("/admin/rules", get(list_rules).post(add_rule))
         .route("/admin/rules/:id", delete(delete_rule).put(update_rule))
@@ -548,6 +549,41 @@ async fn build_models_catalog(st: &Arc<GatewayState>, current_raw: &str) -> serd
         }
     }
     json!({ "object": "list", "data": data })
+}
+
+/// GET /v1/context-usage: context consumption snapshot for agent-side compaction.
+/// Agent asks this before each turn: usageRatio >= compactThreshold -> compact now.
+async fn context_usage(
+    State(st): State<Arc<GatewayState>>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    if !st.check_auth(headers.get(axum::http::header::AUTHORIZATION).and_then(|v| v.to_str().ok())) {
+        return openai_error_response(StatusCode::UNAUTHORIZED, "unauthorized", "missing or invalid Authorization bearer");
+    }
+    // 模型提示：取最近一条网关日志的模型（没有则为空 → 用默认窗口）
+    let model_hint = st.store.list_gateway_logs(1).ok().and_then(|l| l.first().map(|x| x.model.clone())).unwrap_or_default();
+    let (platform, model) = resolve_model(&model_hint, st.router.current_platform())
+        .unwrap_or((st.router.current_platform(), model_hint));
+    let raw = st.router.current_platform_raw();
+    let (context_window, _mt) = if model.is_empty() {
+        (DEFAULT_CONTEXT_WINDOW, None)
+    } else {
+        model_limits(&st, platform, &raw, &model).await
+    };
+    let rows = st.store.token_stats_daily(1).unwrap_or_default();
+    let (pt, ct, total, reqs) = rows.first().map(|r| (r.1, r.2, r.3, r.4)).unwrap_or((0, 0, 0, 0));
+    let ratio = if context_window > 0 { (total as f64 / context_window as f64).min(1.0) } else { 0.0 };
+    Json(json!({
+        "model": model,
+        "platform": platform.as_str(),
+        "contextWindow": context_window,
+        "usedToday": { "promptTokens": pt, "completionTokens": ct, "totalTokens": total, "requests": reqs },
+        "estimatedUsed": total,
+        "usageRatio": (ratio * 10000.0).round() / 10000.0,
+        "shouldCompact": ratio >= 0.85,
+        "compactThreshold": 0.85,
+        "policy": "agent_decides: gateway publishes usage; agent summarizes and trims history when shouldCompact=true"
+    })).into_response()
 }
 
 /// GET /v1/models：当前请求平台的模型目录（60s 缓存，切平台立即重建）
@@ -927,19 +963,20 @@ async fn chat_completions(
                     return if stream {
                         // 流式：先记一条开始行（请求时间），耗时/结果由 StreamGuard 在流结束时回填
                         let account_ref = format!("{}:{}", attempt_cred.provider, attempt_cred.uid);
-                        let log_id = st.store.log_gateway_request(
-                            platform.as_str(), &account_ref, &model, true, Some(200), None, None,
+                        let log_id = st.store.log_gateway_request_full(
+                            platform.as_str(), &account_ref, &model, true, Some(200), None, None, None, None,
                         ).unwrap_or(0);
                         stream_response(&st, &model, platform.as_str(), events, log_id, t0)
                     } else {
                         // 非流式：聚合完成后再按实际内容记录（空流记失败，避免"假成功"）
-                        let (resp, has_content) = blocking_response(&model, platform.as_str(), events).await;
-                        let log_id = st.store.log_gateway_request(
+                        let (resp, has_content, usage) = blocking_response(&model, platform.as_str(), events).await;
+                        let (pt, ct) = usage.map(|(p, c, _)| (Some(p as i64), Some(c as i64))).unwrap_or((None, None));
+                        let log_id = st.store.log_gateway_request_full(
                             platform.as_str(),
                             &format!("{}:{}", attempt_cred.provider, attempt_cred.uid),
                             &model, has_content, Some(if has_content { 200 } else { 502 }),
                             if has_content { None } else { Some("empty stream (no finish_reason/content)") },
-                            None,
+                            None, pt, ct,
                         ).unwrap_or(0);
                         let _ = st.store.finish_gateway_log(log_id, t0.elapsed().as_millis() as i64, None, None, None);
                         resp
@@ -1116,6 +1153,7 @@ struct StreamGuard {
     t0: std::time::Instant,
     finished: Arc<std::sync::atomic::AtomicBool>,
     error: Arc<std::sync::Mutex<Option<String>>>,
+    tokens: Arc<std::sync::Mutex<(Option<i64>, Option<i64>)>>,
 }
 
 impl Drop for StreamGuard {
@@ -1123,6 +1161,10 @@ impl Drop for StreamGuard {
         let elapsed = self.t0.elapsed().as_millis() as i64;
         let finished = self.finished.load(std::sync::atomic::Ordering::Relaxed);
         if finished {
+            let (pt, ct) = *self.tokens.lock().unwrap_or_else(|e| e.into_inner());
+            if pt.is_some() || ct.is_some() {
+                let _ = self.store.update_gateway_log_tokens(self.log_id, pt, ct);
+            }
             let _ = self.store.finish_gateway_log(self.log_id, elapsed, None, None, None);
         } else {
             let msg = self.error.lock().ok().and_then(|g| g.clone())
@@ -1221,12 +1263,15 @@ fn stream_response(
     let finished2 = finished.clone();
     let error = Arc::new(std::sync::Mutex::new(None::<String>));
     let error2 = error.clone();
+    let tokens_seen: Arc<std::sync::Mutex<(Option<i64>, Option<i64>)>> = Arc::default();
+    let tokens_seen2 = tokens_seen.clone();
     let guard = StreamGuard {
         store: st.store.clone(),
         log_id,
         t0,
         finished,
         error,
+        tokens: tokens_seen,
     };
 
     // 工具参数按 index 缓冲：上游分片可能含伪影（如 Qoder 多发 `""`），
@@ -1298,7 +1343,11 @@ fn stream_response(
                 // 参数缓存到结束帧统一校验/修复后下发
                 if let Some(a) = arguments { e.2.push_str(&a); }
             }
-            Ok(StreamEvent::Usage { input, output, total }) => out.push(Ok(Event::default().data(json!({
+            Ok(StreamEvent::Usage { input, output, total }) => {
+                if let Ok(mut g) = tokens_seen2.lock() {
+                    *g = (Some(input as i64), Some(output as i64));
+                }
+                out.push(Ok(Event::default().data(json!({
                 "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
                 "choices": [],
                 "usage": {
@@ -1306,7 +1355,8 @@ fn stream_response(
                     "completion_tokens": output,
                     "total_tokens": total.unwrap_or(input + output),
                 },
-            }).to_string()))),
+            }).to_string())));
+            }
             Ok(StreamEvent::Done { finish }) => {
                 // 重复 finish_reason：只处理第一帧（含参数 flush 与结束帧下发）
                 if done_sent2.swap(true, std::sync::atomic::Ordering::Relaxed) {
@@ -1408,7 +1458,7 @@ async fn blocking_response(
     model: &str,
     platform: &str,
     events: EventStream,
-) -> (axum::response::Response, bool) {
+) -> (axum::response::Response, bool, Option<(u64, u64, Option<u64>)>) {
     let mut text = String::new();
     let mut reasoning = String::new();
     let mut usage: Option<(u64, u64, Option<u64>)> = None;
@@ -1445,7 +1495,7 @@ async fn blocking_response(
     let mut empty_stream = false;
     if let Some(msg) = failure {
         if text.is_empty() {
-            return (err_response(StatusCode::BAD_GATEWAY, "upstream", &msg), false);
+            return (err_response(StatusCode::BAD_GATEWAY, "upstream", &msg), false, usage);
         }
     }
     if text.is_empty() && reasoning.is_empty() && tool_calls.is_empty() {
@@ -1490,7 +1540,7 @@ async fn blocking_response(
         },
     }))
     .into_response();
-    (resp, !empty_stream)
+    (resp, !empty_stream, usage)
 }
 
 // ---------- 管理面 ----------

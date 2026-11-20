@@ -8,9 +8,9 @@
   var DICT = {
     'zh-CN': {
       // 品牌 / 通用
-      app_name: 'AI路由助手',
-      app_name_short: 'AI路由助手',
-      brand_symbol: '路',
+      app_name: 'AI Free Router',
+      app_name_short: 'AI Free Router',
+      brand_symbol: 'R',
       ok: '确定', cancel: '取消', save: '保存', close: '关闭', refresh: '刷新',
       confirm: '提示', loading: '加载中…', saving: '保存中…', copy: '复制', copied: '已复制',
       current: '当前', all: '全部', daily: '每天', weekly: '每周', monthly: '每月', yearly: '每年',
@@ -18,14 +18,18 @@
       // 顶栏
       minimize_to_tray: '最小化到托盘', close_app: '关闭', one_click_checkin: '一键签到', refresh_balance: '刷新余额',
       // 导航
-      nav_home: '首页', nav_accounts: '账号管理', nav_checkin: '签到中心', nav_stats: '积分统计', nav_route: '账号路由', nav_settings: '设置',
+      nav_home: '首页', nav_accounts: '账号管理', nav_checkin: '签到中心', nav_stats: '统计', nav_route: '账号路由', nav_settings: '设置',
       // 首页
       today_cycle: '今日周期', points_trend: '积分趋势', my_ai_tools: '我的 AI 工具', manage_accounts: '管理账号 →',
       checkin_points: '签到积分', period_points: '期间签到积分 +', chart_load_failed: '图表加载失败: ',
       empty_no_tools: '还没有添加 AI 工具 —— 到「账号管理」添加账号',
       available: '可用', checked_in: '✓ 已签到', last: '上次 ',
       period_points_short: '期间签到积分', records: '记录次数', buckets: '统计桶数', all_accounts: '全部账号',
+      token_usage: 'Token 消耗', token_period: '期间 Token 消耗', token_stats_all: 'Token 消耗为本地网关全部账号的聚合统计（网关日志），单账号视图暂不支持 token 统计。', token_stats_single: '单账号视图仅统计签到积分；Token 消耗请切回「全部账号」。',
       stat_read_failed: '统计读取失败: ',
+      // 统计图例（折线图：签到积分 + token 消耗）
+      stat_token_used: 'Token 消耗', stat_metric_points: '签到积分（左轴）', stat_metric_tokens: 'Token 消耗（右轴）',
+      stat_tokens_short: 'Token 消耗',
       // 平台描述（PLAT desc）
       desc_trae: '字节跳动的 AI IDE，支持 SOLO 模式',
       desc_workbuddy: '腾讯的 AI 编码工作台，国内/国际双版本',
@@ -166,14 +170,14 @@
       route_sub: '切换请求平台、配置路由规则；网关对本地提供 OpenAI 兼容接口。',
       cancel_changes: '取消修改', save_settings: '保存设置',
       quit_desc: '选择窗口关闭行为：最小化到托盘可保持网关与自动签到继续运行。',
-      quit_title: '关闭 AI路由助手', quit_bg: '退至后台', quit_app: '退出程序',
+      quit_title: '关闭 AI Free Router', quit_bg: '退至后台', quit_app: '退出程序',
       // locale 名称
       lang_zh: '中文（简体）', lang_en: 'English'
     },
     'en-US': {
-      app_name: 'AI Route Assistant',
-      app_name_short: 'AI Route Assistant',
-      brand_symbol: '路',
+      app_name: 'AI Free Router',
+      app_name_short: 'AI Free Router',
+      brand_symbol: 'R',
       ok: 'OK', cancel: 'Cancel', save: 'Save', close: 'Close', refresh: 'Refresh',
       confirm: 'Confirm', loading: 'Loading…', saving: 'Saving…', copy: 'Copy', copied: 'Copied',
       current: 'Current', all: 'All', daily: 'Daily', weekly: 'Weekly', monthly: 'Monthly', yearly: 'Yearly',
@@ -185,6 +189,7 @@
       empty_no_tools: 'No AI tools added yet — go to \u201cAccounts\u201d to add an account',
       available: 'Available', checked_in: '✓ Checked in', last: 'Last ',
       period_points_short: 'Points this period', records: 'Records', buckets: 'Buckets', all_accounts: 'All accounts',
+      token_usage: 'Token usage', token_period: 'Tokens this period', token_stats_all: 'Token usage aggregates all accounts via the local gateway log; per-account token stats are not available.', token_stats_single: 'Single-account view shows check-in points only; switch to \u201cAll accounts\u201d for token usage.',
       stat_read_failed: 'Failed to load statistics: ',
       desc_trae: 'ByteDance\u2019s AI IDE with SOLO mode',
       desc_workbuddy: 'Tencent\u2019s AI coding workbench (China / global)',
@@ -317,7 +322,7 @@
       route_sub: 'Switch request platform and configure routing rules; the gateway serves an OpenAI-compatible API locally.',
       cancel_changes: 'Discard changes', save_settings: 'Save settings',
       quit_desc: 'Choose the window close behavior: minimize to tray keeps the gateway and auto check-in running.',
-      quit_title: 'Close AI Route Assistant', quit_bg: 'To background', quit_app: 'Quit',
+      quit_title: 'Close AI Free Router', quit_bg: 'To background', quit_app: 'Quit',
       lang_zh: '中文（简体）', lang_en: 'English'
     }
   };

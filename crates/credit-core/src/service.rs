@@ -269,6 +269,13 @@ impl Service {
         let _ = secret_b64; // secret 字段保存加密凭据；本轮 cred 明文存 auth 列（单机 DPAPI 由 vault 处理）
         // trae 多账号设备号仲裁（去重/挑空闲）在请求前完成
         self.trae_pick_device(provider, uid, &mut cred);
+        // 码道（CodeArts）：STS 有效期短（约 1h）且客户端会轮换 RT —— 签到前主动续期，
+        // 避免「账号过期」直接失败；续期失败不阻塞（state/claim 链路里还有 Auth 恢复兜底）
+        if provider.starts_with("codearts") {
+            if let Ok(fresh) = self.ensure_codearts_fresh(&cred).await {
+                cred = fresh;
+            }
+        }
         let adapter = adapter_for(provider).ok_or_else(|| PlatformError::Local(format!("no adapter for {provider}")))?;
         let cycle = crate::adapters::day_cn();
 
@@ -280,7 +287,7 @@ impl Service {
             }
         }
 
-        let outcome = match self.state_and_claim(provider, uid, &mut cred, adapter.as_ref()).await {
+        let mut outcome = match self.state_and_claim(provider, uid, &mut cred, adapter.as_ref()).await {
             Ok(o) => o,
             Err(e) => {
                 // 平台链路失败也落库：Auth 类记 auth-expired（与 UI 徽标对应），其余记 failed
@@ -288,14 +295,37 @@ impl Service {
                 CheckinOutcome { provider: provider.into(), uid: uid.into(), status: status.into(), amount: None, message: Some(e.to_string()) }
             }
         };
+        // 签到失败/授权过期 → 自动续期（重新扫描本机客户端会话 → STS RT 续期 → 拉起客户端）
+        // 后整链重试一次；重试仍失败才落库失败态
+        if matches!(outcome.status.as_str(), "failed" | "auth-expired") && provider.starts_with("codearts") {
+            match self.ensure_codearts_fresh(&cred).await {
+                Ok(fresh) => {
+                    cred = fresh;
+                    match self.state_and_claim(provider, uid, &mut cred, adapter.as_ref()).await {
+                        Ok(retry) if retry.status != "failed" && retry.status != "auth-expired" => {
+                            outcome = retry;
+                            outcome.message = outcome.message.take().map(|m| format!("自动续期后重签成功 · {m}"))
+                                .or_else(|| Some("自动续期后重签成功".into()));
+                        }
+                        _ => {} // 重试仍失败：保留第一次失败结果落库
+                    }
+                }
+                Err(_) => {} // 续期失败：保留失败结果（message 已带平台原始错误）
+            }
+        }
         let _ = self.store.record_history(provider, uid, name, &cycle, &outcome.status, outcome.amount, outcome.message.as_deref(), &crate::adapters::now_iso());
         let _ = self.store.update_account_status(provider, uid, &outcome.status, outcome.message.as_deref());
         Ok(outcome)
     }
 
-    /// 签到公共链路：state →（Auth 时走刷新链恢复）→ claim →（设备冲突时换号重试）。
+    /// 签到公共链路：state →（Auth/1001 时走刷新链恢复）→ claim →（设备冲突换号 / 鉴权过期续期重试）。
     /// 只有"账号不存在/凭据损坏"等本地错误向上抛；平台侧失败统一转成 outcome 由调用方落库。
+    ///
+    /// Trae BUSINESS code=1001 = 鉴权失败（JWT 过期/无效，官方 1xxx 为鉴权错误段），
+    /// 与设备号无关 —— 换 x-device-id 只对 9074/9095 有效。正确处理：refresh 换新 token
+    /// 后重试一次；refresh 失败才落失败态（提示重新登录）。
     async fn state_and_claim(&self, provider: &str, uid: &str, cred: &mut Cred, adapter: &dyn Adapter) -> Result<CheckinOutcome, PlatformError> {
+        // state 报 Auth（含 trae 1001 映射）→ 先续期再查状态
         let st = match adapter.state(cred).await {
             Ok(s) => s,
             Err(PlatformError::Auth) if cred.refresh_token.is_some() => {
@@ -305,12 +335,28 @@ impl Service {
             Err(e) => return Err(e),
         };
         let receipt = adapter.claim(cred, &st).await;
+        // claim 报 BUSINESS code=1001/1002（token 过期）→ refresh 换票后重试一次（不换设备号）
+        let receipt = match &receipt {
+            Err(e) if is_auth_business_err(e) && cred.refresh_token.is_some() => {
+                match self.refreshed_cred(provider, uid, cred).await {
+                    Ok(nc) => {
+                        *cred = nc;
+                        adapter.claim(cred, &st).await
+                    }
+                    Err(_) => receipt, // 续期失败：保留原错误（提示重新登录）
+                }
+            }
+            _ => receipt,
+        };
         // trae 设备冲突（9074/9095）自动换号重试；成功后记忆新设备号
         Ok(match receipt {
             Ok(r) => CheckinOutcome { provider: provider.into(), uid: uid.into(), status: r.status.clone(), amount: r.amount, message: r.message.clone() },
             Err(e) => {
                 let msg = e.to_string();
-                if msg.contains("9074") || msg.contains("9095") {
+                if is_auth_business_err(&e) {
+                    // 1001/1002 鉴权失败且无法续期：标记 auth-expired（与 UI「授权过期」徽标对应）
+                    CheckinOutcome { provider: provider.into(), uid: uid.into(), status: "auth-expired".into(), amount: None, message: Some(format!("{msg}（token 已过期且无法自动续期，请重新登录 Trae 客户端后「扫描本机」）")) }
+                } else if msg.contains("9074") || msg.contains("9095") {
                     if let Some(o) = self.trae_rotate_device_retry(provider, uid, &cred.name, cred, adapter).await {
                         o
                     } else {
@@ -631,6 +677,18 @@ fn shift_day(day: &str, delta: i64) -> String {
     let (y2, m2, d2) = crate::adapters::civil_from_days(days);
     format!("{y2:04}-{m2:02}-{d2:02}")
 }
+}
+
+/// 鉴权类业务错误判定：Trae 1001（鉴权失败）/1002（令牌无效或过期）映射为 Auth 语义。
+/// 上游签到/额度接口 token 过期时不再表现为普通 BUSINESS 失败，而是走 refresh 续期链。
+fn is_auth_business_err(e: &PlatformError) -> bool {
+    if matches!(e, PlatformError::Auth) {
+        return true;
+    }
+    if let PlatformError::Business { code, .. } = e {
+        return code.as_i64() == Some(1001) || code.as_i64() == Some(1002);
+    }
+    false
 }
 
 /// 从 Trae JWT payload 取 /data/id 作为 uid（解析失败返回空串）。

@@ -376,6 +376,38 @@ async fn daily_income(days: Option<i64>) -> Result<serde_json::Value, String> {
     Ok(s.daily_income(days.unwrap_or(7)))
 }
 
+/// 近 N 天每日 token 消耗（积分统计页与签到积分同图展示的数据源）
+#[tauri::command]
+async fn daily_tokens(days: Option<i64>) -> Result<serde_json::Value, String> {
+    let s = svc()?;
+    let n = days.unwrap_or(7);
+    let rows = s.store.token_stats_daily(n.max(1) * 2).unwrap_or_default();
+    // rows 按日期倒序 → 转正序 map
+    let mut map: std::collections::BTreeMap<String, (i64, i64, i64, i64)> = Default::default();
+    for (day, p, c, t, req) in rows {
+        map.insert(day, (p, c, t, req));
+    }
+    let today = credit_core::adapters::day_cn();
+    let mut items = Vec::new();
+    for i in (0..n).rev() {
+        let day = shift_day_str(&today, -i);
+        let (p, c, t, req) = map.remove(&day).unwrap_or((0, 0, 0, 0));
+        items.push(serde_json::json!({
+            "day": day, "promptTokens": p, "completionTokens": c, "totalTokens": t, "requests": req,
+        }));
+    }
+    Ok(serde_json::json!({ "days": items }))
+}
+
+/// 日期平移（YYYY-MM-DD ± N 天）；复用 credit-core 的 civil 日历工具
+fn shift_day_str(day: &str, delta: i64) -> String {
+    let parts: Vec<i64> = day.split('-').filter_map(|x| x.parse().ok()).collect();
+    if parts.len() != 3 { return day.to_string(); }
+    let days = credit_core::adapters::days_from_civil(parts[0], parts[1], parts[2]) + delta;
+    let (y, m, d) = credit_core::adapters::civil_from_days(days);
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
 /// 读取应用设置（自动签到/定时/开机自启/随机时间等）
 #[tauri::command]
 async fn settings_get() -> Result<serde_json::Value, String> {
@@ -389,7 +421,7 @@ async fn settings_get() -> Result<serde_json::Value, String> {
         "telemetry": get("telemetry", "0") == "1",
         "randomTime": get("randomTime", "0") == "1",
         "time": get("time", "09:00"),
-        "app": "AI路由助手",
+        "app": "AI Free Router",
         "schedTick": get("sched_tick", ""),
         "lastRunDay": get("last_auto_run_day", ""),
         "lastRunTarget": get("last_auto_run_target", ""),
@@ -439,7 +471,7 @@ async fn login_open_window(app: tauri::AppHandle, session_id: String, url: Strin
     if let Some(w) = app.get_webview_window(&label) {
         let _ = w.close();
     }
-    let title = format!("AI路由助手 · {} 授权登录", match provider.as_str() {
+    let title = format!("AI Free Router · {} 授权登录", match provider.as_str() {
         "trae" => "Trae", "workbuddy" => "WorkBuddy", "minimax" => "MiniMax",
         "qoder" => "Qoder", "codearts" => "码道", "codearts-desktop" => "码道桌面", _ => "平台",
     });
@@ -1262,7 +1294,7 @@ fn main() {
             // 托盘图标：左键单击唤出面板（保留用户拖动后的位置）；菜单 = 打开 / 退出
             use tauri::menu::{Menu, MenuItem};
             use tauri::tray::TrayIconBuilder;
-            let show_item = MenuItem::with_id(app, "show", "打开 AI路由助手", true, None::<&str>)?;
+            let show_item = MenuItem::with_id(app, "show", "打开 AI Free Router", true, None::<&str>)?;
             let quit_item = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&show_item, &quit_item])?;
             // 图标：优先窗口图标（windows 上为嵌入 ico），失败则显式解析 icon.ico
@@ -1270,7 +1302,7 @@ fn main() {
                 .or_else(|| tauri::image::Image::from_bytes(include_bytes!("../icons/icon.ico")).ok())
                 .or_else(|| tauri::image::Image::from_bytes(include_bytes!("../icons/icon.png")).ok());
             let mut builder = TrayIconBuilder::with_id("main-tray")
-                .tooltip("AI路由助手 — 网关与自动签到运行中")
+                .tooltip("AI Free Router — 网关与自动签到运行中")
                 .menu(&menu)
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app, event| {
@@ -1306,7 +1338,7 @@ fn main() {
             snapshot, import, checkin, quota_refresh, history,
             login_start, login_poll, login_cancel,
             account_delete, account_toggle_auto, trae_local_devices, trae_set_device, codearts_sync_local,
-            statistics, daily_income, settings_get, settings_set, account_list_all, open_url,
+            statistics, daily_income, daily_tokens, settings_get, settings_set, account_list_all, open_url,
             login_open_window, login_close_window,
             gateway_status, gateway_set_platform, gateway_add_rule, gateway_update_rule, gateway_delete_rule,
             gateway_set_limits, gateway_clear_logs, gateway_accounts, gateway_switch_account, tools_info, tools_set_install_dir, tools_refresh_minimax_url, tools_download, tools_install, tools_open_page, quota_refresh_all, quit_app, platform_ensure_running, check_update, download_update, install_update,

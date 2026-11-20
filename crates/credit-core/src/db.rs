@@ -25,6 +25,7 @@ impl Store {
         Self::migrate(&conn)?;
         Self::migrate_v2(&conn)?;
         Self::migrate_v3(&conn)?;
+        Self::migrate_v4(&conn)?;
         Ok(Self { conn: Mutex::new(conn) })
     }
 
@@ -112,6 +113,18 @@ impl Store {
         // 老库可能已有该列（重复执行容忍）：ALTER TABLE ADD COLUMN 失败直接忽略
         let _ = conn.execute("ALTER TABLE gateway_logs ADD COLUMN duration_ms INTEGER", []);
         let _ = conn.execute("PRAGMA user_version = 3", []);
+        Ok(())
+    }
+
+    /// v4：网关请求日志增加 prompt/completion tokens 列（token 消耗统计用）
+    fn migrate_v4(conn: &Connection) -> anyhow::Result<()> {
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if version >= 4 {
+            return Ok(());
+        }
+        let _ = conn.execute("ALTER TABLE gateway_logs ADD COLUMN prompt_tokens INTEGER", []);
+        let _ = conn.execute("ALTER TABLE gateway_logs ADD COLUMN completion_tokens INTEGER", []);
+        let _ = conn.execute("PRAGMA user_version = 4", []);
         Ok(())
     }
 
@@ -258,7 +271,7 @@ pub fn list_history(&self, limit: i64) -> anyhow::Result<Vec<HistoryRow>> {
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
 }
 
-    /// 记录一条网关请求日志（ok: 成功/失败）
+    /// 记录一条网关请求日志（ok: 成功/失败；tokens 可拆分 prompt/completion 记录）
     #[allow(clippy::too_many_arguments)]
     pub fn log_gateway_request(
         &self,
@@ -270,9 +283,32 @@ pub fn list_history(&self, limit: i64) -> anyhow::Result<Vec<HistoryRow>> {
         message: Option<&str>,
         tokens: Option<i64>,
     ) -> anyhow::Result<i64> {
+        self.log_gateway_request_full(platform, account, model, ok, status_code, message, tokens, None, None)
+    }
+
+    /// 带输入/输出 token 拆分的完整请求日志记录（token 统计数据源）。
+    /// tokens 为 None 时自动取 prompt + completion。
+    #[allow(clippy::too_many_arguments)]
+    pub fn log_gateway_request_full(
+        &self,
+        platform: &str,
+        account: &str,
+        model: &str,
+        ok: bool,
+        status_code: Option<i64>,
+        message: Option<&str>,
+        tokens: Option<i64>,
+        prompt_tokens: Option<i64>,
+        completion_tokens: Option<i64>,
+    ) -> anyhow::Result<i64> {
+        let tokens = tokens.or_else(|| match (prompt_tokens, completion_tokens) {
+            (Some(p), Some(c)) => Some(p + c),
+            _ => None,
+        });
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO gateway_logs (at, platform, account, model, ok, status_code, message, tokens) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO gateway_logs (at, platform, account, model, ok, status_code, message, tokens, prompt_tokens, completion_tokens)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             rusqlite::params![
                 crate::adapters::now_iso(),
                 platform,
@@ -281,10 +317,42 @@ pub fn list_history(&self, limit: i64) -> anyhow::Result<Vec<HistoryRow>> {
                 ok as i64,
                 status_code,
                 message,
-                tokens
+                tokens,
+                prompt_tokens,
+                completion_tokens
             ],
         )?;
         Ok(conn.last_insert_rowid())
+    }
+
+    /// 按日期聚合 token 消耗（签到积分统计同源展示）：只统计成功请求。
+    /// 返回 Vec<(day, prompt_sum, completion_sum, total_sum, requests)>。
+    pub fn token_stats_daily(&self, limit: i64) -> anyhow::Result<Vec<(String, i64, i64, i64, i64)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT substr(at, 1, 10) AS day,
+                    COALESCE(SUM(prompt_tokens), 0),
+                    COALESCE(SUM(completion_tokens), 0),
+                    COALESCE(SUM(COALESCE(tokens, prompt_tokens + completion_tokens)), 0),
+                    COUNT(*)
+             FROM gateway_logs
+             WHERE ok = 1 AND (tokens IS NOT NULL OR prompt_tokens IS NOT NULL OR completion_tokens IS NOT NULL)
+             GROUP BY day ORDER BY day DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([limit], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        })?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// 流式请求结束回填 token 用量（Usage 事件在流中到达，Drop 时统一写入）。
+    pub fn update_gateway_log_tokens(&self, id: i64, prompt_tokens: Option<i64>, completion_tokens: Option<i64>) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE gateway_logs SET prompt_tokens = ?2, completion_tokens = ?3, tokens = COALESCE(?2, 0) + COALESCE(?3, 0) WHERE id = ?1",
+            rusqlite::params![id, prompt_tokens, completion_tokens],
+        )?;
+        Ok(())
     }
 
     /// 请求结束时回填耗时（毫秒）/结果（流式请求先记开始行，结束或中断时更新）。

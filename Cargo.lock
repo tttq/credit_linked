@@ -874,7 +874,7 @@ dependencies = [
 
 [[package]]
 name = "credit-cli"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "aes",
  "anyhow",
@@ -889,7 +889,7 @@ dependencies = [
 
 [[package]]
 name = "credit-core"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -915,7 +915,7 @@ dependencies = [
 
 [[package]]
 name = "credit-gateway"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "axum",
@@ -937,7 +937,7 @@ dependencies = [
 
 [[package]]
 name = "credit-tauri"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "credit-core",

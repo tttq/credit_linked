@@ -41,6 +41,7 @@ let statPeriod = 'day', statAccount = 'all';
 let checkinFilter = 'all';
 let loginTimer = null, curLoginSid = null;
 let charts = { ov: null, st: null };
+let statTokens = []; // token consume per day for statistics chart
 
 // ===== 外观主题（system | light | dark，默认跟随系统） =====
 // html[data-theme] 驱动 CSS 暗色变量；system 模式实时跟随 OS 深浅色切换。
@@ -423,24 +424,84 @@ async function drawStatistics() {
   try {
     const agg = await invoke('statistics', { provider, uid, period: statPeriod });
     const items = agg.items || [];
+    // token 消耗统计（按天粒度；周期=week/month/year 时直接聚合日桶）
+    let toks = [];
+    if (!provider && !uid) {
+      const daily = await invoke('daily_tokens', { days: statPeriod === 'day' ? 14 : (statPeriod === 'week' ? 56 : (statPeriod === 'month' ? 180 : 730)) }).catch(() => ({ days: [] }));
+      const days = daily.days || [];
+      const keyOf = (day) => {
+        if (statPeriod === 'day') return day;
+        if (statPeriod === 'week') { const d = new Date(day + 'T00:00:00'); const p = new Date(d); p.setDate(d.getDate() - ((d.getDay() + 6) % 7)); return isoWeekKey(p); }
+        if (statPeriod === 'month') return day.slice(0, 7);
+        return day.slice(0, 4);
+      };
+      const acc = new Map();
+      for (const d of days) {
+        const k = keyOf(d.day);
+        const e = acc.get(k) || { prompt: 0, completion: 0, total: 0 };
+        e.prompt += d.promptTokens || 0; e.completion += d.completionTokens || 0; e.total += d.totalTokens || 0;
+        acc.set(k, e);
+      }
+      // 对齐统计图的桶顺序
+      toks = items.map(i => acc.get(i.bucket) || { prompt: 0, completion: 0, total: 0 });
+      $('#stat-token-note').textContent = t('token_stats_all');
+    } else {
+      $('#stat-token-note').textContent = t('token_stats_single');
+    }
     const totalSum = items.reduce((s, i) => s + i.sum, 0);
     const totalCount = items.reduce((s, i) => s + i.count, 0);
-    const successCount = items.reduce((s, i) => s + i.count, 0);
+    const tokenSum = toks.reduce((s, x) => s + x.total, 0);
     $('#stat-metrics').innerHTML =
       '<div><p>' + t('period_points_short') + '</p><strong>' + fmt(totalSum) + '</strong></div>' +
+      '<div><p>' + t('token_period') + '</p><strong>' + fmt(tokenSum) + '</strong></div>' +
       '<div><p>' + t('records') + '</p><strong>' + totalCount + '</strong></div>' +
       '<div><p>' + t('buckets') + '</p><strong>' + items.length + '</strong></div>';
     const el = $('#stat-chart');
     charts.st ||= echarts.init(el);
     charts.st.resize();
+    // 双序列折线图：签到积分（左轴）+ token 消耗（右轴）；全部账号时同时统计
+    const showToken = !provider && !uid;
+    const series = [{
+      name: t('checkin_points'), type: 'line', smooth: true, symbolSize: 5,
+      itemStyle: { color: '#6862ed' }, lineStyle: { width: 2.4, color: '#6862ed' },
+      areaStyle: { color: 'rgba(104, 98, 237, .12)' },
+      data: items.map(i => Math.round(i.sum * 100) / 100),
+    }];
+    if (showToken) {
+      series.push({
+        name: t('token_usage'), type: 'line', smooth: true, symbolSize: 5, yAxisIndex: 1,
+        itemStyle: { color: '#20b9ec' }, lineStyle: { width: 2.4, color: '#20b9ec', type: 'dashed' },
+        data: toks.map(x => x.total),
+      });
+    }
     charts.st.setOption({
       tooltip: { trigger: 'axis' },
-      grid: { left: 46, right: 14, top: 22, bottom: 28 },
+      legend: showToken ? { data: [t('checkin_points'), t('token_usage')], bottom: 0, textStyle: { fontSize: 11, color: chartAxisColor() } } : undefined,
+      grid: { left: 50, right: showToken ? 56 : 18, top: 24, bottom: showToken ? 44 : 28 },
       xAxis: { type: 'category', data: items.map(i => i.bucket), axisLabel: { fontSize: 10, color: chartAxisColor(), rotate: items.length > 12 ? 30 : 0 } },
-      yAxis: { type: 'value', axisLabel: { fontSize: 10, color: chartAxisColor() }, splitLine: { lineStyle: { color: chartSplitColor() } } },
-      series: [{ name: t('checkin_points'), type: 'bar', itemStyle: { color: '#6862ed', borderRadius: 4 }, barMaxWidth: 26, data: items.map(i => Math.round(i.sum * 100) / 100) }],
-    });
+      yAxis: [
+        { type: 'value', name: t('checkin_points'), nameTextStyle: { fontSize: 10, color: chartAxisColor() }, axisLabel: { fontSize: 10, color: chartAxisColor() }, splitLine: { lineStyle: { color: chartSplitColor() } } },
+        ...(showToken ? [{ type: 'value', name: t('token_usage'), nameTextStyle: { fontSize: 10, color: chartAxisColor() }, axisLabel: { fontSize: 10, color: chartAxisColor() }, splitLine: { show: false } }] : []),
+      ],
+      series,
+    }, true);
   } catch (e) { toast(t('stat_read_failed') + e, 4200); }
+}
+// ISO 周桶键（周一为界）：YYYY-Www
+function isoWeekKey(mondayDate) {
+  const d = new Date(mondayDate);
+  const target = new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()));
+  const dayNum = (target.getUTCDay() + 6) % 7;
+  target.setUTCDate(target.getUTCDate() - dayNum + 3);
+  const firstThursday = new Date(Date.UTC(target.getUTCFullYear(), 0, 4));
+  const fDayNum = (firstThursday.getUTCDay() + 6) % 7;
+  firstThursday.setUTCDate(firstThursday.getUTCDate() - fDayNum + 3);
+  const week = 1 + Math.round((target - firstThursday) / (7 * 86400000));
+  const y = target.getUTCFullYear();
+  const m = new Date(target); m.setUTCDate(m.getUTCDate() - 3);
+  const yr = m.getUTCFullYear();
+  void y;
+  return yr + '-W' + String(week).padStart(2, '0');
 }
 $$('#stat-period button').forEach(b => b.addEventListener('click', () => {
   statPeriod = b.dataset.period;
