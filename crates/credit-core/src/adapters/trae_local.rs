@@ -97,7 +97,12 @@ pub fn read_identity(data_dir: &std::path::Path) -> Option<TraeIdentity> {
             let h = Sha256::digest(machine_id.as_bytes());
             h.iter().map(|b| format!("{b:02x}")).collect::<String>()[..32].to_string()
         });
-    let build_version = storage.get("iCubeLastVersion").and_then(|v| v.as_str()).map(|s| s.to_string());
+    // 上游要求 x-app-version-code / x-ide-version-code 必须是**纯数字**的构建号。
+    // 官方真值来自安装目录 product.json 的 `traeVersionCode`（实测 3.4.22 → 20250325）；
+    // `iCubeLastVersion` 是带点的运行时版本（2.3.105403），不能直接当构建号用。
+    // 旧实现把带点值判为非数字后回落到假值 20260716 —— 这是最容易被识别的单点特征。
+    let build_version = find_product_version_code()
+        .or_else(|| storage.get("iCubeLastVersion").and_then(|v| v.as_str()).map(|s| s.to_string()));
     let app_version = find_product_app_version();
     Some(TraeIdentity {
         machine_id,
@@ -109,7 +114,8 @@ pub fn read_identity(data_dir: &std::path::Path) -> Option<TraeIdentity> {
     })
 }
 
-fn find_product_app_version() -> Option<String> {
+/// 探测本机 Trae 安装目录下的 `resources/app/product.json`（多候选路径）
+fn find_product_json() -> Option<PathBuf> {
     let local = std::env::var("LOCALAPPDATA").ok().map(PathBuf::from);
     let mut roots: Vec<PathBuf> = Vec::new();
     if let Some(l) = local { roots.push(l); }
@@ -121,18 +127,35 @@ fn find_product_app_version() -> Option<String> {
     for root in &roots {
         for name in names {
             let p = root.join(name).join("resources/app/product.json");
-            if let Some(ver) = read_app_version(&p) { return Some(ver); }
+            if p.exists() { return Some(p); }
             // 部分安装器多一层 Programs
             let p2 = root.join("Programs").join(name).join("resources/app/product.json");
-            if let Some(ver) = read_app_version(&p2) { return Some(ver); }
+            if p2.exists() { return Some(p2); }
         }
     }
-    // 兜底：从运行中的 Trae 进程路径推导（<exe dir>/resources/app/product.json）
-    let mut cmd = std::process::Command::new("tasklist");
-    cmd.args(["/FI", "IMAGENAME eq Trae CN.exe", "/FO", "CSV", "/NH"]);
-    let out = crate::proc_util::hide_console(cmd).output().ok()?;
-    let _ = out;
     None
+}
+
+/// 官方构建号（product.json `traeVersionCode`，纯数字）
+fn find_product_version_code() -> Option<String> {
+    let p = find_product_json()?;
+    let text = std::fs::read_to_string(&p).ok()?;
+    let v: Value = serde_json::from_str(text.trim_start_matches('\u{feff}')).ok()?;
+    let code = match v.get("traeVersionCode") {
+        Some(Value::String(s)) => s.trim().to_string(),
+        Some(Value::Number(n)) => n.to_string(),
+        _ => return None,
+    };
+    if !code.is_empty() && code.chars().all(|c| c.is_ascii_digit()) {
+        Some(code)
+    } else {
+        None
+    }
+}
+
+fn find_product_app_version() -> Option<String> {
+    let p = find_product_json()?;
+    read_app_version(&p)
 }
 
 fn read_app_version(path: &std::path::Path) -> Option<String> {

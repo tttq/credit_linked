@@ -3,6 +3,7 @@
 //! chat 一律流式（WorkBuddy 上游拒绝非流式，Trae SOLO 通道也是 stream-only），
 //! 非流式响应由网关层聚合。SSE 解析用统一的"泵"结构：拉 chunk → 行缓冲 → 逐条吐事件。
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures_core::Stream;
@@ -61,7 +62,7 @@ fn http_client() -> &'static reqwest::Client {
     })
 }
 
-/// 流式（SSE）请求客户端：**不能用整体 timeout**——reqwest 的 timeout 覆盖整个响应体读取，
+/// 流式（SSE）请求客户端：**不能用整体 timeout**——timeout 覆盖整个响应体读取，
 /// 长回答/长时间思考会被拦腰截断（客户端表现为「只收到一点数据就断开」）。
 /// 这里只限制连接与「两次读取之间的空闲」，长流可以有任意总时长。
 fn stream_client() -> &'static reqwest::Client {
@@ -74,6 +75,27 @@ fn stream_client() -> &'static reqwest::Client {
             .build()
             .expect("gateway stream client")
     })
+}
+
+/// 字节流 → 统一 `Result<Bytes, String>`：让 SSE 泵不绑定具体 HTTP 客户端实现
+fn into_sse_stream(
+    stream: impl Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static,
+) -> std::pin::Pin<Box<dyn Stream<Item = Result<bytes::Bytes, String>> + Send>> {
+    Box::pin(stream.map(|r| r.map_err(|e| e.to_string())))
+}
+
+/// 本机主机名（官方客户端在 infer-sse 请求里发 `Cosy-MachineHostname`）。
+/// Windows 读 COMPUTERNAME，类 Unix 读 HOSTNAME；去掉非法 HTTP 头字符。
+fn hostname() -> Result<String, ()> {
+    let raw = std::env::var("COMPUTERNAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .map_err(|_| ())?;
+    let clean: String = raw
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '.' || *c == '_')
+        .take(64)
+        .collect();
+    if clean.is_empty() { Err(()) } else { Ok(clean) }
 }
 
 /// 按字符截断到 n 个字符（超长补省略号；错误信息展示用）
@@ -218,7 +240,7 @@ pub async fn wb_chat_stream(cred: &Cred, body: Value, device: Option<(&str, &str
         let quota = text.contains("14018") || msg.contains("额度") || msg.contains("quota");
         return Err(format!("WorkBuddy 上游返回错误{}: {msg}", if quota { "（额度不足）" } else { "" }));
     }
-    Ok(parse_openai_sse(resp.bytes_stream()))
+    Ok(parse_openai_sse(into_sse_stream(resp.bytes_stream())))
 }
 
 // ============================ Trae ============================
@@ -332,7 +354,7 @@ pub async fn trae_chat_stream(cred: &Cred, intl: bool, enterprise: bool, body: V
         req = req.header(k, v);
     }
     let resp = send_sse(req).await?;
-    Ok(parse_trae_sse(resp.bytes_stream()))
+    Ok(parse_trae_sse(into_sse_stream(resp.bytes_stream())))
 }
 
 // ============================ SSE 解析 ============================
@@ -349,7 +371,7 @@ struct Pump {
     kind: SseKind,
     buf: Vec<u8>,
     queue: std::collections::VecDeque<StreamEvent>,
-    stream: std::pin::Pin<Box<dyn Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send>>,
+    stream: std::pin::Pin<Box<dyn Stream<Item = Result<bytes::Bytes, String>> + Send>>,
     done: bool,
     /// 已收到结束事件（finish_reason / [DONE]）：之后最多再等 2s 收尾（usage 等），
     /// 上游不关闭连接也不会让客户端一直挂着（否则客户端会超时断开，表现为「只收到一点数据」）
@@ -358,7 +380,7 @@ struct Pump {
 
 impl Pump {
     /// 构造泵：绑定解析分支与原始字节流
-    fn new(kind: SseKind, stream: impl Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static) -> Self {
+    fn new(kind: SseKind, stream: impl Stream<Item = Result<bytes::Bytes, String>> + Send + 'static) -> Self {
         Self { kind, buf: Vec::new(), queue: Default::default(), stream: Box::pin(stream), done: false, finished: false }
     }
     fn feed(&mut self, chunk: &[u8]) {
@@ -613,8 +635,103 @@ pub fn decode_trae_event(event_name: &str, data: &str) -> Option<StreamEvent> {
     }
 }
 
+/// 流式请求的「早期断开自动重试」包装器。
+///
+/// 背景：上游在流式传输**中途**断开连接时，reqwest 统一报
+/// `error decoding response body`（Kind::Decode，底层 hyper IO 错误），
+/// 客户端表现为「本轮运行失败：上游在流式传输中途断开连接」。
+/// 典型成因：并发会话冲突、上游超时、连接被对端重置。
+///
+/// 语义：**只在尚未向客户端产出任何内容之前**才自动重发。
+/// 已经吐过正文的流重试会让客户端收到两份内容（工具调用重复执行），因此不能重试。
+/// - 首个内容事件前失败 → 指数退避后重发（最多 [`STREAM_RETRY_MAX_ATTEMPTS`] 次）；
+/// - 已产出内容后失败 → 原样把错误交给客户端；
+/// - 其它错误（非中途断开）→ 原样透传。
+///
+/// `first` 是**已经建立成功**的上游流（建流阶段的失败由调用方按业务错误处理，
+/// 以便保留换号/换平台的 failover 语义）；`make` 只负责中途断开后的重新发起。
+pub fn retry_stream_with<F>(first: EventStream, make: F) -> EventStream
+where
+    F: FnMut() -> StreamBoxFuture + Send + 'static,
+{
+    struct St {
+        make: Box<dyn FnMut() -> StreamBoxFuture + Send>,
+        cur: Option<EventStream>,
+        /// 已发起的请求次数（含首次）
+        attempts: u32,
+        /// 是否已向客户端产出过内容（内容一旦产出就不能再重试）
+        produced: bool,
+    }
+
+    let st = St { make: Box::new(make), cur: Some(first), attempts: 1, produced: false };
+    Box::pin(futures_util::stream::unfold(st, |mut st| async move {
+        loop {
+            let stream = st.cur.as_mut().expect("stream present");
+            match stream.next().await {
+                Some(Ok(ev)) => {
+                    if matches!(
+                        ev,
+                        StreamEvent::Text(_) | StreamEvent::Reasoning(_) | StreamEvent::ToolCall { .. } | StreamEvent::Usage { .. }
+                    ) {
+                        st.produced = true;
+                    }
+                    return Some((Ok(ev), st));
+                }
+                Some(Err(msg)) => {
+                    // 已产出内容 → 不能重试（会重复内容）
+                    if st.produced {
+                        return Some((Err(msg), st));
+                    }
+                    // 非「中途断开」类错误 → 不重试
+                    if !msg.starts_with(STREAM_DISCONNECT_PREFIX) {
+                        return Some((Err(msg), st));
+                    }
+                    if st.attempts >= STREAM_RETRY_MAX_ATTEMPTS {
+                        return Some((
+                            Err(format!(
+                                "{msg}（已自动重试 {} 次仍失败）",
+                                STREAM_RETRY_MAX_ATTEMPTS.saturating_sub(1)
+                            )),
+                            st,
+                        ));
+                    }
+                    eprintln!(
+                        "[gateway] 上游流中途断开且尚未产出内容，自动重试 {}/{}",
+                        st.attempts, STREAM_RETRY_MAX_ATTEMPTS - 1
+                    );
+                    // 指数退避 + 抖动，避免多个并发请求同时重试打爆上游
+                    let backoff = 300u64 * (1u64 << (st.attempts.min(3) - 1).max(0));
+                    let jitter = (uuid::Uuid::new_v4().as_u128() % 200) as u64;
+                    tokio::time::sleep(Duration::from_millis(backoff + jitter)).await;
+                    // **先丢弃旧流再重新申请**：旧流可能持有码道会话槽位租约，
+                    // 若等新请求拿到槽位后才释放，多个并发重试会各自占着旧槽位去抢新槽位 → 自锁。
+                    st.cur = None;
+                    // 重新发起请求；失败则退化为普通错误（不再重试）
+                    match (st.make)().await {
+                        Ok(s) => {
+                            st.cur = Some(s);
+                            st.attempts += 1;
+                        }
+                        Err(e) => return Some((Err(e), st)),
+                    }
+                }
+                None => return None, // 正常结束
+            }
+        }
+    }))
+}
+
+/// 装箱的流请求 future（供重试闭包使用）
+pub type StreamBoxFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Result<EventStream, String>> + Send>>;
+
+/// 「上游流中途断开」错误前缀（可重试标记；重试器据此判定是否值得重发）
+pub const STREAM_DISCONNECT_PREFIX: &str = "上游在流式传输中途断开连接";
+
+/// 流式请求的最大尝试次数（首次 + 重试）
+pub const STREAM_RETRY_MAX_ATTEMPTS: u32 = 3;
+
 /// 用泵驱动原始字节流 → 统一 EventStream（Done 后最多再等 2s 收尾）
-fn pump_stream(kind: SseKind, stream: std::pin::Pin<Box<dyn Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send>>) -> EventStream {
+fn pump_stream(kind: SseKind, stream: std::pin::Pin<Box<dyn Stream<Item = Result<bytes::Bytes, String>> + Send>>) -> EventStream {
     Box::pin(futures_util::stream::unfold(Pump::new(kind, stream), |mut p| async move {
         loop {
             if let Some(ev) = p.pop() {
@@ -637,7 +754,10 @@ fn pump_stream(kind: SseKind, stream: std::pin::Pin<Box<dyn Stream<Item = Result
             };
             match next {
                 Some(Ok(chunk)) => p.feed(&chunk),
-                Some(Err(e)) => return Some((Err(format!("stream: {e}")), p)),
+                Some(Err(e)) => {
+                    // 统一「中途断开」前缀（见 stream_error_message），便于上层自动重试
+                    return Some((Err(stream_error_message(&e)), p));
+                }
                 None => {
                     p.done = true;
                     if let Some(ev) = p.take_tail() {
@@ -651,12 +771,12 @@ fn pump_stream(kind: SseKind, stream: std::pin::Pin<Box<dyn Stream<Item = Result
 }
 
 /// OpenAI 线格式 SSE → EventStream
-pub fn parse_openai_sse(stream: impl Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static) -> EventStream {
+pub fn parse_openai_sse(stream: impl Stream<Item = Result<bytes::Bytes, String>> + Send + 'static) -> EventStream {
     pump_stream(SseKind::OpenAi, Box::pin(stream))
 }
 
 /// Trae 自定义 SSE → EventStream
-pub fn parse_trae_sse(stream: impl Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static) -> EventStream {
+pub fn parse_trae_sse(stream: impl Stream<Item = Result<bytes::Bytes, String>> + Send + 'static) -> EventStream {
     pump_stream(SseKind::Trae, Box::pin(stream))
 }
 
@@ -685,7 +805,102 @@ pub async fn zcode_fetch_models(_cred: &Cred) -> Result<Vec<ModelInfo>, Platform
     Ok(out)
 }
 
-/// ZCode chat 通道（2026-11-19 实测结论：Start Plan 专属端点可用了）
+/// 环境变量里的智谱开放平台 API Key（不含账号 meta；供「没有 ZCode 账号也能用」判断）
+pub fn zcode_env_api_key() -> Option<String> {
+    for k in ["ZCODE_API_KEY", "ZHIPU_API_KEY", "BIGMODEL_API_KEY"] {
+        if let Ok(v) = std::env::var(k) {
+            let v = v.trim().to_string();
+            if !v.is_empty() {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
+/// 取 ZCode 的智谱开放平台 API Key（若有）。
+///
+/// 来源优先级：
+/// 1. 账号凭据 `meta.apiKey`（账号管理里显式填的 key）；
+/// 2. 环境变量 `ZCODE_API_KEY` / `ZHIPU_API_KEY`（本机快速启用）。
+///
+/// 这是**官方支持、无渠道风控**的长期稳定通道，优先于 ZCode 套餐通道。
+fn zcode_api_key(cred: &Cred) -> Option<String> {
+    let from_meta = cred.meta.get("apiKey").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    if !from_meta.is_empty() {
+        return Some(from_meta);
+    }
+    zcode_env_api_key()
+}
+
+/// 网关内部 OpenAI 线格式 body → 智谱开放平台 v4 请求体。
+///
+/// 只做两件事：
+/// - `system` 字符串折进 `messages` 首条（v4 接口只认 messages 里的 system 角色）；
+/// - `reasoning_effort` → `thinking`（v4 用 thinking.type 控制思考链）。
+fn zcode_apikey_body(body: &Value) -> Value {
+    let mut out = body.clone();
+    if let Some(o) = out.as_object_mut() {
+        let system = o.remove("system").and_then(|v| v.as_str().map(|s| s.to_string())).unwrap_or_default();
+        if !system.trim().is_empty() {
+            if let Some(msgs) = o.get_mut("messages").and_then(|m| m.as_array_mut()) {
+                msgs.insert(0, json!({ "role": "system", "content": system }));
+            }
+        }
+        if let Some(v) = o.remove("reasoning_effort") {
+            let eff = v.as_str().unwrap_or("").to_string();
+            o.insert("thinking".into(), if matches!(eff.as_str(), "off" | "none") {
+                json!({ "type": "disabled" })
+            } else {
+                json!({ "type": "enabled" })
+            });
+        }
+        o.insert("stream".into(), Value::Bool(true));
+    }
+    out
+}
+
+/// ZCode 直连智谱开放平台（**API Key 通道**）：`POST {ZCODE_CHAT_BASE}{ZCODE_CHAT_PATH}`。
+///
+/// 为什么这条最稳：智谱开放平台 `/api/paas/v4/chat/completions` 是**公开标准接口**，
+/// 走 `Authorization: Bearer <API Key>`，没有 ZCode 那套「仅官方客户端」渠道校验
+/// （`code=3012` / `code=11128 Illegal API invocation from an unapproved channel`），
+/// 也不受 Start Plan 账号风控封禁影响。只要 API Key 有余额就能一直用。
+///
+/// 入参仍是网关内部的 OpenAI 线格式（model/messages/system/stream/max_tokens/tools），
+/// 这里只把 `system` 折进 messages 首条、`reasoning_effort` 映射成 `thinking` 后直接转发。
+pub async fn zcode_apikey_chat_stream(api_key: &str, body: Value) -> Result<EventStream, String> {
+    let out = zcode_apikey_body(&body);
+
+    let url = format!("{}{}", ZCODE_CHAT_BASE, ZCODE_CHAT_PATH);
+    let mut req = stream_client()
+        .post(&url)
+        .header("Authorization", format!("Bearer {api_key}"))
+        .header("Content-Type", "application/json")
+        .header("Accept", "text/event-stream")
+        .json(&out);
+    // 官方 SDK 的渠道标识（智谱开放平台不需要，但带上无副作用，便于排障）
+    req = req.header("User-Agent", "ZCode/3.18.2");
+    let resp = req.send().await.map_err(|e| format!("ZCode(API Key) 请求失败（{url}）：{e}"))?;
+    let st = resp.status().as_u16();
+    if st == 200 {
+        return Ok(parse_openai_sse(into_sse_stream(resp.bytes_stream())));
+    }
+    let txt = resp.text().await.unwrap_or_default();
+    let t = truncate(&txt, 300);
+    if st == 401 || st == 403 {
+        return Err(format!("ZCode(API Key) 鉴权失败（HTTP {st}）：API Key 无效或已过期，请重新填写。原始：{t}"));
+    }
+    if txt.contains("1113") || txt.contains("余额") || txt.contains("resource") {
+        return Err(format!("ZCode(API Key) 余额不足或无可用资源包（HTTP {st}）：请到智谱开放平台充值。原始：{t}"));
+    }
+    if txt.contains("11128") {
+        return Err(format!("ZCode(API Key) 渠道被拦截（HTTP {st}，code=11128）：该 Key 所属渠道未开通此模型。原始：{t}"));
+    }
+    Err(format!("ZCode(API Key) 返回 HTTP {st}：{t}"))
+}
+
+/// ZCode chat 通道（**套餐通道**；有 API Key 时优先走 API Key 通道）。
 ///
 /// **① 首选：Start Plan 专属端点**（官方客户端同款）
 ///    `POST https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages`
@@ -705,6 +920,10 @@ pub async fn zcode_fetch_models(_cred: &Cred) -> Result<Vec<ModelInfo>, Platform
 ///    bigmodel access_token（官方客户端的取票通道，实测 code=0）。
 ///    认证有效（429=额度不足是上游业务错误，非鉴权失败）。
 pub async fn zcode_chat_stream(cred: &Cred, body: Value) -> Result<EventStream, String> {
+    // —— ⓪ 首选：智谱开放平台 API Key 通道（官方标准接口，无渠道风控，长期最稳）——
+    if let Some(key) = zcode_api_key(cred) {
+        return zcode_apikey_chat_stream(&key, body).await;
+    }
     let mid = cred.meta.get("deviceMid").and_then(|d| d.as_str()).unwrap_or("");
     let model = body.get("model").and_then(|m| m.as_str()).unwrap_or("").to_string();
     let max_tokens = body.get("max_tokens").and_then(|v| v.as_u64()).map(|v| v as u32);
@@ -738,34 +957,68 @@ pub async fn zcode_chat_stream(cred: &Cred, body: Value) -> Result<EventStream, 
     };
     let st = resp.status().as_u16();
     if st == 200 {
-        return Ok(parse_anthropic_sse(resp.bytes_stream()));
+        return Ok(parse_anthropic_sse(into_sse_stream(resp.bytes_stream())));
     }
     let txt = resp.text().await.unwrap_or_default();
     // 3012 = 官方客户端身份闸门未过（版本头或 system 块不匹配）
+    //
+    // 2026-11-20 实测：服务端 3012 的文案已变成
+    //   "Your account has been suspended for misusing the Start Plan, such as proxying it to
+    //    non-ZCode clients."
+    // 即账号因「被代理给非官方客户端」而被**封禁** Start Plan 权益。
+    // 此时 Start Plan 通道对本账号**永久不可用**，再重试无意义 —— 必须走 ② bigmodel 回退，
+    // 否则 ZCode 整体不可用（旧实现在这里直接 return Err，回退分支永远走不到）。
     if txt.contains("3012") {
-        return Err(format!(
-            "ZCode Start Plan 被服务端「仅官方客户端」校验拒绝（code=3012）：{txt}；\
-             请确认已升级到 3.18.2 客户端（X-ZCode-App-Version 需与当前版本一致）"
-        ));
+        eprintln!("[zcode] Start Plan 被拒（code=3012，含账号封禁语义），改走 bigmodel Coding-Plan 回退");
+        // 回退也失败时，把两条通道的原因 + 出路一起报出来
+        return match zcode_bigmodel_fallback(cred, a_body, &sys, mid).await {
+            Ok(s) => Ok(s),
+            Err(fb) => Err(format!(
+                "ZCode Start Plan 被拒（code=3012）：{}；回退到 bigmodel Coding-Plan 也失败：{}。\
+                 \n【为什么被封】Start Plan 是**只允许官方 ZCode 客户端使用**的档位：\
+                 它的渠道校验需要官方桌面 Host 进程在**每个请求上动态签发**运行时凭据\
+                 （`interaction/requestProviderRuntimeHeaders` → accountScope + headers），\
+                 该凭据绑定客户端进程身份，网关注入/伪造不了；\
+                 仅「本机开着 ZCode 客户端」并不构成授权——请求不是那个进程发出的。\
+                 所以任何网关/代理方式使用 Start Plan，都会被判为 proxying to non-ZCode clients。\
+                 \n【稳定解法（按推荐顺序）】\
+                 ① 智谱开放平台 API Key：设环境变量 ZCODE_API_KEY=<key> 后重启网关\
+                 （走官方标准接口 /api/paas/v4/chat/completions，无渠道校验、按量计费，最稳）；\
+                 ② 开通 bigmodel Coding Plan / 资源包后，回退通道即可直接使用；\
+                 ③ 改用其它已可用平台（码道/Qoder/MiniMax/Trae 等）。\
+                 被封账号请向 ZCode 申诉；换新号用同样方式仍会被封。",
+                truncate(&txt, 240), fb
+            )),
+        };
     }
     // 3006 = 该账号无权使用此模型（官方 builtin 目录列出 3 个模型，但按账号权益放开）
     if txt.contains("3006") {
         return Err(format!(
             "ZCode Start Plan 当前账号无权使用该模型（code=3006）：{txt}；\
-             当前账号实测可用 GLM-5.3-Flash / GLM-5.3（GLM-5.2、GLM-5-Turbo 需更高档权益）"
+             当前账号实测可用 GLM-5.3-Flash / GLM-5.3（GLM-5.2、GLM-5-Turbo 需更高档权益）。\
+             也可改用 API Key 通道：设置 ZCODE_API_KEY 环境变量"
         ));
     }
     // 3007 = 安全校验（验证码）拦截：官方客户端会弹验证码，第三方无法自动过
     if txt.contains("3007") {
         return Err(format!(
-            "ZCode Start Plan 触发安全校验（code=3007）：{txt}；该档位需要官方客户端完成验证码，\
-             请改用其它平台或等待风控解除"
+            "ZCode Start Plan 触发安全校验（code=3007）：{txt}；该档位需要官方客户端完成验证码。\
+             建议改用 API Key 通道（ZCODE_API_KEY 环境变量）或其它平台"
+        ));
+    }
+    // 11128 = 渠道校验：请求不是从「已批准的渠道」发出（官方 Host 动态铸造的 provider 运行时头）
+    if txt.contains("11128") {
+        return Err(format!(
+            "ZCode 渠道校验拦截（HTTP {st} code=11128 Illegal API invocation from an unapproved channel）：\
+             {txt}。该通道要求请求携带官方客户端 Host 动态签发的运行时请求头，第三方无法稳定复现。\
+             \n【稳定解法】改用智谱开放平台 API Key 通道：设置环境变量 ZCODE_API_KEY=<你的key> 后重启网关。"
         ));
     }
     // 1113 = 额度不足（账号无可用资源包）
     if txt.contains("1113") {
         return Err(format!(
-            "ZCode 对话被拒（HTTP {st} code=1113 余额不足或无可用资源包）：{txt}"
+            "ZCode 对话被拒（HTTP {st} code=1113 余额不足或无可用资源包）：{txt}。\
+             请到智谱/ZCode 开通套餐，或改用 API Key 通道（ZCODE_API_KEY 环境变量）"
         ));
     }
     if txt.contains("401") || st == 401 {
@@ -775,15 +1028,35 @@ pub async fn zcode_chat_stream(cred: &Cred, body: Value) -> Result<EventStream, 
     }
 
     // —— ② 回退：bigmodel Coding-Plan 端点 ——
-    // 该端点没有 3012 闸门，用用户自己的 system 提示词即可（不必带官方固定块）。
+    zcode_bigmodel_fallback(cred, a_body, &sys, mid).await
+}
+
+/// ZCode 回退通道：bigmodel Coding-Plan Anthropic 端点。
+///
+/// 凭据 = 用长效 zcodejwttoken 经 `GET /api/v1/oauth/profile` 动态换取的新鲜
+/// bigmodel access_token（官方客户端的取票通道，实测 code=0）。
+/// 该端点没有 Start Plan 的「仅官方客户端」闸门（3012），但需要账号本身有
+/// Coding Plan 权益（否则 429 / code=1113 余额不足）。
+///
+/// 独立成函数的原因：Start Plan 的 3012（账号被封禁 Start Plan 权益）与其它错误
+/// 都必须能走到这里 —— 旧实现把 3012 直接 return Err，导致回退**永远不可达**，
+/// ZCode 因此整体不可用。
+async fn zcode_bigmodel_fallback(
+    cred: &Cred,
+    mut a_body: Value,
+    sys: &str,
+    mid: &str,
+) -> Result<EventStream, String> {
+    // 该端点用用户自己的 system 提示词即可（不必带官方固定块）
     if !sys.is_empty() {
         a_body["system"] = json!([{ "type": "text", "text": sys }]);
     } else {
         a_body.as_object_mut().map(|o| o.remove("system"));
     }
+    a_body["stream"] = Value::Bool(true);
     let fresh = match credit_core::adapters::zcode::fresh_bigmodel_token(cred).await {
         Ok(t) => t,
-        Err(e) => return Err(format!("ZCode Start Plan 请求失败且取票回退也失败：{e}")),
+        Err(e) => return Err(format!("ZCode 取票（oauth/profile）失败：{e}")),
     };
     let url = format!("{}{}", crate::protocol::ZCODE_ANTHROPIC_BASE, crate::protocol::ZCODE_ANTHROPIC_PATH);
     let mut hs = crate::protocol::zcode_chat_headers(&fresh, Some(mid));
@@ -796,10 +1069,10 @@ pub async fn zcode_chat_stream(cred: &Cred, body: Value) -> Result<EventStream, 
     };
     let st = resp.status().as_u16();
     if st == 200 {
-        return Ok(parse_anthropic_sse(resp.bytes_stream()));
+        return Ok(parse_anthropic_sse(into_sse_stream(resp.bytes_stream())));
     }
     let txt = resp.text().await.unwrap_or_default();
-    if txt.contains("1113") {
+    if txt.contains("1113") || txt.contains("429") {
         return Err(format!(
             "ZCode 对话被拒（HTTP {st} code=1113 余额不足或无可用资源包）：当前账号在 bigmodel 平台没有可用的 \
              Coding Plan 权益（Start Plan 权益只挂在官方客户端专属端点上）。请确认 ZCode 客户端里已激活套餐，\
@@ -811,7 +1084,7 @@ pub async fn zcode_chat_stream(cred: &Cred, body: Value) -> Result<EventStream, 
             "ZCode 取票 token 被拒（HTTP {st}）：zcodejwttoken 可能已失效，请在 ZCode 客户端重新登录后「扫描本机」"
         ));
     }
-    Err(format!("ZCode 对话端点返回 HTTP {st}：{}", truncate(&txt, 240)))
+    Err(format!("ZCode bigmodel 回退通道返回 HTTP {st}：{}", truncate(&txt, 240)))
 }
 
 // ============================ MiniMax ============================
@@ -836,17 +1109,44 @@ pub async fn minimax_fetch_models(_cred: &Cred) -> Result<Vec<ModelInfo>, Platfo
 /// 凭据：OAuth mmoat token（部分会话可用）或 MiniMax API key。401 时报明确错误。
 pub async fn minimax_chat_stream(cred: &Cred, body: Value) -> Result<EventStream, String> {
     let url = format!("{MINIMAX_API_BASE}{MINIMAX_ANTHROPIC_PATH}");
-    let hs = minimax_chat_headers(&cred.token);
+    // 轮次阶段：Anthropic 线格式里 tool 结果会变成 `user` 角色的 tool_result 块，
+    // 所以判断「最后一条是否携带 tool_result」来区分迭代轮与新一轮。
+    let phase = match body.get("messages").and_then(|m| m.as_array()).and_then(|a| a.last()) {
+        Some(last) => {
+            let has_tool_result = last
+                .get("content")
+                .and_then(|c| c.as_array())
+                .map(|arr| arr.iter().any(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_result")))
+                .unwrap_or(false);
+            if has_tool_result { "iteration" } else { "initial" }
+        }
+        None => "initial",
+    };
+    let hs = crate::protocol::minimax_chat_headers_phase(&cred.token, phase);
     let mut req = stream_client().post(&url).json(&body);
     for (k, v) in &hs {
         req = req.header(k, v);
     }
     let resp = send_sse(req).await?;
-    Ok(parse_anthropic_sse(resp.bytes_stream()))
+    Ok(parse_anthropic_sse(into_sse_stream(resp.bytes_stream())))
+}
+
+/// 把上游流读取错误转成可读消息。
+///
+/// 上游（BoringSSL/hyper 栈）对「响应已开始、正文读取中途连接被对端掐断」
+/// 统一报 `error decoding response body`（底层是 hyper IO 错误）。
+/// 译成可读提示并打上统一前缀（`STREAM_DISCONNECT_PREFIX`），
+/// 便于上层「早期断开自动重试」识别（见 `retry_stream_with`）。
+fn stream_error_message(raw: &str) -> String {
+    if raw.contains("error decoding response body") || raw.contains("decoding response") {
+        format!("{STREAM_DISCONNECT_PREFIX}（并发会话冲突或上游超时）—— 请重试；原始错误：{raw}")
+    } else {
+        format!("stream: {raw}")
+    }
 }
 
 /// Anthropic 线格式 SSE → EventStream（复用 OpenAI 帧格式；事件解码走 anthropic 分支）
-pub fn parse_anthropic_sse(stream: impl Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static) -> EventStream {
+pub fn parse_anthropic_sse(stream: impl Stream<Item = Result<bytes::Bytes, String>> + Send + 'static) -> EventStream {
     Box::pin(futures_util::stream::unfold(AnthropicPump::new(stream), |mut p| async move {
         loop {
             if let Some(ev) = p.pop() {
@@ -857,7 +1157,7 @@ pub fn parse_anthropic_sse(stream: impl Stream<Item = Result<bytes::Bytes, reqwe
             }
             match p.stream.next().await {
                 Some(Ok(chunk)) => p.feed(&chunk),
-                Some(Err(e)) => return Some((Err(format!("stream: {e}")), p)),
+                Some(Err(e)) => return Some((Err(stream_error_message(&e)), p)),
                 None => {
                     p.done = true;
                     if let Some(ev) = p.take_tail() {
@@ -876,7 +1176,7 @@ pub fn parse_anthropic_sse(stream: impl Stream<Item = Result<bytes::Bytes, reqwe
 struct AnthropicPump {
     buf: Vec<u8>,
     queue: std::collections::VecDeque<StreamEvent>,
-    stream: std::pin::Pin<Box<dyn Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send>>,
+    stream: std::pin::Pin<Box<dyn Stream<Item = Result<bytes::Bytes, String>> + Send>>,
     done: bool,
     /// 已发出结束事件（message_delta stop_reason / message_stop）：之后不再重复 Done
     finished: bool,
@@ -885,7 +1185,7 @@ struct AnthropicPump {
 }
 
 impl AnthropicPump {
-    fn new(stream: impl Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static) -> Self {
+    fn new(stream: impl Stream<Item = Result<bytes::Bytes, String>> + Send + 'static) -> Self {
         Self {
             buf: Vec::new(),
             queue: Default::default(),
@@ -1011,7 +1311,11 @@ pub struct QoderSigner {
     #[allow(dead_code)] // 保留句柄防止子进程被 drop 关闭；stderr 由系统接管
     child: tokio::process::Child,
     stdin: tokio::process::ChildStdin,
-    stdout: tokio::process::ChildStdout,
+    /// **常驻** BufReader：sidecar 是「一问一答」行协议，一次 read 可能带回多条响应。
+    /// 若每次签名都新建 BufReader，多读到的字节会随 BufReader 一起被丢弃，
+    /// 下一问就读到了错位的帧 → 表现为随机的 "sidecar json: expected value" 解析失败
+    /// （高并发/高负载时更容易出现：多条响应被一次 TCP 读批量带回）。
+    stdout: tokio::io::BufReader<tokio::process::ChildStdout>,
 }
 
 impl QoderSigner {
@@ -1025,6 +1329,18 @@ impl QoderSigner {
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null());
+        // **注入真实机器身份**（sidecar 从 env 读，缺省会回落全零 UUID —— 极容易被识别）。
+        // machine_id 来自 `<Qoder userData>/.auth/machine_id`；版本来自 `.qoder-app-status.json`。
+        if let Some(mid) = credit_core::adapters::qoder_local::machine_id(false)
+            .or_else(|| credit_core::adapters::qoder_local::machine_id(true))
+        {
+            cmd.env("QODER_MACHINE_ID", mid);
+        }
+        if let Some(ver) = credit_core::adapters::qoder_local::client_version(false)
+            .or_else(|| credit_core::adapters::qoder_local::client_version(true))
+        {
+            cmd.env("QODER_VERSION", ver);
+        }
         // Windows：node 是控制台子系统进程，GUI 应用里 spawn 会弹黑框 → 隐藏后台运行
         #[cfg(windows)]
         cmd.creation_flags(0x0800_0000);
@@ -1033,17 +1349,18 @@ impl QoderSigner {
             .map_err(|e| PlatformError::Local(format!("sidecar spawn: {e}")))?;
         let mut c = child;
         let stdin = c.stdin.take().ok_or_else(|| PlatformError::Local("sidecar stdin".into()))?;
-        let mut stdout = c.stdout.take().ok_or_else(|| PlatformError::Local("sidecar stdout".into()))?;
-        // 消费 ready 帧 {"ok":true,"ready":true}
+        let stdout = c.stdout.take().ok_or_else(|| PlatformError::Local("sidecar stdout".into()))?;
+        // 常驻 BufReader：消费 ready 帧 {"ok":true,"ready":true}，并**保留**其后可能
+        // 已到达的字节（一次 read 可能带回 ready + 首个响应）。此处新建局部 BufReader
+        // 会把多余字节丢掉，之后的响应就错位了。
+        let mut reader = tokio::io::BufReader::new(stdout);
         {
             use tokio::io::AsyncBufReadExt;
-            let mut reader = tokio::io::BufReader::new(&mut stdout);
             let mut ready_line = String::new();
             reader.read_line(&mut ready_line).await
                 .map_err(|e| PlatformError::Local(format!("sidecar ready: {e}")))?;
         }
-        let stdout = stdout;
-        Ok(Self { child: c, stdin, stdout })
+        Ok(Self { child: c, stdin, stdout: reader })
     }
 
     /// 请求签名：发 JSON 行 → 收 JSON 行
@@ -1056,9 +1373,9 @@ impl QoderSigner {
             .map_err(|e| PlatformError::Local(format!("sidecar write: {e}")))?;
         self.stdin.flush().await
             .map_err(|e| PlatformError::Local(format!("sidecar write: {e}")))?;
-        let mut reader = tokio::io::BufReader::new(&mut self.stdout);
         let mut resp_line = String::new();
-        reader.read_line(&mut resp_line).await
+        // 用常驻 BufReader 读（不新建）：保证与 sidecar 的行协议严格一一对应
+        self.stdout.read_line(&mut resp_line).await
             .map_err(|e| PlatformError::Local(format!("sidecar read: {e}")))?;
         let resp: Value = serde_json::from_str(resp_line.trim())
             .map_err(|e| PlatformError::Local(format!("sidecar json: {e}")))?;
@@ -1219,21 +1536,35 @@ async fn qoder_sign(req: &Value) -> Result<Value, String> {
 }
 
 /// 由账号 uid 派生稳定的会话 UUID（同一账号所有请求复用一个上游会话）。
-/// 码道上游限制「并发会话数 ≤ 3」：早期实现每请求生成新 user-session-id，
-/// Agent 并发/多轮调用时瞬间创建多个会话，触发 TM.00001041 直接失败（表现为请求断掉/无法处理）。
-fn stable_session_id(uid: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let mut h = Sha256::new();
-    h.update(b"credit-rs/session/");
-    h.update(uid.as_bytes());
-    let d = h.finalize();
-    let hex = d.iter().map(|b| format!("{b:02x}")).collect::<String>();
-    format!("{}-{}-{}-{}-{}", &hex[0..8], &hex[8..12], &hex[12..16], &hex[16..20], &hex[20..32])
-}
+/// 码道 user-session-id：**每请求唯一**（对齐官方客户端行为——每个对话一个独立会话）。
+///
+/// 上游两条并发规则（2026-11-19/20 实测）：
+/// ① 「并发会话数 ≤ 3」（TM.00001041）：瞬间建满会话会在请求阶段报错 → 已有退避重试兜底；
+/// ② 同一 session id 的并发 turn：上游不报错而是 **200 后直接掐断在途流**
+///    （reqwest 表现为 "error decoding response body"，单发不复现、并发必现）。
+/// 因此不能按账号固定 session id（会把所有并发请求绑进同一会话互相掐），
+/// 必须每请求独立：并发请求各占一个会话槽位互不干扰。
+/// 多轮上下文不依赖 session（上游无 sessionId/agentId 概念，多轮靠完整 messages 重发）。
 
 /// 华为码道 chat：POST {snap-access}/api/v2/chat/completions（OpenAI 兼容 SSE）。
 /// 签名头集与 PromptCenter 门面不同：无 agent-type；x-auth-token 与 x-security-token 同值。
 /// desktop/IDE 仅影响通道头（x-ot-client-type / ide-name / plugin-name）。
+///
+/// ## 会话池（2026-11-20 实测修正）
+///
+/// 上游对**账号**限制「并发会话数 ≤ 3」（`TM.00001041` / "并发会话数已达上限(3个)"）。
+/// 实测该配额统计的是**已建立的会话总数**，且会话**不随请求结束自动释放**：
+/// - 每请求生成新 `user-session-id` → 第 4 个请求起永久报 TM.00001041，
+///   连**串行**请求也会失败（会话泄漏，越用越死）—— 这是此前「码道完全不可用」的根因；
+/// - 复用同一 `user-session-id` 则不新增会话，配额不会被消耗光。
+///
+/// 因此改为**按账号维护一个有界的可复用会话池**（见 [`codearts_session_lease`]）：
+/// 池大小 = 3（对齐上游上限），每槽位一个稳定 session id，轮转取用，
+/// 且**同一槽位同一时刻只有一个在途请求**（池本身即并发闸门），
+/// 既不泄漏会话配额，也不会出现同会话并发掐流。
+///
+/// 历史结论「必须每请求唯一 session id，否则同会话并发会掐流」在实测中成立，
+/// 但代价是会话配额泄漏；「有界池 + 每槽位单飞」可同时满足两个约束。
 pub async fn codearts_chat_stream(cred: &Cred, body: Value, desktop: bool) -> Result<EventStream, String> {
     let sts = cred.meta.get("security_token").and_then(|t| t.as_str()).unwrap_or("");
     let ak = cred.meta.get("access_key_id").and_then(|a| a.as_str()).unwrap_or("");
@@ -1259,24 +1590,36 @@ pub async fn codearts_chat_stream(cred: &Cred, body: Value, desktop: bool) -> Re
         rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut b);
         b.iter().map(|x| format!("{x:02x}")).collect()
     };
-    // 实测：网关校验 x-span-id 类头 max length 64 —— x-snap-traceid 不能拼 uuid_hex(65)，
-    // 用单段 hex32；span/trace 各自独立 hex 亦在 64 内
-    let trace = trace_hex.clone();
+    // 实测：网关校验 x-span-id 类头 max length 64 —— 各 trace 头各自独立，均在 64 内
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
     let (y, mo, d) = credit_core::adapters::civil_from_days(now / 86400);
     let rem = now % 86400;
     let created = format!("{y:04}-{mo:02}-{d:02}T{:02}:{:02}:{:02}Z", rem / 3600, (rem % 3600) / 60, rem % 60);
 
+    // 取一个会话槽位（单飞：同一槽位同一时刻只有一个在途请求；流读完才释放）
+    let lease = codearts_session_lease(&cred.uid).await;
+    let session_id = lease.session_id.clone();
+
     // 业务头（content-type/host/x-sdk-date 由 sign_codearts 内部补全并纳入签名）
+    //
+    // 2026-11-20 对官方客户端取证（Electron app.asar @232615977 的 AiChannel 头 +
+    // agent-kernel.exe 的 LLM 转发白名单 @51917479/@60507224）后的修正：
+    // - **删掉 `x-span-id`**：官方两个客户端二进制里该头出现 0 次，是网关自造的特征。
+    // - `x-snap-traceid` 官方是 `crypto.randomUUID()`（36 字符带连字符），
+    //   旧实现用 hex32 且与 traceid/x-ot-trace-id 同值 —— 形状与语义都不对。
+    //   这里改成真 UUID，并让 traceid / x-ot-trace-id 各自独立（官方也是互不相同）。
     let extra: Vec<(String, String)> = vec![
         ("x-security-token".into(), sts.to_string()),
         ("x-auth-token".into(), sts.to_string()),
-        ("user-session-id".into(), stable_session_id(&cred.uid)),
-        ("x-snap-traceid".into(), trace.clone()),
-        ("x-span-id".into(), uuid::Uuid::new_v4().to_string()),
-        ("traceid".into(), trace.clone()),
-        ("x-ot-trace-id".into(), trace.clone()),
+        ("user-session-id".into(), session_id.clone()),
+        ("x-snap-traceid".into(), uuid::Uuid::new_v4().to_string()),
+        ("traceid".into(), trace_hex.clone()),
+        ("x-ot-trace-id".into(), uuid::Uuid::new_v4().to_string()),
         ("x-ot-span-id".into(), span_hex),
+        // 官方 kernel 的会话链路头：`x-ot-session-id` 与会话 id 同源，
+        // `x-ot-parent-session-id` 指向上一层会话（无嵌套时与自身一致）。
+        ("x-ot-session-id".into(), session_id.clone()),
+        ("x-ot-parent-session-id".into(), session_id.clone()),
         ("x-ot-client-version".into(), "0.2.9".into()),
         ("x-ot-client-type".into(), client_type.into()),
         ("ide-name".into(), ide_name.into()),
@@ -1310,7 +1653,24 @@ pub async fn codearts_chat_stream(cred: &Cred, body: Value, desktop: bool) -> Re
         };
         let status = resp.status().as_u16();
         if (200..300).contains(&status) {
-            return Ok(parse_openai_sse(resp.bytes_stream()));
+            // 2xx：可能是 SSE，也可能是「HTTP 200 + 业务错误帧」——
+            // 码道把业务错误塞在流首帧里（data:{"text":"[DONE]","error_code":"TM.000010051"}），
+            // 由 pump_stream 解码成 Error 事件；此处只做 content-type 兜底判定。
+            let ct = resp.headers().get("content-type").and_then(|v| v.to_str().ok())
+                .map(|v| v.to_lowercase()).unwrap_or_default();
+            if ct.contains("text/event-stream") || ct.is_empty() {
+                // 租约随流存活：流读完/被丢弃时才归还槽位（避免同一 session 并发 turn）
+                let stream = parse_openai_sse(into_sse_stream(resp.bytes_stream()));
+                return Ok(hold_lease(stream, lease));
+            }
+            // 非 SSE 的 200：读 body 转成错误事件流（保持 EventStream 语义一致）
+            let text = resp.text().await.unwrap_or_default();
+            let msg = if text.contains("TM.00001041") {
+                "码道并发会话数已达上限（3个）—— 上游会话配额已用尽，请稍后重试或改用其它平台".to_string()
+            } else {
+                format!("CodeArts chat 返回非 SSE（HTTP {status}）：{}", truncate(&text, 300))
+            };
+            return Ok(single_error_stream(msg, "codearts_bad_response"));
         }
         let text = resp.text().await.unwrap_or_default();
         let busy = text.contains("TM.00001041") || text.contains("并发会话数");
@@ -1321,6 +1681,93 @@ pub async fn codearts_chat_stream(cred: &Cred, body: Value, desktop: bool) -> Re
         eprintln!("[codearts] 并发会话已满，退避重试 {}/4", attempt + 1);
     }
     Err(last_err)
+}
+
+/// 单条错误事件流（把一次性错误包装成 EventStream，便于上层统一处理）
+fn single_error_stream(msg: String, code: &str) -> EventStream {
+    let ev = StreamEvent::Error(msg, code.to_string());
+    Box::pin(futures_util::stream::once(async move { Ok(ev) }))
+}
+
+/// 让事件流持有会话租约：流被读完或被丢弃（客户端断开）时才归还槽位。
+///
+/// 若提前归还，同一 session id 会出现并发 turn → 上游 200 后直接掐断在途流
+/// （reqwest 表现为 "error decoding response body"）。
+fn hold_lease(stream: EventStream, lease: CodeartsSessionLease) -> EventStream {
+    Box::pin(futures_util::stream::unfold((stream, Some(lease)), |(mut s, lease)| async move {
+        match s.next().await {
+            Some(item) => Some((item, (s, lease))),
+            None => None,
+        }
+    }))
+}
+
+/// 码道会话槽位租约：持有期间该 session id 被独占（流读完才释放）。
+struct CodeartsSessionLease {
+    session_id: String,
+    /// 归还租约的守卫（drop 时自动释放槽位）
+    _guard: tokio::sync::OwnedSemaphorePermit,
+}
+
+/// 码道会话池：按账号维护 3 个稳定 session id 的槽位。
+///
+/// 上游「并发会话数 ≤ 3」统计的是**已建立会话总数**且不自动释放，
+/// 所以会话 id 必须**有限且可复用**，不能每请求新建。
+/// 每个槽位一个独立信号量：acquire 成功即独占该槽位 → 天然保证
+/// 「同一会话不会有并发 turn」（避免上游 200 后掐流）。
+///
+/// 槽位数 = 3（对齐上游上限）；账号维度隔离（不同账号各用各的配额）。
+fn codearts_session_pool(uid: &str) -> Arc<Vec<Arc<tokio::sync::Semaphore>>> {
+    use std::sync::{Mutex, OnceLock};
+    static MAP: OnceLock<Mutex<std::collections::HashMap<String, Arc<Vec<Arc<tokio::sync::Semaphore>>>>>> = OnceLock::new();
+    let map = MAP.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    let mut g = map.lock().unwrap();
+    g.entry(uid.to_string())
+        .or_insert_with(|| {
+            Arc::new((0..CODEARTS_SESSION_POOL_SIZE)
+                .map(|_| Arc::new(tokio::sync::Semaphore::new(1)))
+                .collect())
+        })
+        .clone()
+}
+
+/// 码道会话池容量（对齐上游「并发会话数 ≤ 3」）
+const CODEARTS_SESSION_POOL_SIZE: usize = 3;
+
+/// 取一个会话槽位（阻塞等待空闲槽位；槽位耗尽时排队，不会超上游上限）
+async fn codearts_session_lease(uid: &str) -> CodeartsSessionLease {
+    let pool = codearts_session_pool(uid);
+    // 轮转起点：用全局计数器打散，避免总是挤在第一个槽位
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let start = NEXT.fetch_add(1, Ordering::Relaxed) % pool.len();
+    for i in 0..pool.len() {
+        let idx = (start + i) % pool.len();
+        let sem = pool[idx].clone();
+        if let Ok(permit) = sem.acquire_owned().await {
+            // 槽位 id 稳定派生：同一槽位永远用同一个 session id → 上游不新增会话
+            let session_id = codearts_session_id(uid, idx);
+            return CodeartsSessionLease { session_id, _guard: permit };
+        }
+    }
+    // 理论不可达（acquire_owned 只在信号量关闭时失败）；兜底退化为自造 id
+    CodeartsSessionLease {
+        session_id: uuid::Uuid::new_v4().to_string(),
+        _guard: pool[0].clone().acquire_owned().await.expect("semaphore open"),
+    }
+}
+
+/// 槽位 → 稳定 session id（同一账号 + 同一槽位 → 同一个 id）
+fn codearts_session_id(uid: &str, slot: usize) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(b"credit-rs/codearts/session/v1\0");
+    h.update(uid.as_bytes());
+    h.update(b"\0");
+    h.update(slot.to_le_bytes());
+    let d = h.finalize();
+    let hex: String = d.iter().map(|b| format!("{b:02x}")).collect();
+    format!("{}-{}-{}-{}-{}", &hex[0..8], &hex[8..12], &hex[12..16], &hex[16..20], &hex[20..32])
 }
 
 /// 华为码道模型清单：GET {API_BASE}/v1/model/builtin（HWS 签名 + x-security-token）
@@ -1341,7 +1788,8 @@ pub async fn codearts_fetch_models(cred: &Cred, _desktop: bool) -> Result<Vec<Mo
     // 用 credit-core 的 sign_codearts 构造 HWS 签名头
     let host = "snap-access.cn-north-4.myhuaweicloud.com";
     let (auth, signed) = credit_core::adapters::codearts::sign_codearts(ak, sk, "GET", host, "/v1/model/builtin", "", &extra_headers, body_str, Some(sts));
-    let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).build().unwrap();
+    // 复用带指纹仿真的共享客户端（旧实现每请求新建 client，既慢又指纹不一致）
+    let client = http_client();
     let mut req = client.get(&url);
     for (k, v) in &signed { req = req.header(k, v); }
     req = req.header("Authorization", &auth);
@@ -1369,6 +1817,12 @@ pub async fn codearts_fetch_models(cred: &Cred, _desktop: bool) -> Result<Vec<Mo
     Ok(out)
 }
 /// Qoder chat：sidecar 签名（常驻进程池）→ POST agent_chat_generation（SSE 双层信封 → OpenAI chunk）
+///
+/// 请求头分两部分（对齐官方客户端 `DFr` 中间件链，见 qoder-worker-runtime.obf.mjs）：
+/// ① wasm 产出的签名/加密头（Authorization / Cosy-* / X-Model-* 等）；
+/// ② **wasm 之外由 JS 叠加的身份/链路头**：umid 的 `Cosy-MachineCode/Token/Type`、
+///    `Cosy-MachineOS`、`Cosy-MachineHostname`、W3C `traceparent`、`x-request-id`。
+///    旧实现完全缺失第 ② 层，是明显的非官方特征，这里补齐。
 pub async fn qoder_chat_stream(cred: &Cred, body: Value) -> Result<EventStream, String> {
     // 1. 签名（进程池轮转，不再每请求 spawn）
     let signed = qoder_sign(&json!({
@@ -1382,14 +1836,55 @@ pub async fn qoder_chat_stream(cred: &Cred, body: Value) -> Result<EventStream, 
     let body_str = signed.get("body").and_then(|b| b.as_str()).ok_or("sidecar: no body")?.to_string();
     let headers: Value = signed.get("headers").cloned().unwrap_or(json!({}));
     // 2. 发请求（上游响应是外层信封 SSE：data:{headers,body,statusCode}）
-    let mut req = stream_client().post(&url);
+    //
+    // 用 HeaderMap 的 insert 语义（而非 req.header 的 append）：
+    // wasm 自己也会产出部分 Cosy-* 头，追加会造成**同名重复头**，反而是异常特征。
+    use reqwest::header::{HeaderName, HeaderValue};
+    let mut hm = reqwest::header::HeaderMap::new();
     if let Some(hs) = headers.as_object() {
         for (k, v) in hs {
             if let Some(sv) = v.as_str() {
-                req = req.header(k, sv);
+                if let (Ok(name), Ok(val)) = (HeaderName::from_bytes(k.as_bytes()), HeaderValue::from_str(sv)) {
+                    hm.insert(name, val);
+                }
             }
         }
     }
+    let mut put = |k: &str, v: String| {
+        if !v.is_empty() {
+            if let (Ok(name), Ok(val)) = (HeaderName::from_bytes(k.as_bytes()), HeaderValue::from_str(&v)) {
+                hm.insert(name, val);
+            }
+        }
+    };
+    // 3. 补官方 JS 层身份/链路头（wasm 不产出这些）。
+    //    注意：**不覆盖 Cosy-MachineToken** —— wasm 由 machineId 派生的 token 已能通过校验，
+    //    换成 umid token 有失效风险（那是服务端下发、会轮换的物料）。
+    if let Some((code, _token, ty)) = credit_core::adapters::qoder_local::umid_info(false)
+        .or_else(|| credit_core::adapters::qoder_local::umid_info(true))
+    {
+        put("Cosy-MachineCode", code);
+        put("Cosy-MachineType", ty);
+    }
+    // 官方 umid 层固定发：Cosy-MachineOS = "<arch>_<platform>"
+    #[cfg(target_arch = "x86_64")]
+    let machine_os = format!("x86_64_{}", if cfg!(windows) { "win32" } else { std::env::consts::OS });
+    #[cfg(target_arch = "aarch64")]
+    let machine_os = format!("aarch64_{}", if cfg!(windows) { "win32" } else { std::env::consts::OS });
+    put("Cosy-MachineOS", machine_os);
+    if let Ok(host) = hostname() {
+        put("Cosy-MachineHostname", host);
+    }
+    // W3C traceparent + x-request-id（官方 trace 中间件每请求注入；request-id 与 body request_id 同值）
+    let trace32: String = uuid::Uuid::new_v4().simple().to_string();
+    let span16: String = uuid::Uuid::new_v4().simple().to_string()[..16].to_string();
+    put("traceparent", format!("00-{trace32}-{span16}-01"));
+    let req_id = body.get("request_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    if !req_id.is_empty() {
+        put("x-request-id", req_id.clone());
+        put("x-qoder-request-id", req_id);
+    }
+    let req = stream_client().post(&url).headers(hm);
     let resp = req.body(body_str).send().await.map_err(|e| format!("network: {e}"))?;
     let status = resp.status().as_u16();
     if !(200..300).contains(&status) {
@@ -1397,7 +1892,7 @@ pub async fn qoder_chat_stream(cred: &Cred, body: Value) -> Result<EventStream, 
         return Err(format!("upstream HTTP {status}: {}", truncate(&text, 400)));
     }
     // 3. 双层信封解析：外层 SSE data:{...body:"<openai chunk json>"...} → 内层 OpenAI delta
-    Ok(parse_qoder_envelope_sse(resp.bytes_stream()))
+    Ok(parse_qoder_envelope_sse(into_sse_stream(resp.bytes_stream())))
 }
 
 /// 仅做 Qoder 签名（诊断/测试用）：返回 sidecar 给出的 url/body/headers 原样。
@@ -1413,7 +1908,7 @@ pub async fn qoder_sign_request(cred: &Cred, body: Value) -> Result<Value, Strin
 }
 
 /// Qoder 双层信封 SSE → EventStream
-pub fn parse_qoder_envelope_sse(stream: impl Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static) -> EventStream {
+pub fn parse_qoder_envelope_sse(stream: impl Stream<Item = Result<bytes::Bytes, String>> + Send + 'static) -> EventStream {
     Box::pin(futures_util::stream::unfold(QoderPump::new(stream), |mut p| async move {
         loop {
             if let Some(ev) = p.pop() {
@@ -1424,7 +1919,7 @@ pub fn parse_qoder_envelope_sse(stream: impl Stream<Item = Result<bytes::Bytes, 
             }
             match p.stream.next().await {
                 Some(Ok(chunk)) => p.feed(&chunk),
-                Some(Err(e)) => return Some((Err(format!("stream: {e}")), p)),
+                Some(Err(e)) => return Some((Err(stream_error_message(&e)), p)),
                 None => {
                     p.done = true;
                     if let Some(ev) = p.take_tail() {
@@ -1440,14 +1935,14 @@ pub fn parse_qoder_envelope_sse(stream: impl Stream<Item = Result<bytes::Bytes, 
 /// Qoder 双层信封 SSE 泵（外层 data 帧 → 内层 OpenAI chunk 解码）
 struct QoderPump {
     buf: Vec<u8>,
-    stream: std::pin::Pin<Box<dyn Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send>>,
+    stream: std::pin::Pin<Box<dyn Stream<Item = Result<bytes::Bytes, String>> + Send>>,
     done: bool,
     /// 已产出错误事件：后续 event:error 栈帧/兜底错误不再重复上报（只保留根因）
     errored: bool,
 }
 
 impl QoderPump {
-    fn new(stream: impl Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static) -> Self {
+    fn new(stream: impl Stream<Item = Result<bytes::Bytes, String>> + Send + 'static) -> Self {
         Self { buf: Vec::new(), stream: Box::pin(stream), done: false, errored: false }
     }
     fn feed(&mut self, chunk: &[u8]) {
@@ -1533,14 +2028,71 @@ fn qoder_http_status(envelope: &Value) -> Option<i64> {
     })
 }
 
+/// Qoder 内层 body 归一化：把「终止标记」与「嵌套 SSE 文本」转成事件。
+///
+/// 上游有两种形态实测到：
+/// ① body 就是终止标记 `[DONE]` —— 正常结束，不是错误；
+/// ② body 是内层 SSE 文本（`data: {"choices":…}\n\ndata: [DONE]`）—— 需按帧解析。
+///
+/// 返回 None = body 形态未知，交给调用方按 JSON / 非 JSON 错误处理。
+fn decode_qoder_inner_body(inner: &str) -> Option<StreamEvent> {
+    let t = inner.trim();
+    if t.is_empty() {
+        return None;
+    }
+    // ① 终止标记
+    if t == "[DONE]" {
+        return Some(StreamEvent::Done { finish: "stop".into() });
+    }
+    // ② 裸 JSON（chunk / 错误对象）交给调用方按 JSON 处理。
+    //    必须先判这个：正文内容里可能含 "data:" 字样（如 `data:image/png;base64,…`），
+    //    若无条件按 SSE 解析会把正常 chunk 误判成空流并提前结束。
+    if t.starts_with('{') || t.starts_with('[') {
+        return None;
+    }
+    // ③ 内层 SSE 文本：只认「行首是 data:」的帧，逐帧解析取第一个可产出事件的帧
+    if t.lines().any(|l| l.trim_start().starts_with("data:")) {
+        for line in t.lines() {
+            let Some(d) = line.trim_start().strip_prefix("data:") else { continue };
+            let d = d.trim();
+            if d.is_empty() {
+                continue;
+            }
+            if d == "[DONE]" {
+                return Some(StreamEvent::Done { finish: "stop".into() });
+            }
+            if let Ok(v) = serde_json::from_str::<Value>(d) {
+                let evs = parse_openai_chunk(&v);
+                if let Some(first) = evs.into_iter().next() {
+                    return Some(first);
+                }
+            }
+        }
+        // 内层 SSE 解析不出事件（空流）→ 视为正常结束而非错误
+        return Some(StreamEvent::Done { finish: "stop".into() });
+    }
+    None
+}
+
 /// 外层信封 data:{headers, body:"<json>", statusCode} → 内层 OpenAI chunk → 事件。
 /// 关键修复：信封内是业务错误（如 invalid_model_error / 额度不足）时，此前会被静默丢弃，
 /// 客户端只看到空流/502；现在显式转成 Error 事件，透出上游真实原因。
 fn decode_qoder_envelope(data: &str) -> Option<StreamEvent> {
+    // 外层 data 帧本身可能就是终止标记（`data: [DONE]`，非信封 JSON）：
+    // 直接当正常结束，否则这一帧被丢弃、流结束时没有 Done 事件。
+    if data.trim() == "[DONE]" {
+        return Some(StreamEvent::Done { finish: "stop".into() });
+    }
     let envelope: Value = serde_json::from_str(data).ok()?;
     let status = qoder_http_status(&envelope);
     let inner_str = envelope.get("body").and_then(|b| b.as_str()).unwrap_or("");
     if !inner_str.trim().is_empty() {
+        // 内层 body 可能是 SSE 文本（`data: {...}\n\ndata: [DONE]`）而非裸 chunk JSON，
+        // 也可能直接是终止标记 `[DONE]`。这两种都不是「JSON 解析失败」，
+        // 此前一律报「上游返回非 JSON（HTTP 200）：[DONE]」——把正常结束当成致命错误。
+        if let Some(ev) = decode_qoder_inner_body(inner_str) {
+            return Some(ev);
+        }
         match serde_json::from_str::<Value>(inner_str) {
             Ok(inner) => {
                 // 业务错误帧：{code:"invalid_model_error", message:"Unsupported model ...", type:...}
@@ -1627,7 +2179,7 @@ mod stream_tests {
         use futures_util::StreamExt;
         // 先发一个 finish_reason 帧，然后流永远 pending（模拟上游不关闭连接）
         let first = bytes::Bytes::from_static(b"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n");
-        let s = futures_util::stream::once(async move { Ok::<_, reqwest::Error>(first) })
+        let s = futures_util::stream::once(async move { Ok::<_, String>(first) })
             .chain(futures_util::stream::pending());
         let mut ev = parse_openai_sse(s);
         let t0 = std::time::Instant::now();
@@ -1648,7 +2200,7 @@ mod stream_tests {
             bytes::Bytes::from_static(b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\xe5\xa5\xbd\"},\"finish_reason\":null}]}\n"),
             bytes::Bytes::from_static(b"\ndata: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"),
         ];
-        let s = futures_util::stream::iter(chunks.into_iter().map(Ok::<_, reqwest::Error>));
+        let s = futures_util::stream::iter(chunks.into_iter().map(Ok::<_, String>));
         let mut ev = parse_openai_sse(s);
         let mut text = String::new();
         let mut done = false;
@@ -1661,5 +2213,141 @@ mod stream_tests {
         }
         assert_eq!(text, "你好");
         assert!(done, "应收到结束事件");
+    }
+
+    /// 码道会话池：同一账号同一槽位必须派生出**稳定** session id（跨进程重启也一致），
+    /// 否则每次重启都会新建会话、泄漏上游「并发会话数 ≤ 3」配额。
+    #[test]
+    fn codearts_session_id_is_stable_and_slot_scoped() {
+        let a0 = codearts_session_id("uid-a", 0);
+        let a0_again = codearts_session_id("uid-a", 0);
+        assert_eq!(a0, a0_again, "同一账号同一槽位必须稳定（否则每次重启泄漏会话）");
+        assert_ne!(a0, codearts_session_id("uid-a", 1), "不同槽位必须是不同会话");
+        assert_ne!(a0, codearts_session_id("uid-b", 0), "不同账号必须隔离");
+        // 形如 uuid：36 字符、4 个连字符
+        assert_eq!(a0.len(), 36);
+        assert_eq!(a0.matches('-').count(), 4);
+    }
+
+    /// 渠道池容量必须对齐上游「并发会话数 ≤ 3」
+    #[test]
+    fn codearts_session_pool_size_matches_upstream_limit() {
+        assert_eq!(CODEARTS_SESSION_POOL_SIZE, 3);
+    }
+
+    /// ZCode API Key 通道请求体转换：system 折进 messages 首条、reasoning_effort → thinking
+    #[test]
+    fn zcode_apikey_body_folds_system_and_maps_thinking() {
+        let body = json!({
+            "model": "GLM-5.3-Flash",
+            "system": "你是助手",
+            "messages": [{"role":"user","content":"hi"}],
+            "reasoning_effort": "high",
+            "max_tokens": 64,
+        });
+        let out = zcode_apikey_body(&body);
+        // system 不再是顶层字段
+        assert!(out.get("system").is_none(), "顶层 system 必须被折进 messages");
+        // 首条是 system 角色且内容一致
+        assert_eq!(out["messages"][0]["role"], "system");
+        assert_eq!(out["messages"][0]["content"], "你是助手");
+        assert_eq!(out["messages"][1]["role"], "user");
+        // reasoning_effort 映射为 thinking.type，且不再保留原字段
+        assert!(out.get("reasoning_effort").is_none());
+        assert_eq!(out["thinking"]["type"], "enabled");
+        // 强制流式
+        assert_eq!(out["stream"], json!(true));
+        assert_eq!(out["max_tokens"], json!(64));
+
+        // off/none → disabled
+        let off = zcode_apikey_body(&json!({"model":"m","system":"","messages":[],"reasoning_effort":"off"}));
+        assert_eq!(off["thinking"]["type"], "disabled");
+        assert!(off.get("system").is_none());
+        // 空 system 不产生 system 消息
+        assert_eq!(off["messages"].as_array().unwrap().len(), 0);
+    }
+
+    /// 中途断开自动重试：**未产出内容**时重试，第二次成功 → 客户端只看到完整内容。
+    #[tokio::test]
+    async fn retry_stream_resumes_when_disconnect_before_content() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        // 首次：立刻以「中途断开」失败
+        let first = Box::pin(futures_util::stream::once(async {
+            Err::<StreamEvent, String>(format!("{STREAM_DISCONNECT_PREFIX}：boom"))
+        })) as EventStream;
+        // 第二次：正常吐内容
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls2 = calls.clone();
+        let out = retry_stream_with(first, move || {
+            calls2.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {
+                Ok(Box::pin(futures_util::stream::iter(vec![
+                    Ok(StreamEvent::Text("hi".into())),
+                    Ok(StreamEvent::Done { finish: "stop".into() }),
+                ])) as EventStream)
+            }) as StreamBoxFuture
+        });
+        let mut out = out;
+        let mut text = String::new();
+        let mut errs = 0;
+        while let Some(item) = out.next().await {
+            match item {
+                Ok(StreamEvent::Text(t)) => text.push_str(&t),
+                Ok(_) => {}
+                Err(_) => errs += 1,
+            }
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "应重发一次");
+        assert_eq!(text, "hi", "重试后客户端应收到正常内容");
+        assert_eq!(errs, 0, "重试成功后不应把错误透给客户端");
+    }
+
+    /// 中途断开自动重试：**已产出内容**后断开不能再重放（否则客户端收到重复内容）
+    #[tokio::test]
+    async fn retry_stream_does_not_replay_after_content_emitted() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let first = Box::pin(futures_util::stream::iter(vec![
+            Ok(StreamEvent::Text("part".into())),
+            Err(format!("{STREAM_DISCONNECT_PREFIX}：boom")),
+        ])) as EventStream;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls2 = calls.clone();
+        let mut out = retry_stream_with(first, move || {
+            calls2.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(Box::pin(futures_util::stream::empty()) as EventStream) }) as StreamBoxFuture
+        });
+        let mut text = String::new();
+        let mut errs = 0;
+        while let Some(item) = out.next().await {
+            match item {
+                Ok(StreamEvent::Text(t)) => text.push_str(&t),
+                Ok(_) => {}
+                Err(_) => errs += 1,
+            }
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "已产出内容后不得重放");
+        assert_eq!(text, "part");
+        assert_eq!(errs, 1, "错误应透传给客户端");
+    }
+
+    /// 非「中途断开」类错误不应触发重试
+    #[tokio::test]
+    async fn retry_stream_ignores_non_disconnect_errors() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let first = Box::pin(futures_util::stream::once(async {
+            Err::<StreamEvent, String>("upstream HTTP 400: bad model".into())
+        })) as EventStream;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls2 = calls.clone();
+        let mut out = retry_stream_with(first, move || {
+            calls2.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(Box::pin(futures_util::stream::empty()) as EventStream) }) as StreamBoxFuture
+        });
+        let mut errs = 0;
+        while let Some(item) = out.next().await {
+            if item.is_err() { errs += 1; }
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "业务错误不应重试");
+        assert_eq!(errs, 1);
     }
 }

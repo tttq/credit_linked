@@ -19,6 +19,25 @@
 
 use serde_json::{json, Value};
 
+/// WorkBuddy 聊天 UA：`WorkBuddy/{ver} WorkBuddy/{ver}`（+ 可选 ` CLI/{cliVer}`）。
+///
+/// 官方 `buildVlmGatewayHeaders` 的版本段来自客户端 appVersion / platformVersion；
+/// 旧实现硬编码 `5.11.3 ... CLI/2.63.2`（那个 CLI 段其实来自 CodeBuddy CLI），
+/// 客户端升级后立刻对不上。现在按本机安装版本动态生成，读不到才回落常量、且不发 CLI 段。
+fn wb_chat_ua() -> String {
+    static UA: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    UA.get_or_init(|| {
+        let ver = credit_core::adapters::wb_local::app_version().unwrap_or_else(|| "5.11.3".to_string());
+        format!("WorkBuddy/{ver} WorkBuddy/{ver}")
+    })
+    .clone()
+}
+
+/// WorkBuddy 客户端版本（头 `X-IDE-Version` 用）
+fn wb_client_version() -> String {
+    credit_core::adapters::wb_local::app_version().unwrap_or_else(|| "5.11.3".to_string())
+}
+
 /// WorkBuddy chat 通道 UA（官方 VlmUpstream 格式：WorkBuddy/{ver} WorkBuddy/{ver} [CLI/{cliVer}]）
 pub const WB_CHAT_UA: &str = "WorkBuddy/5.11.3 WorkBuddy/5.11.3 CLI/2.63.2";
 /// WorkBuddy 产品配置通道 UA（/v3/config 逐字对齐官方客户端）
@@ -44,8 +63,10 @@ pub const TRAE_AI_REMOTE_BASE: &str = "https://coresg-normal.trae.ai/api/remote/
 
 /// Trae 固定 x-app-id（两个网关同值，实测验证）
 pub const TRAE_APP_ID: &str = "6eefa01c-1036-4c7e-9ca5-d891f63bfcd8";
-/// 非数字构建版本时的回落（上游绑定必须纯数字）
-pub const TRAE_VERSION_CODE_FALLBACK: &str = "20260716";
+/// 非数字构建版本时的回落（上游要求纯数字）。
+/// 取官方实测真值（Trae CN 3.4.22 的 product.json `traeVersionCode` = 20250325），
+/// 不再用自造的未来日期值 —— 假值本身就是可识别的指纹。
+pub const TRAE_VERSION_CODE_FALLBACK: &str = "20250325";
 
 /// 远程模型目录 functions（CN 与 AI 桶）
 pub const TRAE_DIRECTORY_FUNCTIONS_CN: [&str; 12] = [
@@ -170,26 +191,33 @@ pub fn wb_is_global(domain: &str) -> bool {
 /// WorkBuddy chat 请求头（对齐 chatHeaders；设备指纹头由凭据 meta 提供可选项）
 pub fn wb_chat_headers(token: &str, uid: &str, domain: &str, enterprise_id: Option<&str>, device: Option<(&str, &str, &str)>) -> Vec<(String, String)> {
     // 逐字对齐官方客户端 VlmUpstream/applyGatewayHeaders（asar 逆向）
+    //
+    // 会话三元组的生命周期（官方 VlmSessionLedger.acquire，asar @20769437）：
+    // **每会话生成一次并复用**（X-Conversation-ID / acp-connection-id /
+    // X-Conversation-Request-ID 三者在同一会话内不变），
+    // 只有 X-Conversation-Message-ID 与 X-Request-ID 是每条消息新生成。
+    // 旧实现三个都每请求换新 → 同一账号下会话 id 反复横跳，是最明显的非官方特征之一。
+    let (conv_id, conv_req_id, acp_id) = wb_session_triplet(uid);
     let mut hs = vec![
         ("Authorization".to_string(), format!("Bearer {token}")),
         ("Content-Type".to_string(), "application/json".to_string()),
         ("Accept".to_string(), "application/json".to_string()),
         ("x-requested-with".to_string(), "XMLHttpRequest".to_string()),
-        ("User-Agent".to_string(), WB_CHAT_UA.to_string()),
+        ("User-Agent".to_string(), wb_chat_ua()),
         ("X-Product".to_string(), "SaaS".to_string()),
         ("X-IDE-Type".to_string(), "WorkBuddy".to_string()),
         ("X-IDE-Name".to_string(), "WorkBuddy".to_string()),
-        ("X-IDE-Version".to_string(), "5.11.3".to_string()),
+        ("X-IDE-Version".to_string(), wb_client_version()),
         ("X-Private-Data".to_string(), "true".to_string()),
         ("X-Agent-Intent".to_string(), "craft".to_string()),
         ("X-Agent-Purpose".to_string(), "conversation".to_string()),
         ("x-codebuddy-request".to_string(), "1".to_string()),
         ("Accept-Encoding".to_string(), "identity".to_string()),
         ("Accept-Language".to_string(), if wb_is_global(domain) { "en-US".to_string() } else { "zh-CN".to_string() }),
-        // 会话标识（官方每会话固定 / 每消息随机）
-        ("X-Conversation-ID".to_string(), uuid::Uuid::new_v4().to_string()),
-        ("X-Conversation-Request-ID".to_string(), uuid::Uuid::new_v4().to_string()),
-        ("acp-connection-id".to_string(), uuid::Uuid::new_v4().to_string()),
+        // 会话标识：前三个每会话固定（见上），后两个每消息随机
+        ("X-Conversation-ID".to_string(), conv_id),
+        ("X-Conversation-Request-ID".to_string(), conv_req_id),
+        ("acp-connection-id".to_string(), acp_id),
         ("X-Conversation-Message-ID".to_string(), uuid::Uuid::new_v4().to_string()),
         ("X-Request-ID".to_string(), uuid::Uuid::new_v4().to_string()),
     ];
@@ -204,32 +232,25 @@ pub fn wb_chat_headers(token: &str, uid: &str, domain: &str, enterprise_id: Opti
     hs.push(("X-B3-SpanId".to_string(), span_id));
     hs.push(("X-B3-Sampled".to_string(), "1".to_string()));
     hs.push(("X-Trace-ID".to_string(), trace_id));
-    // 设备身份（Turing 真实 token + 盐派生 machine/session，对齐官方客户端）
-    if let Some((dev_token, machine, session)) = device {
-        if !dev_token.is_empty() {
-            hs.push(("X-Device-Token".to_string(), dev_token.to_string()));
-        }
-        if !machine.is_empty() {
-            hs.push(("X-Machine-ID".to_string(), machine.to_string()));
-        }
-        if !session.is_empty() {
-            hs.push(("X-Session-ID".to_string(), session.to_string()));
-        }
-    }
-    // 用户/企业/域
+    // 设备身份：**聊天链路不发**（2026-11-20 取证）。
+    // 官方 app.asar 全量检索：`X-Session-ID` / `X-Machine-ID` 出现 0 次；
+    // `X-Device-Token` 只出现在 `DesktopAccountRepo.getCheckinRequestHeaders()`（计费/签到）。
+    // 旧实现把三者都塞进聊天请求 —— 属于自造指纹，已移除（保留参数以免调用方大改）。
+    let _ = device;
+    // 用户/企业/域：官方桌面端只在 auth/* 用 `X-No-*`，且值一律是字符串 "true"
     if uid.is_empty() {
-        hs.push(("X-No-User-Id".to_string(), "1".to_string()));
+        hs.push(("X-No-User-Id".to_string(), "true".to_string()));
     } else {
         hs.push(("X-User-Id".to_string(), uid.to_string()));
     }
     if enterprise_id.unwrap_or_default().is_empty() {
-        hs.push(("X-No-Enterprise-Id".to_string(), "1".to_string()));
+        hs.push(("X-No-Enterprise-Id".to_string(), "true".to_string()));
     } else {
         hs.push(("X-Enterprise-Id".to_string(), enterprise_id.unwrap().to_string()));
         hs.push(("X-Tenant-Id".to_string(), enterprise_id.unwrap().to_string()));
     }
     if domain.is_empty() {
-        hs.push(("X-No-Department-Info".to_string(), "1".to_string()));
+        hs.push(("X-No-Department-Info".to_string(), "true".to_string()));
     } else {
         hs.push(("X-Domain".to_string(), domain.to_string()));
     }
@@ -272,7 +293,6 @@ pub fn trae_version_code(build_version: Option<&str>) -> String {
 /// Trae 对话请求头（对齐 dsh-connect-trae buildTraeHeaders，SOLO 通道需要 x-uid/请求 id）
 /// identity: machine_id / device_id / build_version / app_version 均来自凭据 meta（本机扫描或登录时入库）
 pub fn trae_chat_headers(token: &str, meta: &Value) -> Vec<(String, String)> {
-    let uid = meta.get("uid").and_then(|v| v.as_str()).unwrap_or("");
     let request_id = uuid::Uuid::new_v4().to_string();
     let trace_id: String = request_id.replace('-', "").chars().take(32).collect();
     let machine_id = meta.get("machineId").and_then(|v| v.as_str()).unwrap_or("");
@@ -283,12 +303,13 @@ pub fn trae_chat_headers(token: &str, meta: &Value) -> Vec<(String, String)> {
     let os_version = meta.get("osVersion").and_then(|v| v.as_str()).unwrap_or("Windows");
     let device_brand = meta.get("deviceBrand").and_then(|v| v.as_str()).unwrap_or("PC");
 
-    vec![
+    let mut hs = vec![
         ("Authorization".to_string(), format!("Cloud-IDE-JWT {token}")),
         ("X-Ide-Token".to_string(), token.to_string()),
-        ("X-Cloudide-Token".to_string(), token.to_string()),
+        // 2026-11-20 取证：`X-Cloudide-Token` 在官方 harness.dll 里只用于
+        // `/trae/api/v3/SetConnectorToken`（@0xd24f648），聊天链路不发 —— 已移除。
         ("x-plugin-channel".to_string(), "icube-ai".to_string()),
-        ("User-Agent".to_string(), if app_version.is_empty() { format!("Trae/{version_code}") } else { format!("Trae/{app_version}") }),
+        // 官方 ai_agent.dll 的头清单（http.rs:1149）**没有 User-Agent**；自造 UA 反而是特征。
         ("x-app-id".to_string(), TRAE_APP_ID.to_string()),
         ("x-machine-id".to_string(), machine_id.to_string()),
         ("x-device-id".to_string(), device_id.to_string()),
@@ -303,11 +324,27 @@ pub fn trae_chat_headers(token: &str, meta: &Value) -> Vec<(String, String)> {
         ("x-custom-trace-id".to_string(), trace_id.clone()),
         ("x-flow-traceparent".to_string(), format!("04-{trace_id}-{}-01", &trace_id[..16.min(trace_id.len())])),
         ("request-traffic-type".to_string(), "prod".to_string()),
-        ("x-uid".to_string(), uid.to_string()),
+        // 2026-11-20 取证：官方 ai_agent.dll 的 http.rs 头清单里还有下面几个（网关此前缺失）：
+        // - `X-Tt-Env` ← ppe_env_name（线上即 "prod"）
+        // - `X-Use-Ppe` 常量 "1"
+        // - `X-Device-Cpu` ← device_cpu（有值才发，避免臆造）
+        ("X-Tt-Env".to_string(), meta.get("ppeEnvName").and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty()).unwrap_or("prod").to_string()),
+        ("X-Use-Ppe".to_string(), "1".to_string()),
+        // 2026-11-20 取证：`x-uid` 在官方两个本机二进制（harness.dll / ai_agent.dll）里均未出现
+        // （那是 web 通道才需要的头）—— 已移除。
         ("x-request-id".to_string(), request_id.clone()),
         ("x-trae-request-id".to_string(), request_id),
         ("Accept".to_string(), "text/event-stream".to_string()),
-    ]
+    ];
+    // 条件性头：只在凭据里确实有值时发（缺头 < 假头）
+    if let Some(cpu) = meta.get("deviceCpu").and_then(|v| v.as_str()).filter(|s| !s.trim().is_empty()) {
+        hs.push(("X-Device-Cpu".to_string(), cpu.to_string()));
+    }
+    if let Some(web) = meta.get("webId").and_then(|v| v.as_str()).filter(|s| !s.trim().is_empty()) {
+        hs.push(("X-Web-Id".to_string(), web.to_string()));
+    }
+    hs
 }
 
 /// Trae 模型目录请求头（remote web 通道）
@@ -430,11 +467,13 @@ pub fn wb_chat_body(messages: &[Value], system: &str, model: &str, max_tokens: O
         }
         msgs.push(mm);
     }
+    // 2026-11-20 取证：官方桌面端 agent 请求体里没有 `user` 字段（那是 web/OpenAI SDK 形状）。
+    // 旧实现带 `user` 反而多出一个非官方字段，已移除（参数保留以兼容调用方）。
+    let _ = uid;
     let mut body = json!({
         "messages": msgs,
         "model": model,
         "stream": true,
-        "user": if uid.is_empty() { "credit-rs" } else { uid },
     });
     if let Some(mt) = max_tokens {
         body["max_tokens"] = json!(mt);
@@ -878,36 +917,88 @@ pub const MINIMAX_API_BASE: &str = "https://agent.minimax.cn";
 /// MiniMax anthropic 兼容 chat 路径
 pub const MINIMAX_ANTHROPIC_PATH: &str = "/mavis/api/v1/llm/v1/messages";
 
+/// WorkBuddy 会话三元组（每账号在**进程内**生成一次并复用）。
+///
+/// 对齐官方 `VlmSessionLedger`：`{X-Conversation-ID, acp-connection-id,
+/// X-Conversation-Request-ID}` 在同一会话内保持不变，只有消息级 id 才每请求换新。
+/// 用网关进程生命周期近似「一次客户端会话」——重启网关等价于客户端重开。
+fn wb_session_triplet(uid: &str) -> (String, String, String) {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<HashMap<String, (String, String, String)>>> = OnceLock::new();
+    let map = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut g = map.lock().unwrap_or_else(|e| e.into_inner());
+    g.entry(uid.to_string())
+        .or_insert_with(|| {
+            (
+                uuid::Uuid::new_v4().to_string(),
+                uuid::Uuid::new_v4().to_string(),
+                uuid::Uuid::new_v4().to_string(),
+            )
+        })
+        .clone()
+}
+
 /// MiniMax chat 请求头（凭据：MMOAT OAuth token 或 API key）。
 /// 对齐 MiniMax Code 官方客户端（pi-ai anthropic provider）：
 /// - Authorization Bearer 是真正鉴权；x-api-key 官方是占位
 /// - X-Mavis-Session-Id 按 token 稳定（影响服务端缓存亲和），Agent-Id 用固定 main
 /// - 时区偏移按秒（UTC+8 = 28800）
 pub fn minimax_chat_headers(token: &str) -> Vec<(String, String)> {
-    use sha2::{Digest, Sha256};
-    let session_id = {
-        let h = Sha256::digest(token.as_bytes());
-        let hex: String = h.iter().take(16).map(|b| format!("{b:02x}")).collect();
-        format!("{}-{}-{}-{}-{}", &hex[0..8], &hex[8..12], &hex[12..16], &hex[16..20], &hex[20..32])
-    };
+    minimax_chat_headers_phase(token, "initial")
+}
+
+/// 带轮次阶段的 MiniMax 请求头（`turn_phase` 由 [`minimax_turn_phase`] 推断）
+pub fn minimax_chat_headers_phase(token: &str, turn_phase: &str) -> Vec<(String, String)> {
+    // 官方 MiniMax Code 3.1.16（asar 逆向 @83487684 / @83421859 / @83487185）：
+    // - managed-login 模式下 `x-api-key` 是**占位符 `sk-xxx`**，真实凭据只走 Authorization。
+    //   旧实现把真实 token 也塞进 x-api-key，等于一个请求带两份真凭据，是很明显的非官方特征。
+    // - `X-Mavis-Session-Id` = 本地会话 id（每会话一个），不是账号终身常量。
+    //   这里按 token 在**进程内**生成并缓存一个随机会话 id，等价于「一次网关运行 = 一个本地会话」。
+    // - `X-Mavis-Turn-Phase` 随 agentic 轮次推进（initial / iteration / compaction）。
+    let session_id = minimax_session_id(token);
     vec![
         ("Authorization".to_string(), format!("Bearer {token}")),
-        ("x-api-key".to_string(), token.to_string()),
+        // 官方占位符（managed-login 的 apiKey 字段值）
+        ("x-api-key".to_string(), "sk-xxx".to_string()),
         ("anthropic-version".to_string(), "2023-06-01".to_string()),
+        // 官方 Electron 客户端走浏览器栈直连 Anthropic 兼容端点需要这个头
+        ("anthropic-dangerous-direct-browser-access".to_string(), "true".to_string()),
         ("Content-Type".to_string(), "application/json".to_string()),
         ("Accept".to_string(), "application/json".to_string()),
         ("User-Agent".to_string(), "MiniMaxAgent".to_string()),
         ("X-Mavis-Session-Id".to_string(), session_id),
         ("X-Mavis-Agent-Id".to_string(), "main".to_string()),
+        // 官方：String(new Date().getTimezoneOffset() * -60) —— 本机为 UTC+8 时即 28800
         ("X-Mavis-Timezone-Offset".to_string(), "28800".to_string()),
-        ("X-Mavis-Turn-Phase".to_string(), "initial".to_string()),
+        ("X-Mavis-Turn-Phase".to_string(), turn_phase.to_string()),
     ]
 }
 
+/// 每 token 一个**进程内稳定**的 MiniMax 会话 id（模拟官方「每会话一个 id」）。
+/// 用随机 UUID 而非 sha256(token)：后者是账号终身常量，反而暴露「同一 id 永不更换」。
+fn minimax_session_id(token: &str) -> String {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<HashMap<u64, String>>> = OnceLock::new();
+    let key = {
+        use sha2::{Digest, Sha256};
+        let d = Sha256::digest(token.as_bytes());
+        u64::from_be_bytes(d[..8].try_into().unwrap_or([0u8; 8]))
+    };
+    let map = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut g = map.lock().unwrap_or_else(|e| e.into_inner());
+    g.entry(key)
+        .or_insert_with(|| uuid::Uuid::new_v4().to_string())
+        .clone()
+}
+
 /// MiniMax Anthropic Messages body（Anthropic 格式与 OpenAI 不同：system 是顶层字段）
+///
+/// 2026-11-20 取证（MiniMax Code 3.1.16 asar 逆向）：官方 `system` 是
+/// **`[{type:"text", text}]` 块数组**，不是裸字符串；这里对齐（两种形态上游都接受，
+/// 但数组才是官方形状，字符串形态会被识别为非官方 SDK 产物）。
 pub fn minimax_chat_body(messages: &[Value], system: &str, model: &str, max_tokens: Option<u32>) -> Value {
-    // OpenAI 线格式 → Anthropic 线格式（tool_use / tool_result 必须按 Anthropic 规范成对出现，
-    // 否则上游直接 400：tool result's tool id() not found (2013)）
     let (msgs, sys) = to_anthropic_messages(messages, system);
     let mut body = json!({
         "model": model,
@@ -916,9 +1007,28 @@ pub fn minimax_chat_body(messages: &[Value], system: &str, model: &str, max_toke
         "stream": true,
     });
     if !sys.is_empty() {
-        body["system"] = json!(sys);
+        body["system"] = json!([{ "type": "text", "text": sys }]);
     }
     body
+}
+
+/// 按对话历史推断 MiniMax 官方 `X-Mavis-Turn-Phase`。
+///
+/// 官方取值 `initial / iteration / compaction`（managed Token Plan 的 agentic 多轮）：
+/// - 历史里最后一条是 `tool` 结果 → 正在工具循环里继续 → `iteration`
+/// - 否则新一轮用户输入 → `initial`
+/// 旧实现恒为 `initial`，agentic 多轮看起来永远像首轮。
+pub fn minimax_turn_phase(messages: &[Value]) -> &'static str {
+    let last_role = messages
+        .iter()
+        .rev()
+        .find_map(|m| m.get("role").and_then(|r| r.as_str()))
+        .unwrap_or("");
+    if last_role == "tool" {
+        "iteration"
+    } else {
+        "initial"
+    }
 }
 
 /// 解析 Anthropic SSE chunk → 事件列表（MiniMax/ZCode Anthropic 兼容通道返回 Anthropic 线格式）。
@@ -1050,7 +1160,15 @@ pub fn anthropic_frame_decode(data: &str) -> Vec<crate::upstream::StreamEvent> {
     parse_anthropic_chunk(&v)
 }
 
-/// Qoder 云端 chat body（agent_chat_generation 信封格式：model/messages/stream/session_id/request_id）
+/// Qoder 云端 chat body（agent_chat_generation 信封格式）。
+///
+/// 2026-11-20 从官方 worker（`qoder-worker-runtime.obf.mjs` @34387500 `qFr`）拿到真实
+/// 请求体字段集。旧实现只发 5 个字段（model/messages/stream/session_id/request_id），
+/// 与官方差 20 余项 —— 属于极易识别的结构差异。
+///
+/// 这里补齐**语义确定且无副作用**的那部分（固定值/派生值）；
+/// 形状未知的 `chat_context`/`parameters`/`patches`/`business`/`custom_context`
+/// 暂不臆造，避免上游校验失败。
 pub fn qoder_chat_body(messages: &[Value], model: &str) -> Value {
     let request_id = uuid::Uuid::new_v4().to_string();
     // messages 转为 OpenAI 线格式（string content 展平）
@@ -1064,11 +1182,24 @@ pub fn qoder_chat_body(messages: &[Value], model: &str) -> Value {
         msgs.push(mm);
     }
     json!({
-        "model": model,
-        "messages": msgs,
-        "stream": true,
-        "session_id": request_id,
+        // —— 官方固定/派生字段（对齐 qFr）——
         "request_id": request_id,
+        "chat_record_id": uuid::Uuid::new_v4().to_string(),
+        "request_set_id": uuid::Uuid::new_v4().to_string(),
+        "source_session_id": uuid::Uuid::new_v4().to_string(),
+        "session_id": request_id,
+        "stream": true,
+        "chat_task": "FREE_INPUT",
+        "is_reply": true,
+        "is_retry": false,
+        "source": 1,
+        "version": "3",
+        "agent_id": "agent_common",
+        "aliyun_user_type": "",
+        // —— 请求内容 ——
+        "model": model,
+        "model_config": { "key": model, "source": "official" },
+        "messages": msgs,
     })
 }
 
@@ -1105,6 +1236,9 @@ pub fn codearts_chat_body(messages: &[Value], system: &str, model: &str, max_tok
         "messages": msgs,
         "stream": true,
         "stream_options": { "include_usage": true },
+        // 官方 kernel 的 chat_core.rs 字段表里有 `tool_stream`（工具参数流式下发）：
+        // 缺它时上游走非流式工具参数路径，Agent 侧表现是「工具调用迟迟不来」。
+        "tool_stream": true,
     });
     if let Some(mt) = max_tokens {
         body["max_tokens"] = json!(mt);

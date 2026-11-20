@@ -563,19 +563,19 @@ async fn auto_tick(app: &tauri::AppHandle) -> Result<(), String> {
     let get = |k: &str, d: &str| s.store.get_setting(k, d).unwrap_or_else(|_| d.to_string());
     // 码道历史账号元数据修复（名字 / DPoP 私钥 / RT / 到期时间）
     repair_codearts_accounts(&s);
-    // 码道 STS 自动续期（与自动签到开关无关）：每 10 分钟巡检一次，
-    // 剩余有效期 < 10 分钟时按「客户端会话 → 客户端刷新等待 → STS RT 续期并回写」链路处理。
+    // 凭据自动续期（与自动签到开关无关，**全平台**）：每 10 分钟巡检一次。
+    // 旧实现只对码道做（`p.starts_with("codearts")` 前置判断），ZCode/Minimax/Trae/
+    // WorkBuddy/Qoder 只能等请求打中 401 再被动自愈 —— 用户会先看到一次失败。
+    // 现在：① 先把本机客户端最新登录态同步进库；② 对快过期账号走完整自愈链
+    // （扫描本机 → refresh_token → 拉起客户端等待刷新）。
     let now_secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
     let last_renew: i64 = get("last_renew_tick", "0").parse().unwrap_or(0);
     if now_secs - last_renew >= 600 {
         let _ = s.store.set_setting("last_renew_tick", &now_secs.to_string());
-        if let Ok(rows) = s.store.list_accounts() {
-            if rows.iter().any(|(p, _, _, _, _)| p.starts_with("codearts")) {
-                for (p, u, r) in s.renew_expiring(600).await {
-                    if r != "renewed" {
-                        let _ = s.store.set_setting("last_auto_error", &format!("{p}:{u} 凭据续期 {r}"));
-                    }
-                }
+        let _ = s.sync_from_local().await;
+        for (p, u, r) in s.renew_expiring(600).await {
+            if r != "renewed" {
+                let _ = s.store.set_setting("last_auto_error", &format!("{p}:{u} 凭据续期 {r}"));
             }
         }
     }

@@ -248,8 +248,12 @@ pub fn build_router(state: Arc<GatewayState>) -> AxumRouter {
 }
 
 /// 启动网关监听（Tauri setup / CLI serve 子命令调用）
+///
+/// 同时拉起**后台维护任务**（本机登录态同步 + 全平台自动续期），
+/// 使凭据在过期前就被续上，而不是等请求打中 401 才被动自愈。
 pub async fn serve(state: Arc<GatewayState>, addr: SocketAddr) -> anyhow::Result<()> {
-    let app = build_router(state);
+    let app = build_router(state.clone());
+    spawn_background_maintenance(state);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
     Ok(())
@@ -281,128 +285,81 @@ async fn list_platforms(State(st): State<Arc<GatewayState>>) -> Response {
 /// ① trae/workbuddy/qoder：先重扫本机登录态，失败再走 refresh 链（refresh_token）；
 /// ② minimax/zcode/codearts：读客户端存储；zcode/码道 token 未变时自动拉起客户端等待刷新。
 /// 返回 true = 已拿到新凭据。
+/// 凭据自愈：委托给 `Service::heal_cred`（全平台统一链路）：
+/// ① 扫描本机登录态 → ② refresh_token 换新 → ③ 拉起官方客户端等其刷新后再扫。
+///
+/// 旧实现按平台各写一套（只覆盖 minimax/trae/workbuddy/qoder/zcode/codearts），
+/// 且与后台巡检重复；现在收敛到 core，网关的**请求级自愈**与**后台自动续期**共用同一份逻辑。
+/// 返回 true = 已拿到新凭据（调用方据此重试请求）。
 async fn refresh_creds_from_local(st: &Arc<GatewayState>, platform: Platform, stale: &Cred) -> bool {
     use credit_core::service::Service;
     let svc = Service { store: st.store.clone() };
-    match platform {
-        Platform::Minimax => {
-            if svc.import_account("minimax", false).await.is_ok() {
-                return true;
-            }
-            launch_wait_and_import(st, platform, "minimax", false).await
-        }
-        // Trae（国内/企业/国际）、WorkBuddy、Qoder：本地登录态扫描 + refresh_token 刷新链，
-        // 均失败（本地 token 也过期）→ 拉起本机客户端等它刷新后再扫
-        Platform::Trae | Platform::TraeEnterprise | Platform::TraeIntl
-        | Platform::WorkBuddy | Platform::WorkBuddyIntl | Platform::Qoder => {
-            let (provider, intl) = match platform {
-                Platform::Trae | Platform::TraeEnterprise => ("trae", false),
-                Platform::TraeIntl => ("trae", false), // 本地扫描只识别国内版；国际版走 refresh
-                Platform::WorkBuddyIntl => ("workbuddy", true),
-                Platform::WorkBuddy => ("workbuddy", false),
-                _ => ("qoder", false),
-            };
-            if svc.import_account(provider, intl).await.is_ok() {
-                return true;
-            }
-            // 扫描失败（如国际版）→ 走 refresh_token 链
-            if svc.refreshed_cred(&stale.provider, &stale.uid, stale).await.is_ok() {
-                return true;
-            }
-            launch_wait_and_import(st, platform, provider, intl).await
-        }
-        Platform::Zcode => {
-            let stale_token = stale.token.clone();
-            // 1) 本地磁盘 token 已变化（客户端在线轮换过）→ 直接导入
-            if let Some(l) = credit_core::adapters::zcode_local::read_live_auth() {
-                if l.access_token != stale_token {
-                    return svc.import_account("zcode", false).await.is_ok();
-                }
-            }
-            // 2) token 仍是旧的 → 拉起本机客户端，等它自动刷新再导入
-            let old_fp = credit_core::adapters::zcode_local::token_fingerprint();
-            match credit_core::adapters::zcode_local::launch_client() {
-                Some(exe) => eprintln!("[gateway] zcode token 过期，已拉起客户端 {}，等待其刷新…", exe.display()),
-                None => {
-                    eprintln!("[gateway] zcode token 过期且本机未安装 ZCode 客户端");
-                    return false;
-                }
-            }
-            let wait = tokio::task::spawn_blocking(move || {
-                credit_core::adapters::zcode_local::wait_for_token_change(old_fp.as_deref(), std::time::Duration::from_secs(15))
-            }).await.ok().flatten();
-            match wait {
-                Some(_) => svc.import_account("zcode", false).await.is_ok(),
-                None => {
-                    eprintln!("[gateway] zcode 客户端 15s 内未刷新 token（可能需要在客户端里重新登录）");
-                    false
-                }
-            }
-        }
+    let provider = platform.account_provider();
+    // 平台名 → provider 字符串（企业/国际版有独立 provider 名）
+    let provider = match platform {
+        Platform::TraeEnterprise => "trae",
+        Platform::TraeIntl => "trae",
+        Platform::WorkBuddyIntl => "workbuddy-intl",
+        Platform::Qoder => "qoder",
+        Platform::Zcode => "zcode",
         Platform::CodeArts => {
-            // 码道续期链：客户端会话已变 → 重新导入；客户端在跑 → 等它刷新；
-            // 否则网关用 STS RT 自己续期并回写客户端 secretStorage（见 Service::ensure_codearts_fresh）
-            match svc.ensure_codearts_fresh(stale).await {
-                Ok(_) => true,
-                Err(e) => {
-                    eprintln!("[gateway] 码道凭据续期失败: {e}");
-                    false
-                }
-            }
+            if stale.provider == "codearts-desktop" { "codearts-desktop" } else { "codearts" }
+        }
+        _ => provider,
+    };
+    match svc.heal_cred(provider, stale).await {
+        Some(c) => {
+            eprintln!("[gateway] {} 凭据已自愈（provider={provider} uid={}）", platform.as_str(), c.uid);
+            true
+        }
+        None => {
+            eprintln!("[gateway] {} 凭据自愈失败（本机未安装客户端或需重新登录），provider={provider}", platform.as_str());
+            false
         }
     }
 }
 
-/// 拉起本机平台客户端（trae/workbuddy/qoder/minimax），等它自动刷新登录态
-/// （凭据指纹变化）后重新扫描导入。进程拉起与轮询在线程池做，不阻塞异步运行时。
-async fn launch_wait_and_import(st: &Arc<GatewayState>, platform: Platform, provider: &str, intl: bool) -> bool {
-    // 1) 旧指纹（可能涉及解密/DPAPI，放线程池）
-    let old_fp = tokio::task::spawn_blocking(move || match platform {
-        Platform::Trae | Platform::TraeEnterprise | Platform::TraeIntl => credit_core::adapters::trae_local::token_fingerprint(),
-        Platform::WorkBuddy | Platform::WorkBuddyIntl => credit_core::adapters::wb_local::session_fingerprint(intl),
-        Platform::Qoder => credit_core::adapters::qoder_local::token_fingerprint(intl),
-        Platform::Minimax => credit_core::adapters::minimax_local::token_fingerprint(),
-        _ => None,
-    }).await.ok().flatten();
-    // 2) 拉起本机客户端
-    let exe = match platform {
-        Platform::Trae | Platform::TraeEnterprise | Platform::TraeIntl => credit_core::adapters::trae_local::launch_client(),
-        Platform::WorkBuddy | Platform::WorkBuddyIntl => credit_core::adapters::wb_local::launch_client(),
-        Platform::Qoder => credit_core::adapters::qoder_local::launch_client(),
-        Platform::Minimax => credit_core::adapters::minimax_local::launch_client(),
-        _ => None,
-    };
-    match exe {
-        Some(exe) => eprintln!("[gateway] {provider} 凭据过期，已拉起本机客户端 {}，等待其刷新…", exe.display()),
-        None => {
-            eprintln!("[gateway] {provider} 凭据过期且本机未安装客户端");
-            return false;
+/// 网关后台维护任务：定期「扫描本机登录态 + 自动续期」（**全平台**）。
+///
+/// 为什么要做后台：
+/// - 各官方客户端会自己按周期轮换 token，但**不会通知网关**；不主动同步的话，
+///   网关库里的凭据会悄悄过期，表现就是「用着用着突然 401 / 本轮运行失败」。
+/// - 旧实现只有码道有后台续期（且只在桌面端 tick 里），ZCode/Minimax/Trae/WorkBuddy/Qoder
+///   完全靠请求打中 401 后再被动自愈 —— 用户会先看到一次失败。
+///
+/// 现在：每 `refreshMinutes`（默认 60，最小 5 分钟）执行一次
+/// ① `sync_from_local`：把本机客户端最新登录态同步进库（便宜，纯本地读）；
+/// ② `renew_expiring`：对快过期的账号走完整自愈链（含 refresh / 拉起客户端）。
+///
+/// 首轮延迟 30s 启动，避免与启动期的账号导入抢资源。
+pub fn spawn_background_maintenance(st: Arc<GatewayState>) {
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        loop {
+            let minutes = st.store.get_setting("refreshMinutes", "60").ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(60)
+                .max(5);
+            {
+                use credit_core::service::Service;
+                let svc = Service { store: st.store.clone() };
+                // ① 同步本机登录态（客户端轮换过的 token 立刻进库）
+                let synced = svc.sync_from_local().await;
+                let changed = synced.iter().filter(|(_, _, r)| r == "synced").count();
+                if changed > 0 {
+                    eprintln!("[maintenance] 本机登录态同步完成：{changed} 个平台");
+                }
+                // ② 快过期账号自动续期（提前 10 分钟；覆盖全部平台）
+                let renewed = svc.renew_expiring(600).await;
+                for (p, u, r) in &renewed {
+                    if r != "renewed" {
+                        eprintln!("[maintenance] {p}:{u} 自动续期未成功（{r}），请求命中时仍会再自愈一次");
+                    }
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(minutes * 60)).await;
         }
-    }
-    // 3) 等客户端刷新凭据（最多 15s）
-    let ok = tokio::task::spawn_blocking(move || match platform {
-        Platform::Trae | Platform::TraeEnterprise | Platform::TraeIntl => {
-            credit_core::adapters::trae_local::wait_for_token_change(old_fp.as_deref(), std::time::Duration::from_secs(15)).is_some()
-        }
-        Platform::WorkBuddy | Platform::WorkBuddyIntl => {
-            credit_core::adapters::wb_local::wait_for_session_change(intl, old_fp.as_deref(), std::time::Duration::from_secs(15)).is_some()
-        }
-        Platform::Qoder => {
-            credit_core::adapters::qoder_local::wait_for_token_change(intl, old_fp.as_deref(), std::time::Duration::from_secs(15)).is_some()
-        }
-        Platform::Minimax => {
-            credit_core::adapters::minimax_local::wait_for_token_change(old_fp.as_deref(), std::time::Duration::from_secs(15)).is_some()
-        }
-        _ => false,
-    }).await.unwrap_or(false);
-    if !ok {
-        eprintln!("[gateway] {provider} 客户端 15s 内未刷新凭据（可能需要在客户端里重新登录）");
-        return false;
-    }
-    // 4) 重新扫描导入
-    use credit_core::service::Service;
-    let svc = Service { store: st.store.clone() };
-    svc.import_account(provider, intl).await.is_ok()
+    });
 }
 
 /// 拉取一个平台的模型列表（含码道双通道兜底）
@@ -423,6 +380,11 @@ async fn fetch_models_for(st: &Arc<GatewayState>, platform: Platform, raw: &str)
     let mut cred = pool.first().cloned();
     if cred.is_none() {
         cred = fallback.first().cloned();
+    }
+    // ZCode 的模型目录是静态清单（不依赖凭据）：没有账号/只剩 API Key 时也要能列出模型，
+    // 否则客户端在「仅配 API Key」的情况下会看不到任何 ZCode 模型。
+    if cred.is_none() && platform == Platform::Zcode {
+        return upstream::zcode_fetch_models(&Default::default()).await.ok();
     }
     let cred = cred?;
     let desktop_channel = cred.provider == "codearts-desktop";
@@ -526,28 +488,118 @@ async fn refresh_creds_for(st: &Arc<GatewayState>, platform: Platform, stale: &C
     }
 }
 
-/// 构建当前请求平台的模型目录（严格跟随账号路由页「请求平台」下拉框，
-/// 只返回该平台的模型 —— 不再聚合其它平台）。
+/// 模型条目 → OpenAI /v1/models 行
+fn model_entry(m: &upstream::ModelInfo, raw: &str, id: &str) -> Value {
+    json!({
+        "id": id,
+        "object": "model",
+        "created": 0,
+        "owned_by": raw,
+        "platform": raw,
+        "raw_model": m.id,
+        "name": if id == m.id { m.name.clone() } else { format!("{} ({})", m.name, raw) },
+        "context_window": m.context_window,
+        "max_tokens": m.max_tokens,
+        "credit_multiplier": m.credit_multiplier,
+    })
+}
+
+/// 最近实际用过的模型 (platform, 裸 model id)，按最近使用排序去重。
+///
+/// 来源：网关请求日志（本身记录了解析后的平台与裸模型 id），**不需要再打上游**。
+/// 用途：切平台/切模型后，客户端（pi-ai / DSH / Cline）做上下文压缩时会按
+/// 「上一个请求的模型」回查自己 provider 的模型配置；若该模型已不在 /v1/models 里，
+/// 就会直接报 `provider "local" has no configured model "xxx"` 整轮失败。
+fn recent_used_models(st: &Arc<GatewayState>, limit: usize) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    let Ok(rows) = st.store.list_gateway_logs(120) else { return out };
+    for r in rows {
+        if r.model.is_empty() || r.platform.is_empty() {
+            continue;
+        }
+        // 日志里的 model 一般是裸 id；兼容历史里可能存过 "平台/模型" 形式
+        let model_id = r.model.split_once('/').map(|(_, m)| m.to_string()).unwrap_or_else(|| r.model.clone());
+        if model_id.is_empty() {
+            continue;
+        }
+        let pair = (r.platform.clone(), model_id);
+        if !out.contains(&pair) {
+            out.push(pair);
+        }
+        if out.len() >= limit {
+            break;
+        }
+    }
+    out
+}
+
+/// 构建 /v1/models 目录：**只列当前平台的模型**，另外附带极少量「最近实际用过」的旧模型。
+///
+/// ## 为什么会有「最近用过」这一小撮
+///
+/// 旧实现切平台后清单整体换掉，客户端把 provider 模型清单当配置，于是出现：
+///
+/// > Cannot switch to local/dfmodel: context compaction failed:
+/// > pi-ai provider "local" has no configured model "glm-5.3-flash"
+///
+/// 即切换模型前的**上下文压缩**要按上一个请求的模型（`glm-5.3-flash`）回查配置，
+/// 而它已随平台切换从清单里消失。
+///
+/// 这里不再聚合全平台（那样清单会有上百条、且混入用户用不到的模型），
+/// 只把**请求日志里最近真正用过的模型**补进来（通常 0~2 条，最多 5 条），
+/// 既保持"看到的就是当前平台模型"，又保证切换瞬间旧模型 id 仍然可解析。
 async fn build_models_catalog(st: &Arc<GatewayState>, current_raw: &str) -> serde_json::Value {
-    let mut data = Vec::new();
-    if let Some(platform) = Platform::parse(current_raw) {
-        if let Some(models) = fetch_models_for(st, platform, current_raw).await {
+    let strict = st.store.get_setting("gatewayStrict", "1").ok().map(|v| v == "1").unwrap_or(true);
+    let current = Platform::parse(current_raw);
+
+    let mut data: Vec<Value> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    // ① 当前平台模型（主体）
+    if let Some(p) = current {
+        if let Some(models) = fetch_models_for(st, p, current_raw).await {
             for m in models {
-                data.push(json!({
-                    "id": m.id.clone(),
-                    "object": "model",
-                    "created": 0,
-                    "owned_by": current_raw,
-                    "platform": current_raw,
-                    "raw_model": m.id,
-                    "name": m.name,
-                    "context_window": m.context_window,
-                    "max_tokens": m.max_tokens,
-                    "credit_multiplier": m.credit_multiplier,
-                }));
+                if seen.insert(m.id.clone()) {
+                    data.push(model_entry(&m, current_raw, &m.id));
+                }
             }
         }
     }
+
+    // ② 最近用过、且不属于当前平台的模型（兜底上下文压缩，最多 5 条）
+    //    严格模式（锁定单平台）下不加：否则客户端会选到跨平台模型然后被 403。
+    if !strict {
+        for (plat_raw, model_id) in recent_used_models(st, 5) {
+            if plat_raw == current_raw || !seen.insert(model_id.clone()) {
+                continue;
+            }
+            // 元数据尽量从所属平台目录取（带 context_window 便于客户端估算压缩阈值）；
+            // 拉不到就给空，客户端会用默认窗口，不影响可用性。
+            let mut info = upstream::ModelInfo {
+                id: model_id.clone(),
+                name: model_id.clone(),
+                context_window: None,
+                max_tokens: None,
+                credit_multiplier: None,
+                supports_images: None,
+            };
+            if let Some(p) = Platform::parse(&plat_raw) {
+                let got = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    fetch_models_for(st, p, &plat_raw),
+                ).await;
+                if let Ok(Some(ms)) = got {
+                    if let Some(found) = ms.into_iter().find(|m| m.id == model_id) {
+                        info = found;
+                    }
+                }
+            }
+            let mut e = model_entry(&info, &plat_raw, &model_id);
+            e["recent"] = json!(true);
+            data.push(e);
+        }
+    }
+
     json!({ "object": "list", "data": data })
 }
 
@@ -586,7 +638,7 @@ async fn context_usage(
     })).into_response()
 }
 
-/// GET /v1/models：当前请求平台的模型目录（60s 缓存，切平台立即重建）
+/// GET /v1/models：模型目录（60s 缓存；切平台/切 strict 立即重建）
 async fn list_models(
     State(st): State<Arc<GatewayState>>,
     headers: axum::http::HeaderMap,
@@ -597,18 +649,44 @@ async fn list_models(
     // 60s 缓存（外部 Agent 会频繁拉模型列表；上游拉取含网络请求与 sidecar spawn）。
     // 缓存带平台键：切换请求平台后立即重建，不会把旧平台清单吐给新平台客户端。
     let current_raw = st.router.current_platform_raw();
+    let cache_key = current_raw.clone();
     if let Ok(g) = st.models_cache.lock() {
-        if let Some((at, plat, cached)) = &*g {
-            if at.elapsed() < std::time::Duration::from_secs(60) && plat == &current_raw {
+        if let Some((at, key, cached)) = &*g {
+            if at.elapsed() < std::time::Duration::from_secs(60) && key == &cache_key {
                 return Json(cached.clone()).into_response();
             }
         }
     }
-    let catalog = build_models_catalog(&st, &current_raw).await;
+    let mut catalog = build_models_catalog(&st, &current_raw).await;
+    // 与上次清单合并：**仅同一平台内**兜底——上游临时拉取失败（token 过期/网络抖动）时，
+    // 不让模型从清单里"消失"（客户端看不到正在用的模型会直接报错）。
+    // 切换平台时不合并，保证用户看到的始终是当前平台的模型。
+    if let Ok(g) = st.models_cache.lock() {
+        if let Some((_, prev_key, prev)) = &*g {
+            if prev_key == &cache_key {
+                merge_catalog_missing(&mut catalog, prev);
+            }
+        }
+    }
     if let Ok(mut g) = st.models_cache.lock() {
-        *g = Some((Instant::now(), current_raw, catalog.clone()));
+        *g = Some((Instant::now(), cache_key, catalog.clone()));
     }
     Json(catalog).into_response()
+}
+
+/// 把上一次清单里有、本次没有的模型补回来（按 id 去重）。
+fn merge_catalog_missing(new: &mut Value, prev: &Value) {
+    let Some(new_arr) = new.get_mut("data").and_then(|d| d.as_array_mut()) else { return };
+    let Some(prev_arr) = prev.get("data").and_then(|d| d.as_array()) else { return };
+    let present: std::collections::HashSet<String> = new_arr.iter()
+        .filter_map(|m| m.get("id").and_then(|i| i.as_str()).map(|s| s.to_string()))
+        .collect();
+    for m in prev_arr {
+        let Some(id) = m.get("id").and_then(|i| i.as_str()) else { continue };
+        if !present.contains(id) {
+            new_arr.push(m.clone());
+        }
+    }
 }
 
 // ---------- 长上下文截断 ----------
@@ -892,7 +970,21 @@ async fn chat_completions(
     }
     let creds: Vec<Cred> = match pinned_account {
         Some(c) => vec![c],
-        None => st.router.accounts_for(platform),
+        None => {
+            let mut v = st.router.accounts_for(platform);
+            // ZCode 例外：只要本机配了智谱开放平台 API Key（ZCODE_API_KEY 等环境变量），
+            // 不依赖 ZCode 客户端账号也能用（API Key 通道无渠道风控，是最稳的一条）。
+            if v.is_empty() && platform == Platform::Zcode && upstream::zcode_env_api_key().is_some() {
+                v.push(Cred {
+                    provider: "zcode".into(),
+                    uid: "api-key".into(),
+                    name: "ZCode (API Key)".into(),
+                    meta: json!({}),
+                    ..Default::default()
+                });
+            }
+            v
+        }
     };
     if creds.is_empty() {
         return err_response(StatusCode::SERVICE_UNAVAILABLE, "no_account",
@@ -932,14 +1024,34 @@ async fn chat_completions(
             // 凭据自愈：minimax/zcode/码道的 token 由本机客户端持续轮换，401 时重读客户端存储
             // （token 未变则自动拉起客户端并等其刷新）再试一次
             if let Err((code, msg)) = &outcome {
-                let is_auth = code == "auth" || msg.contains("401") || msg.contains("Unauthorized")
-                    || msg.contains("令牌已过期") || msg.contains("AUTH:") || msg.contains("1806")
-                    || msg.contains("APIG.0602");
-                if is_auth && !healed && matches!(platform,
+                // 凭据失效识别（实测各平台真实文案，见网关日志/数据库）：
+                // - 码道过期：`APIG.0301 decrypt token fail` / `APIG.0602 security token has expired` /
+                //   `STS5.1806 refresh token 已被使用`
+                // - 通用 401 / Unauthorized / invalid access token / token expired
+                // - MiniMax/Trae/WorkBuddy 的 登录失效 / 令牌已过期
+                let is_auth = code == "auth"
+                    || msg.contains("401")
+                    || msg.contains("403")
+                    || msg.contains("Unauthorized")
+                    || msg.contains("令牌已过期")
+                    || msg.contains("登录已失效")
+                    || msg.contains("AUTH:")
+                    || msg.contains("1806")
+                    || msg.contains("APIG.0301")
+                    || msg.contains("APIG.0602")
+                    || msg.contains("invalid access token")
+                    || msg.contains("token has expired")
+                    || msg.contains("token expired")
+                    || msg.contains("decrypt token fail");
+                // 走智谱开放平台 API Key 通道时不触发「客户端令牌自愈」：
+                // 该通道的 401 是 API Key 本身无效，重扫本机/拉起 ZCode 客户端都无济于事。
+                let api_key_channel = platform == Platform::Zcode && upstream::zcode_env_api_key().is_some();
+                if is_auth && !healed && !api_key_channel && matches!(platform,
                     Platform::Minimax | Platform::Zcode | Platform::CodeArts
                     | Platform::Trae | Platform::TraeEnterprise | Platform::TraeIntl
                     | Platform::WorkBuddy | Platform::WorkBuddyIntl | Platform::Qoder) {
                     healed = true;
+                    // 请求级自愈：扫描本机 → refresh_token → 拉起客户端等刷新（用户已在等待，可以等）
                     if refresh_creds_from_local(&st, platform, &attempt_cred).await {
                         let rows = st.store.list_accounts().unwrap_or_default();
                         // 自愈后凭据可能换了 uid（如 ZCode 重登）——优先取 token 与旧凭据不同的那行，
@@ -984,11 +1096,16 @@ async fn chat_completions(
                 }
                 Err((code, msg)) => {
                     let is_channel_block = msg.contains("11128") || msg.contains("Illegal API invocation");
+                    // 智谱开放平台 API Key 通道的失败是「Key 本身」的问题，
+                    // 与 ZCode 账号无关：既不标账号 failed、也不做换号/退避重试（重试必然同样失败）。
+                    let api_key_failure = platform == Platform::Zcode
+                        && msg.contains("ZCode(API Key)");
                     // 额度耗尽也视作可切换（各平台错误文案不一）
                     let quota_exhausted = msg.contains("额度") || msg.contains("不足") || msg.contains("exhaust")
                         || msg.contains("quota") || msg.contains("credit") || msg.contains("insufficient")
                         || msg.contains("429") || msg.contains("rate_limit");
-                    let failover_worthy = code == "auth" || code == "rate" || code == "network" || code == "upstream" || quota_exhausted;
+                    let failover_worthy = !api_key_failure
+                        && (code == "auth" || code == "rate" || code == "network" || code == "upstream" || quota_exhausted);
                     if failover_worthy && !is_channel_block {
                         // 渠道拦截不算账号故障（账号本身正常，别标 failed）
                         let _ = st.store.update_account_status(&attempt_cred.provider, &attempt_cred.uid, "failed", Some(msg.as_str()));
@@ -1013,6 +1130,8 @@ async fn chat_completions(
                         || msg.contains("APIG.0602");
                     if auth_like {
                         final_msg = match platform {
+                            // API Key 通道的 401 与客户端令牌无关，不要加误导性提示
+                            Platform::Zcode if upstream::zcode_env_api_key().is_some() => final_msg,
                             Platform::Zcode => format!("{msg} | 已自动同步并尝试拉起本机 ZCode 客户端刷新令牌；若仍失败，请在 ZCode 客户端重新登录，再点账号管理的「扫描本机」"),
                             Platform::CodeArts => format!("{msg} | 已自动同步并尝试拉起本机码道客户端刷新 STS；若仍失败，请在码道客户端重新登录，再点账号管理的「扫描本机」"),
                             _ => final_msg,
@@ -1038,9 +1157,92 @@ async fn chat_completions(
     err_response(StatusCode::BAD_GATEWAY, &code, &msg)
 }
 
-/// 单账号派发：返回上游事件流（错误 → (code, msg) 供 failover）
+/// 单账号派发：先建流（失败 → (code, msg) 供换号 failover），
+/// 再给流加上「中途断开自动重试」（见 upstream::retry_stream_with）。
+///
+/// 为什么分两层：
+/// - **建流阶段**失败（HTTP 401/400/TM.00001041…）必须返回 Err，才能触发 chat_completions
+///   里的换号 / 换平台 / 退避重试；
+/// - **流已建立后中途断开**（`error decoding response body`）发生在 Ok 之后，
+///   换号管不到它，只能靠流内部重试。且只有「尚未产出任何内容」时才可安全重放。
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_stream(
+    st: &Arc<GatewayState>,
+    platform: Platform,
+    cred: &Cred,
+    model: &str,
+    messages: &[Value],
+    system: &str,
+    max_tokens: Option<u32>,
+    reasoning_effort: Option<&str>,
+    tools: &[Value],
+    tool_choice: Option<&Value>,
+) -> Result<EventStream, (String, String)> {
+    // 按账号并发闸门：把并发压到「像人手动用」的量级。
+    // 理由：上游风控除了看请求指纹，还看**行为分布**——常驻进程瞬间打出十几个并发，
+    // 与官方客户端一次一两轮的节奏差异极大，是最廉价可判的异常信号。
+    // 可在设置里用 gatewayConcurrency 调整（默认 6；0 = 不限，恢复旧行为）。
+    let permit = acquire_account_permit(st, cred).await;
+    let first = dispatch_once(st, platform, cred, model, messages, system, max_tokens, reasoning_effort, tools, tool_choice).await?;
+    // 为中途断开的重试准备 owned 副本（只在重试时克隆，正常路径零开销）
+    let st2 = st.clone();
+    let cred2 = cred.clone();
+    let model2 = model.to_string();
+    let messages2 = messages.to_vec();
+    let system2 = system.to_string();
+    let reasoning2 = reasoning_effort.map(|s| s.to_string());
+    let tools2 = tools.to_vec();
+    let tool_choice2 = tool_choice.cloned();
+    Ok(Box::pin(upstream::retry_stream_with(first, move || {
+        let st = st2.clone();
+        let cred = cred2.clone();
+        let model = model2.clone();
+        let messages = messages2.clone();
+        let system = system2.clone();
+        let reasoning = reasoning2.clone();
+        let tools = tools2.clone();
+        let tool_choice = tool_choice2.clone();
+        Box::pin(async move {
+            dispatch_once(&st, platform, &cred, &model, &messages, &system, max_tokens, reasoning.as_deref(), &tools, tool_choice.as_ref())
+                .await
+                .map_err(|(_code, msg)| msg)
+        }) as upstream::StreamBoxFuture
+    })
+    .map(move |ev| {
+        // 许可随流存活：流读完/被丢弃前不释放槽位
+        let _ = &permit;
+        ev
+    })))
+}
+
+/// 按账号取并发许可（`gatewayConcurrency`，默认 6；0 = 不限，返回 None）。
+/// key 用 provider:uid —— 同一上游账号的并发才需要合并计算。
+async fn acquire_account_permit(st: &Arc<GatewayState>, cred: &Cred) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    let permits: usize = st.store.get_setting("gatewayConcurrency", "6").ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(6);
+    if permits == 0 {
+        return None;
+    }
+    let sem = account_semaphore(&format!("{}:{}", cred.provider, cred.uid), permits);
+    sem.acquire_owned().await.ok()
+}
+
+/// 按 key 的在途请求信号量（跨请求共享，惰性创建）
+fn account_semaphore(key: &str, permits: usize) -> Arc<tokio::sync::Semaphore> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static MAP: OnceLock<Mutex<HashMap<String, Arc<tokio::sync::Semaphore>>>> = OnceLock::new();
+    let map = MAP.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut g = map.lock().unwrap_or_else(|e| e.into_inner());
+    g.entry(key.to_string())
+        .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(permits)))
+        .clone()
+}
+
+/// 单账号派发一次：返回已建立的上游事件流（错误 → (code, msg) 供 failover）
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_once(
     st: &Arc<GatewayState>,
     platform: Platform,
     cred: &Cred,
@@ -1120,30 +1322,14 @@ async fn dispatch_stream(
             let desktop = cred.provider == "codearts-desktop";
             let mut body = crate::protocol::codearts_chat_body(messages, system, model, max_tokens, reasoning_effort);
             crate::protocol::attach_openai_tools(&mut body, tools, tool_choice);
-            // 码道上游限制「并发会话数 ≤ 3」：按账号做并发闸门（最多 2 个在途），其余排队，
-            // 避免 Agent 并发调用时被打满返回 TM.00001041（表现为请求失败/断掉）
-            let sem = account_semaphore(&format!("codearts:{}", cred.uid), 2);
-            let permit = sem.acquire_owned().await.map_err(|_| ("upstream".to_string(), "codearts 并发闸门已关闭".to_string()))?;
-            let events = upstream::codearts_chat_stream(cred, body, desktop).await.map_err(|e| ("upstream".to_string(), e))?;
-            // permit 随流存活：流读完/断开前不释放槽位
-            Ok(Box::pin(futures_util::StreamExt::map(events, move |ev| {
-                let _ = &permit;
-                ev
-            })))
+            // 码道并发治理**下沉到 upstream::codearts_chat_stream**（会话池）：
+            // 上游「并发会话数 ≤ 3」（TM.00001041）统计的是**已建立会话总数**且不自动释放，
+            // 因此 session id 必须有限可复用 —— 每请求唯一会导致会话配额泄漏、越用越死。
+            // 会话池按账号维护 3 个稳定槽位（每槽位单飞），既不超上游上限，
+            // 也不会出现同会话并发 turn 被掐流。此处不再叠加信号量（避免双重限流）。
+            upstream::codearts_chat_stream(cred, body, desktop).await.map_err(|e| ("upstream".to_string(), e))
         }
     }
-}
-
-/// 按账号的在途请求信号量（key = provider:uid）。用于上游有并发上限的平台（如码道 3 并发）。
-fn account_semaphore(key: &str, permits: usize) -> Arc<tokio::sync::Semaphore> {
-    use std::collections::HashMap;
-    use std::sync::{Mutex, OnceLock};
-    static MAP: OnceLock<Mutex<HashMap<String, Arc<tokio::sync::Semaphore>>>> = OnceLock::new();
-    let map = MAP.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut g = map.lock().unwrap();
-    g.entry(key.to_string())
-        .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(permits)))
-        .clone()
 }
 
 /// 流式请求的收尾守卫：无论流正常结束还是被客户端中断，都回填耗时/结果到请求日志。
@@ -1180,9 +1366,25 @@ impl Drop for StreamGuard {
 /// 处理原则：`""` 前一个有效字符是 `: , [ {` 时是合法的空字符串，保留；
 /// 若前一个字符是数字/true/false/null/`}`/`]`（完整值后紧跟引号）说明两个引号都是伪影，删掉；
 /// 其它情况（字符串结尾多一个引号）删掉一个。校验通过即返回，修不好则原样返回。
+///
+/// 另处理两种残缺形态（上游中途掐流时，收尾 flush 的是残缺分片）：
+/// - 孤立引号：`"`（客户端报 "Unexpected non-whitespace character after JSON"）→ 空参数 `{}`；
+/// - 残缺 JSON：首字符不是 `{`/`[`（如截断的 `"city`）→ 空参数 `{}`——
+///   与其给客户端一个必然解析失败的参数，不如给空参数让工具侧返回可读错误。
 fn sanitize_tool_arguments(raw: &str) -> String {
     let raw = raw.trim();
-    if raw.is_empty() || serde_json::from_str::<serde_json::Value>(raw).is_ok() {
+    // 残缺/伪影兜底：孤立引号或非对象开头的残片 → 空参数
+    if raw.is_empty() || raw == "\"" || raw == "\"\"" {
+        return "{}".to_string();
+    }
+    if !raw.starts_with('{') && !raw.starts_with('[') {
+        // 完整 JSON 字符串（如 "\"北京\""）仍尝试修复；明显残片直接置空
+        if serde_json::from_str::<serde_json::Value>(raw).is_ok() {
+            return raw.to_string();
+        }
+        return "{}".to_string();
+    }
+    if serde_json::from_str::<serde_json::Value>(raw).is_ok() {
         return raw.to_string();
     }
     let mut cur = raw.to_string();
@@ -1228,6 +1430,26 @@ fn sanitize_tool_arguments(raw: &str) -> String {
     } else {
         raw.to_string()
     }
+}
+
+/// 将缓冲的工具调用参数 flush 成 ToolCall 事件（结束帧/收尾流共用）。
+/// 残缺参数（掐流时缓冲区只剩残片）经 sanitize 修复为合法 JSON 后才下发，
+/// 保证客户端永远拿到可解析的 tool_calls。
+fn flush_tool_buf(buf: &mut ToolCallBuf, out: &mut Vec<StreamEvent>) {
+    for (index, (_tid, _name, args)) in buf.iter() {
+        let args_str = if args.trim().is_empty() {
+            "{}".to_string()
+        } else {
+            sanitize_tool_arguments(args)
+        };
+        out.push(StreamEvent::ToolCall {
+            index: *index,
+            id: None,
+            name: None,
+            arguments: Some(args_str),
+        });
+    }
+    buf.clear();
 }
 
 /// SSE 流式响应（OpenAI chat.completion.chunk 线格式）
@@ -1363,18 +1585,20 @@ fn stream_response(
                     return futures_util::stream::iter(out);
                 }
                 if !tool_flushed2.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                    for (index, (_tid, _name, args)) in tool_buf2.lock().unwrap().iter() {
-                        let args_str = if args.trim().is_empty() {
-                            "{}".to_string()
-                        } else {
-                            sanitize_tool_arguments(args)
-                        };
-                        // 只补参数（id/name 已在前面的分片下发，重复会拼成 readread）
-                        let tc = json!({ "index": index, "function": { "arguments": args_str } });
-                        out.push(Ok(Event::default().data(json!({
-                            "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
-                            "choices": [{ "index": 0, "delta": { "tool_calls": [tc] }, "finish_reason": null }],
-                        }).to_string())));
+                    // 只补参数（id/name 已在前面的分片下发，重复会拼成 readread）；
+                    // 共享 flush：残缺参数（掐流残片）经 sanitize 修复后才下发
+                    let mut buf = tool_buf2.lock().unwrap();
+                    let mut flushed: Vec<StreamEvent> = Vec::new();
+                    flush_tool_buf(&mut buf, &mut flushed);
+                    for ev in flushed {
+                        if let StreamEvent::ToolCall { index, arguments, .. } = ev {
+                            let args_str = arguments.unwrap_or_else(|| "{}".into());
+                            let tc = json!({ "index": index, "function": { "arguments": args_str } });
+                            out.push(Ok(Event::default().data(json!({
+                                "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
+                                "choices": [{ "index": 0, "delta": { "tool_calls": [tc] }, "finish_reason": null }],
+                            }).to_string())));
+                        }
                     }
                 }
                 let mut fr = normalize_finish(&finish);
@@ -1409,17 +1633,19 @@ fn stream_response(
     let close = futures_util::stream::once(async move {
         let mut out: Vec<Result<Event, std::convert::Infallible>> = Vec::new();
         if !tool_flushed.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            for (index, (_tid, _name, args)) in tool_buf.lock().unwrap().iter() {
-                let args_str = if args.trim().is_empty() {
-                    "{}".to_string()
-                } else {
-                    sanitize_tool_arguments(args)
-                };
-                let tc = json!({ "index": index, "function": { "arguments": args_str } });
-                out.push(Ok(Event::default().data(json!({
-                    "id": id_c, "object": "chat.completion.chunk", "created": created, "model": model_c,
-                    "choices": [{ "index": 0, "delta": { "tool_calls": [tc] }, "finish_reason": null }],
-                }).to_string())));
+            // 共享 flush：残缺参数（掐流残片）经 sanitize 修复后才下发
+            let mut buf = tool_buf.lock().unwrap();
+            let mut flushed: Vec<StreamEvent> = Vec::new();
+            flush_tool_buf(&mut buf, &mut flushed);
+            for ev in flushed {
+                if let StreamEvent::ToolCall { index, arguments, .. } = ev {
+                    let args_str = arguments.unwrap_or_else(|| "{}".into());
+                    let tc = json!({ "index": index, "function": { "arguments": args_str } });
+                    out.push(Ok(Event::default().data(json!({
+                        "id": id_c, "object": "chat.completion.chunk", "created": created, "model": model_c,
+                        "choices": [{ "index": 0, "delta": { "tool_calls": [tc] }, "finish_reason": null }],
+                    }).to_string())));
+                }
             }
             let fr = if tool_seen.load(std::sync::atomic::Ordering::Relaxed) { "tool_calls" } else { "stop" };
             out.push(Ok(Event::default().data(json!({
@@ -1604,6 +1830,58 @@ async fn delete_rule(State(st): State<Arc<GatewayState>>, axum::extract::Path(id
 
 
 #[cfg(test)]
+mod catalog_tests {
+    use super::*;
+
+    /// 上次清单里有、本次没有的模型必须补回来。
+    ///
+    /// 用户实测故障：切平台后旧模型 id 从 /v1/models 消失，客户端报
+    /// `pi-ai provider "local" has no configured model "glm-5.3-flash"`，
+    /// 上下文压缩/切模型整轮失败。上游某平台临时拉取失败时也不能让模型"消失"。
+    #[test]
+    fn merge_restores_models_missing_from_new_catalog() {
+        let mut new = json!({"object":"list","data":[
+            {"id":"qoder/dfmodel"},{"id":"dfmodel"}
+        ]});
+        let prev = json!({"object":"list","data":[
+            {"id":"qoder/dfmodel"},
+            {"id":"glm-5.3-flash"},
+            {"id":"codearts/glm-5.3-flash"}
+        ]});
+        merge_catalog_missing(&mut new, &prev);
+        let ids: Vec<String> = new["data"].as_array().unwrap().iter()
+            .filter_map(|m| m.get("id").and_then(|i| i.as_str()).map(|s| s.to_string()))
+            .collect();
+        assert!(ids.contains(&"dfmodel".to_string()), "原有条目不应丢失");
+        assert!(ids.contains(&"glm-5.3-flash".to_string()), "缺失的旧模型应被补回");
+        assert!(ids.contains(&"codearts/glm-5.3-flash".to_string()));
+        // 不应重复：qoder/dfmodel 在两个清单里都有
+        assert_eq!(ids.iter().filter(|i| *i == "qoder/dfmodel").count(), 1);
+    }
+
+    /// 模型条目：裸 id 用原名，平台前缀 id 要带上平台名便于区分
+    #[test]
+    fn model_entry_names_qualified_ids_distinctly() {
+        let info = upstream::ModelInfo {
+            id: "glm-5.3-flash".into(),
+            name: "GLM-5.3-Flash".into(),
+            context_window: Some(1_048_576),
+            max_tokens: None,
+            credit_multiplier: None,
+            supports_images: None,
+        };
+        let bare = model_entry(&info, "codearts", "glm-5.3-flash");
+        assert_eq!(bare["id"], "glm-5.3-flash");
+        assert_eq!(bare["name"], "GLM-5.3-Flash");
+        assert_eq!(bare["platform"], "codearts");
+        let qualified = model_entry(&info, "codearts", "codearts/glm-5.3-flash");
+        assert_eq!(qualified["id"], "codearts/glm-5.3-flash");
+        assert_eq!(qualified["raw_model"], "glm-5.3-flash");
+        assert!(qualified["name"].as_str().unwrap().contains("codearts"));
+    }
+}
+
+#[cfg(test)]
 mod truncate_tests {
     use super::*;
 
@@ -1679,7 +1957,8 @@ mod truncate_tests {
 
 #[cfg(test)]
 mod tool_args_tests {
-    use super::sanitize_tool_arguments;
+    use super::{sanitize_tool_arguments, flush_tool_buf, ToolCallBuf};
+    use crate::upstream::StreamEvent;
 
     fn parse(s: &str) -> serde_json::Value {
         serde_json::from_str(s).expect("修复后必须合法")
@@ -1724,7 +2003,39 @@ mod tool_args_tests {
 
     #[test]
     fn empty_and_object_args() {
-        assert_eq!(sanitize_tool_arguments(""), "");
+        // 空参数统一为 "{}"（客户端拿空串无法 JSON.parse）
+        assert_eq!(sanitize_tool_arguments(""), "{}");
         assert_eq!(sanitize_tool_arguments("{}"), "{}");
+    }
+
+    #[test]
+    fn repairs_bare_quote_artifact() {
+        // 上游中途掐流，收尾 flush 只剩一个引号（实测报 "Unexpected non-whitespace
+        // character after JSON at position 2"）→ 兜底为空参数
+        assert_eq!(sanitize_tool_arguments("\""), "{}");
+        assert_eq!(sanitize_tool_arguments("\"\""), "{}");
+    }
+
+    #[test]
+    fn repairs_truncated_fragment() {
+        // 截断残片（首字符不是 {/[ 且不是合法 JSON）→ 空参数，不让客户端必然解析失败
+        assert_eq!(sanitize_tool_arguments("\"city"), "{}");
+        // 合法 JSON 标量/字符串原样保留（客户端可正常 parse）
+        assert_eq!(sanitize_tool_arguments("100"), "100");
+        assert_eq!(sanitize_tool_arguments("\"北京\""), "\"北京\"");
+    }
+
+    #[test]
+    fn truncation_flush_repairs_broken_args() {
+        // 模拟掐流：缓冲区只有残缺参数时，结束帧 flush 应修复为合法 JSON
+        let mut buf: ToolCallBuf = Default::default();
+        buf.insert(0, (Some("call_x".into()), "write".into(), "\"".into()));
+        let mut out = Vec::new();
+        flush_tool_buf(&mut buf, &mut out);
+        let args = match &out[0] {
+            StreamEvent::ToolCall { arguments, .. } => arguments.clone().unwrap_or_default(),
+            other => panic!("期望 ToolCall，得到 {other:?}"),
+        };
+        assert_eq!(args, "{}");
     }
 }

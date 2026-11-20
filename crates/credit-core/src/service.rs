@@ -81,6 +81,12 @@ impl Service {
     ///    把新 AK/SK/ST/RT 落库并**回写客户端 secretStorage**（两边保持同一份 RT）；
     /// ④ 续期失败且客户端已安装 → 拉起客户端等它刷新/重新登录后再导入。
     pub async fn ensure_codearts_fresh(&self, cred: &Cred) -> Result<Cred, PlatformError> {
+        self.ensure_codearts_fresh_opts(cred, true).await
+    }
+
+    /// `allow_wait=false`（后台巡检）：跳过「等客户端刷新」与「拉起客户端」两步，
+    /// 只做「读本机会话 → STS refresh」。见 [`Self::heal_cred_quick`] 的说明。
+    async fn ensure_codearts_fresh_opts(&self, cred: &Cred, allow_wait: bool) -> Result<Cred, PlatformError> {
         use crate::adapters::codearts_local as local;
         let desktop = cred.provider == "codearts-desktop";
         let stale_st = cred.meta.get("security_token").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -93,8 +99,8 @@ impl Service {
                         return Ok(c);
                     }
                 }
-            // ② 客户端在跑 → 等它按自己的周期刷新（不抢它的 RT）
-            if local::client_running() {
+            // ② 客户端在跑 → 等它按自己的周期刷新（不抢它的 RT）。后台巡检不等待（allow_wait=false）。
+            if allow_wait && local::client_running() {
                 let old_fp = local::session_fingerprint(desktop);
                 let changed = tokio::task::spawn_blocking(move || {
                     local::wait_for_session_change(desktop, old_fp.as_deref(), std::time::Duration::from_secs(20))
@@ -109,7 +115,7 @@ impl Service {
                 }
             }
         }
-        // ③ 网关自己续期（客户端没在跑，或 20s 内没等到客户端刷新）
+        // ③ 网关自己续期（客户端没在跑，或没等到客户端刷新）
         let adapter = adapter_for(&cred.provider)
             .ok_or_else(|| PlatformError::Local(format!("no adapter for {}", cred.provider)))?;
         match adapter.refresh(cred).await {
@@ -134,8 +140,10 @@ impl Service {
                 Ok(nc)
             }
             Err(e) => {
-                // ④ 兜底：拉起客户端等它刷新/重新登录
-                if !local::client_running() && local::find_client_exe().is_some() {
+                // ④ 兜底：拉起客户端等它刷新/重新登录（仅请求级；后台不拉起 GUI）
+                let running = local::client_running();
+                let has_exe = local::find_client_exe().is_some();
+                if !running && has_exe && allow_wait {
                     eprintln!("[codearts] STS 续期失败（{e}），拉起客户端等待刷新…");
                     let old_fp = local::session_fingerprint(desktop);
                     local::launch_client();
@@ -156,8 +164,167 @@ impl Service {
         }
     }
 
-    /// 自动续期巡检：对即将过期的 CodeArts 账号执行 ensure_codearts_fresh。
+    /// 全部平台通用的凭据自愈（**请求级**，用户正在等待 → 可以等客户端刷新/拉起客户端）。
+    ///
+    /// 统一链路（各平台一致，不再只对码道做）：
+    /// ① **扫描本机**：客户端常会静默轮换 token → 直接重新导入最新登录态；
+    /// ② **refresh 链**：用 refresh_token 主动换新；
+    /// ③ **拉起客户端**：本地登录态也过期时拉起官方客户端，等它刷新后再扫一次。
+    ///
+    /// 返回最新可用凭据；全部失败返回 None。
+    pub async fn heal_cred(&self, platform: &str, stale: &Cred) -> Option<Cred> {
+        self.heal_cred_opts(platform, stale, true).await
+    }
+
+    /// 凭据自愈（**后台巡检用**）：只做「扫描本机 + refresh_token」，**不等客户端、不拉起 GUI**。
+    ///
+    /// 后台巡检必须是快速且无副作用的：
+    /// - 等客户端刷新要 15~20s/账号，多个账号会把巡检拖到分钟级；
+    /// - 拉起 GUI 客户端属于「打扰用户」的操作，只应在用户请求失败时做一次，
+    ///   不该由后台定时器反复触发。
+    /// 真正需要等待/拉起时，由请求命中 401 后的 [`Self::heal_cred`] 兜底。
+    pub async fn heal_cred_quick(&self, platform: &str, stale: &Cred) -> Option<Cred> {
+        self.heal_cred_opts(platform, stale, false).await
+    }
+
+    async fn heal_cred_opts(&self, platform: &str, stale: &Cred, allow_wait: bool) -> Option<Cred> {
+        // 码道：STS 一次性 RT + 需回写客户端 secretStorage，链路特殊，复用既有实现
+        if platform.starts_with("codearts") {
+            return self.ensure_codearts_fresh_opts(stale, allow_wait).await.ok();
+        }
+        let (import_platform, intl) = import_target(platform);
+        // ① 扫描本机（客户端可能已静默刷新）
+        if self.import_account(import_platform, intl).await.is_ok() {
+            if let Some(c) = self.pick_any_cred(platform, &stale.uid) {
+                if !c.token.is_empty() {
+                    return Some(c);
+                }
+            }
+        }
+        // ② refresh_token 换新
+        if let Ok(nc) = self.refreshed_cred(platform, &stale.uid, stale).await {
+            if !nc.token.is_empty() {
+                return Some(nc);
+            }
+        }
+        // ③ 拉起本机客户端，等它刷新登录态后重新扫描（仅请求级；后台不做）
+        if !allow_wait {
+            return None;
+        }
+        self.launch_and_rescan(platform).await
+    }
+
+    /// 取该 provider 的凭据：优先同 uid（常规刷新），其次任意（重新登录会换 uid）
+    fn pick_any_cred(&self, provider: &str, uid: &str) -> Option<Cred> {
+        if let Some(c) = self.pick_cred(provider, uid) {
+            return Some(c);
+        }
+        let rows = self.store.list_accounts().ok()?;
+        rows.iter()
+            .filter(|(p, _, _, _, _)| p == provider)
+            .find_map(|(_, _, _, _, auth)| serde_json::from_str::<Cred>(auth).ok())
+    }
+
+    /// 拉起本机平台客户端并等它刷新登录态（最长 15s），然后重新扫描导入。
+    /// 进程拉起与轮询都在线程池里做，不阻塞异步运行时。
+    async fn launch_and_rescan(&self, platform: &str) -> Option<Cred> {
+        let p = platform.to_string();
+        let old_fp = tokio::task::spawn_blocking({
+            let p = p.clone();
+            move || match p.as_str() {
+                "trae" | "trae-device" | "trae-intl" => crate::adapters::trae_local::token_fingerprint(),
+                "workbuddy" => crate::adapters::wb_local::session_fingerprint(false),
+                "workbuddy-intl" => crate::adapters::wb_local::session_fingerprint(true),
+                "qoder" => crate::adapters::qoder_local::token_fingerprint(false),
+                "qoder-intl" => crate::adapters::qoder_local::token_fingerprint(true),
+                "minimax" => crate::adapters::minimax_local::token_fingerprint(),
+                "zcode" => crate::adapters::zcode_local::token_fingerprint(),
+                _ => None,
+            }
+        })
+        .await
+        .ok()
+        .flatten();
+
+        let launched = tokio::task::spawn_blocking({
+            let p = p.clone();
+            move || match p.as_str() {
+                "trae" | "trae-device" | "trae-intl" => crate::adapters::trae_local::launch_client().is_some(),
+                "workbuddy" | "workbuddy-intl" => crate::adapters::wb_local::launch_client().is_some(),
+                "qoder" | "qoder-intl" => crate::adapters::qoder_local::launch_client().is_some(),
+                "minimax" => crate::adapters::minimax_local::launch_client().is_some(),
+                "zcode" => crate::adapters::zcode_local::launch_client().is_some(),
+                _ => false,
+            }
+        })
+        .await
+        .unwrap_or(false);
+        if !launched {
+            return None;
+        }
+        eprintln!("[heal] {platform} 凭据失效，已拉起本机客户端等待刷新…");
+        let changed = tokio::task::spawn_blocking({
+            let p = p.clone();
+            let old = old_fp.clone();
+            move || match p.as_str() {
+                "trae" | "trae-device" | "trae-intl" => {
+                    crate::adapters::trae_local::wait_for_token_change(old.as_deref(), std::time::Duration::from_secs(15)).is_some()
+                }
+                "workbuddy" | "workbuddy-intl" => {
+                    crate::adapters::wb_local::wait_for_session_change(p == "workbuddy-intl", old.as_deref(), std::time::Duration::from_secs(15)).is_some()
+                }
+                "qoder" | "qoder-intl" => {
+                    crate::adapters::qoder_local::wait_for_token_change(p == "qoder-intl", old.as_deref(), std::time::Duration::from_secs(15)).is_some()
+                }
+                "minimax" => crate::adapters::minimax_local::wait_for_token_change(old.as_deref(), std::time::Duration::from_secs(15)).is_some(),
+                "zcode" => crate::adapters::zcode_local::wait_for_token_change(old.as_deref(), std::time::Duration::from_secs(15)).is_some(),
+                _ => false,
+            }
+        })
+        .await
+        .unwrap_or(false);
+        if !changed {
+            return None;
+        }
+        let (import_platform, intl) = import_target(platform);
+        if self.import_account(import_platform, intl).await.is_ok() {
+            return self.pick_any_cred(platform, "");
+        }
+        None
+    }
+
+    /// 后台巡检用：把所有「本机已安装客户端」的登录态同步进库（不依赖过期判断）。
+    ///
+    /// 官方客户端会自己按周期轮换 token，但不会通知网关；定期重扫可保证库里
+    /// 始终是当前有效凭据，从而**从源头避免**「用着用着突然 401/过期」。
+    /// 返回 (provider, uid, 结果) 便于 UI 展示。
+    pub async fn sync_from_local(&self) -> Vec<(String, String, String)> {
+        let mut out = Vec::new();
+        // 只同步库里已有账号的 provider（不擅自新增账号）
+        let mut providers: Vec<String> = Vec::new();
+        if let Ok(rows) = self.store.list_accounts() {
+            for (p, _, _, _, _) in rows {
+                if !providers.contains(&p) {
+                    providers.push(p);
+                }
+            }
+        }
+        for p in providers {
+            let (import_platform, intl) = import_target(&p);
+            match self.import_account(import_platform, intl).await {
+                Ok(_) => out.push((p.clone(), String::new(), "synced".into())),
+                Err(e) => out.push((p.clone(), String::new(), format!("skip: {e}"))),
+            }
+        }
+        out
+    }
+
+    /// 自动续期巡检（**全部平台**，不再只码道）：对「剩余有效期 < within 秒」的账号
+    /// 执行 `heal_cred`。没有到期信息的平台跳过（由请求时的 401 自愈兜底）。
     /// `within` = 提前多久开始续期（秒）。
+    ///
+    /// 每个账号的续期都套**硬超时**：续期链会等官方客户端刷新（最长 15~20s）、
+    /// 走 STS 换票，任一环节卡住都不能拖垮整个巡检（否则后台任务会永久停摆）。
     pub async fn renew_expiring(&self, within: i64) -> Vec<(String, String, String)> {
         let mut out = Vec::new();
         let Ok(rows) = self.store.list_accounts() else { return out };
@@ -166,23 +333,30 @@ impl Service {
             .unwrap_or_default()
             .as_millis() as i64;
         for (p, u, _n, _s, auth) in rows {
-            if !p.starts_with("codearts") {
-                continue;
-            }
             let Ok(cred) = serde_json::from_str::<Cred>(&auth) else { continue };
-            // 以客户端会话里的 expiresAt 为准（比 DB 里的 ISO 更精确）
-            let desktop = p == "codearts-desktop";
-            let exp_ms = crate::adapters::codearts_local::read_live_session(desktop)
-                .or_else(|| crate::adapters::codearts_local::read_live_session(!desktop))
-                .and_then(|l| l.session.pointer("/session/expiresAt").and_then(|e| e.as_i64()))
-                .or_else(|| cred.expires_at.as_deref().and_then(crate::adapters::codearts::iso_to_epoch_ms));
-            let Some(exp_ms) = exp_ms else { continue };
+            let Some(exp_ms) = cred_expiry_ms(&p, &cred) else { continue };
             if exp_ms - now_ms > within * 1000 {
                 continue;
             }
-            match self.ensure_codearts_fresh(&cred).await {
-                Ok(_) => out.push((p.clone(), u.clone(), "renewed".into())),
-                Err(e) => out.push((p.clone(), u.clone(), format!("failed: {e}"))),
+            let t0 = std::time::Instant::now();
+            eprintln!("[renew] {p}:{u} 即将过期（剩余 {}s），开始自动续期…", (exp_ms - now_ms) / 1000);
+            // 后台巡检走 **快速路径**：不等客户端刷新、不拉起 GUI 客户端（否则会拖到分钟级）。
+            // 仍套硬超时兜底：万一底层阻塞调用卡住，也不会让巡检永久停摆。
+            let healed = tokio::time::timeout(HEAL_TIMEOUT, self.heal_cred_quick(&p, &cred)).await;
+            let dt = t0.elapsed().as_secs();
+            match healed {
+                Ok(Some(_)) => {
+                    eprintln!("[renew] {p}:{u} 凭据已自动续期（{dt}s）");
+                    out.push((p.clone(), u.clone(), "renewed".into()));
+                }
+                Ok(None) => {
+                    eprintln!("[renew] {p}:{u} 凭据续期失败（{dt}s，需在客户端重新登录）");
+                    out.push((p.clone(), u.clone(), "failed".into()));
+                }
+                Err(_) => {
+                    eprintln!("[renew] {p}:{u} 凭据续期超时（>{dt}s），跳过以免阻塞后续巡检");
+                    out.push((p.clone(), u.clone(), "timeout".into()));
+                }
             }
         }
         out
@@ -684,6 +858,57 @@ fn is_auth_business_err(e: &PlatformError) -> bool {
         return code.as_i64() == Some(1001) || code.as_i64() == Some(1002);
     }
     false
+}
+
+/// 单个账号凭据自愈的硬超时：自愈链会等客户端刷新（15~20s）+ 走 STS 换票，
+/// 给 120s 足够；超时则跳过该账号，避免后台巡检被单个卡死账号拖住。
+const HEAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// provider → (import_account 的平台名, 是否国际版)。/// `import_account` 按 (平台名, intl) 决定最终 provider，故国际版要拆开传。
+fn import_target(provider: &str) -> (&'static str, bool) {
+    match provider {
+        "workbuddy-intl" => ("workbuddy", true),
+        "workbuddy" => ("workbuddy", false),
+        "qoder-intl" => ("qoder", true),
+        "qoder" => ("qoder", false),
+        "trae" | "trae-device" | "trae-intl" => ("trae", false),
+        "minimax" => ("minimax", false),
+        "zcode" => ("zcode", false),
+        "codearts-desktop" => ("codearts-desktop", false),
+        "codearts" => ("codearts", false),
+        _ => ("", false),
+    }
+}
+
+/// 凭据到期时间（epoch ms）。
+///
+/// 优先级：码道的**本机会话 expiresAt**（毫秒精度，最准）→ DB `expires_at`（ISO 8601）
+/// → 仅日期（ZCode 的 zcodeJwt 只解出 YYYY-MM-DD，按当天 23:59:59+08 计）。
+/// 都拿不到 → None（该平台交给请求时的 401 自愈兜底）。
+fn cred_expiry_ms(provider: &str, cred: &Cred) -> Option<i64> {
+    if provider.starts_with("codearts") {
+        let desktop = provider == "codearts-desktop";
+        if let Some(ms) = crate::adapters::codearts_local::read_live_session(desktop)
+            .or_else(|| crate::adapters::codearts_local::read_live_session(!desktop))
+            .and_then(|l| l.session.pointer("/session/expiresAt").and_then(|e| e.as_i64()))
+        {
+            return Some(ms);
+        }
+    }
+    let s = cred.expires_at.as_deref()?.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if let Some(ms) = crate::adapters::codearts::iso_to_epoch_ms(s) {
+        return Some(ms);
+    }
+    // 仅日期 YYYY-MM-DD → 该日结束（UTC）。ZCode 的 zcodeJwt exp 就是按 UTC 日期解出来的，
+    // 故按 end-of-day UTC 作为上界即可（宁可略早续期，不要误判为已过期而反复拉起客户端）。
+    let y: i64 = s.get(0..4)?.parse().ok()?;
+    let mo: i64 = s.get(5..7)?.parse().ok()?;
+    let d: i64 = s.get(8..10)?.parse().ok()?;
+    let days = crate::adapters::days_from_civil(y, mo, d);
+    Some((days + 1) * 86_400_000 - 1)
 }
 
 /// 从 Trae JWT payload 取 /data/id 作为 uid（解析失败返回空串）。

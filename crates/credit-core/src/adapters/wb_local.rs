@@ -125,6 +125,44 @@ pub fn find_client_exe() -> Option<std::path::PathBuf> {
     client_exe_candidates().into_iter().find(|p| p.exists())
 }
 
+/// 读取本机 WorkBuddy 客户端真实版本（`resources/install-manifest.json` 的 appVersion）。
+///
+/// 聊天头里的 `X-IDE-Version` 与 UA 版本段都必须是**当前安装版本**：
+/// 写死版本在客户端升级后会立刻变成「版本对不上」的显式特征。
+pub fn app_version() -> Option<String> {
+    // 优先从 exe 位置推导 resources/install-manifest.json
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(exe) = find_client_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join("resources/install-manifest.json"));
+            candidates.push(dir.join("install-manifest.json"));
+        }
+    }
+    let local = std::env::var("LOCALAPPDATA").unwrap_or_default();
+    for base in [
+        format!("{local}/Programs/WorkBuddy"),
+        format!("{local}/Programs/CodeBuddy"),
+        "D:/ProgramFiles/software/WorkBuddy".to_string(),
+        "C:/Program Files/WorkBuddy".to_string(),
+    ] {
+        candidates.push(std::path::PathBuf::from(&base).join("resources/install-manifest.json"));
+    }
+    for p in candidates {
+        if let Ok(s) = std::fs::read_to_string(&p) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(s.trim_start_matches('\u{feff}')) {
+                if let Some(ver) = v.get("appVersion").and_then(|x| x.as_str()) {
+                    let ver = ver.trim().to_string();
+                    if !ver.is_empty() {
+                        return Some(ver);
+                    }
+                }
+            }
+        }
+    }
+    // 环境变量兜底（客户端目录结构变化时用户可手动指定）
+    std::env::var("WORKBUDDY_APP_VERSION").ok().filter(|s| !s.trim().is_empty())
+}
+
 /// 会话文件原始字节指纹（客户端刷新 token 会重写文件；不解密，轮询零开销）
 pub fn session_fingerprint(intl: bool) -> Option<String> {
     let bytes = std::fs::read(session_file(intl)).ok()?;

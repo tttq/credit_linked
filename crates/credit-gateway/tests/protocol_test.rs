@@ -312,6 +312,65 @@ fn test_qoder_envelope_surfaces_invalid_model_error() {
 }
 
 #[test]
+fn test_qoder_envelope_inner_done_is_stream_end_not_error() {
+    // 用户实测故障：Qoder 上游 HTTP 200，外层信封的 body 直接是 SSE 终止标记 "[DONE]"。
+    // 旧实现把它当「非 JSON」→ 产出 Error 事件 → 整个响应被判失败，Qoder 完全不可用。
+    // 正确语义：这是**正常结束**。
+    let frame = serde_json::json!({
+        "headers": {"Content-Type": ["text/event-stream"]},
+        "body": "[DONE]",
+        "statusCodeValue": 200,
+        "statusCode": "OK"
+    }).to_string();
+    match credit_gateway::upstream::qoder_envelope_event(&frame) {
+        Some(credit_gateway::upstream::StreamEvent::Done { .. }) => {}
+        other => panic!("内层 [DONE] 应转成 Done（正常结束），得到 {other:?}"),
+    }
+
+    // 内层 body 是「嵌套 SSE 文本」时也必须按帧解析，而不是报非 JSON
+    let nested = serde_json::json!({
+        "body": "data: {\"choices\":[{\"delta\":{\"content\":\"你好\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n",
+        "statusCodeValue": 200, "statusCode": "OK"
+    }).to_string();
+    match credit_gateway::upstream::qoder_envelope_event(&nested) {
+        Some(credit_gateway::upstream::StreamEvent::Text(t)) => assert_eq!(t, "你好"),
+        other => panic!("嵌套 SSE 首个内容帧应解析成 Text，得到 {other:?}"),
+    }
+    // 正文里含 "data:"（如 base64 data URL）的普通 chunk 不能被误判成 SSE 空流
+    let dat = serde_json::json!({
+        "body": "{\"choices\":[{\"delta\":{\"content\":\"data:image/png;base64,AAA\"},\"finish_reason\":null}]}",
+        "statusCodeValue": 200, "statusCode": "OK"
+    }).to_string();
+    match credit_gateway::upstream::qoder_envelope_event(&dat) {
+        Some(credit_gateway::upstream::StreamEvent::Text(t)) => {
+            assert!(t.contains("data:image/png"), "含 data: 的正文应原样当作 Text，得到 {t:?}")
+        }
+        other => panic!("含 data: 的普通 chunk 应解析为 Text，得到 {other:?}"),
+    }
+
+    // 外层 data 帧直接是 [DONE]（非信封 JSON）也必须当正常结束，不能丢帧后无 Done
+    match credit_gateway::upstream::qoder_envelope_event("[DONE]") {
+        Some(credit_gateway::upstream::StreamEvent::Done { .. }) => {}
+        other => panic!("外层 [DONE] 应转成 Done，得到 {other:?}"),
+    }
+}
+
+#[test]
+fn test_qoder_envelope_truly_invalid_body_still_errors() {
+    // 真正的非 JSON（上游网关错误页）仍必须当错误报出来，不能被 [DONE] 修复误伤
+    let frame = serde_json::json!({
+        "body": "<html>502 Bad Gateway</html>",
+        "statusCodeValue": 502, "statusCode": "BAD_GATEWAY"
+    }).to_string();
+    match credit_gateway::upstream::qoder_envelope_event(&frame) {
+        Some(credit_gateway::upstream::StreamEvent::Error(_, code)) => {
+            assert_eq!(code, "qoder_bad_body");
+        }
+        other => panic!("HTML 错误页仍应报 Error，得到 {other:?}"),
+    }
+}
+
+#[test]
 fn test_to_anthropic_messages_synthesizes_missing_tool_result() {
     use credit_gateway::protocol::to_anthropic_messages;
     // 截断/中断后历史里 assistant 有 tool_use 但缺 tool 结果：官方客户端会补 is_error 占位

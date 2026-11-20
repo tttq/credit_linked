@@ -44,6 +44,64 @@ pub fn read_auth(intl: bool) -> anyhow::Result<Option<Value>> {
     Ok(Some(serde_json::from_slice(&pt)?))
 }
 
+/// Qoder 的**家目录**（与 Electron userData 不同：身份物料在 `~/.qoder-cn` / `~/.qoder`）。
+///
+/// 本机实测：
+/// - `~/.qoder-cn/.auth/machine_id`（36 字节 UUID）
+/// - `~/.qoder-cn/umid-cache.json`（info.machineCode/machineToken/machineType）
+/// - `~/.qoder-cn/.qoder-app-status.json`（version 0.5.14）
+fn qoder_home(intl: bool) -> Option<std::path::PathBuf> {
+    let home = dirs::home_dir()?;
+    let candidates: &[&str] = if intl { &[".qoder", ".qoder-cn"] } else { &[".qoder-cn", ".qoder"] };
+    for name in candidates {
+        let d = home.join(name);
+        if d.is_dir() {
+            return Some(d);
+        }
+    }
+    None
+}
+
+/// 读取本机 Qoder 的**机器 id**（`~/.qoder-cn/.auth/machine_id`，36 字节 UUID）。
+///
+/// 这是渠道校验/风控里最基础的身份物料：官方客户端每个请求都带
+/// `Cosy-MachineId` / `Cosy-MachineToken`。旧实现从不传值，sidecar 回落到
+/// 全零 UUID（`00000000-0000-0000-0000-000000000000`）—— 这是最容易被识别为
+/// 非官方客户端的单点特征。
+pub fn machine_id(intl: bool) -> Option<String> {
+    let home = qoder_home(intl)?;
+    for rel in [".auth/machine_id", "machine_id"] {
+        if let Ok(s) = std::fs::read_to_string(home.join(rel)) {
+            let s = s.trim().to_string();
+            if !s.is_empty() {
+                return Some(s);
+            }
+        }
+    }
+    None
+}
+
+/// 读取本机 Qoder 客户端版本（`.qoder-app-status.json` 的 version，失败返回 None）
+pub fn client_version(intl: bool) -> Option<String> {
+    let home = qoder_home(intl)?;
+    let v: Value = serde_json::from_reader(std::fs::File::open(home.join(".qoder-app-status.json")).ok()?).ok()?;
+    v.get("version").and_then(|x| x.as_str()).map(|s| s.to_string())
+}
+
+/// 读取本机 Qoder 的 umid 机器身份（`umid-cache.json` 的 `info`）：
+/// `machineCode` / `machineToken` / `machineType`。官方请求会带这三个头。
+pub fn umid_info(intl: bool) -> Option<(String, String, String)> {
+    let home = qoder_home(intl)?;
+    let v: Value = serde_json::from_reader(std::fs::File::open(home.join("umid-cache.json")).ok()?).ok()?;
+    let info = v.get("info")?;
+    let get = |k: &str| info.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let (code, token, ty) = (get("machineCode"), get("machineToken"), get("machineType"));
+    if code.is_empty() && token.is_empty() {
+        return None;
+    }
+    Some((code, token, ty))
+}
+
 /// token 指纹（识别 Qoder 客户端是否已刷新登录态；不泄露 token 明文）
 pub fn token_fingerprint(intl: bool) -> Option<String> {
     use sha2::{Digest, Sha256};

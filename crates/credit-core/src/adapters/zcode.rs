@@ -197,7 +197,67 @@ fn chat_headers(token: &str, device_mid: &str) -> Vec<(String, String)> {
 pub async fn fresh_bigmodel_token(c: &Cred) -> Result<String, PlatformError> {
     let jwt = c.meta.get("zcodeJwt").and_then(|d| d.as_str()).filter(|s| !s.is_empty())
         .ok_or(PlatformError::Auth)?;
-    let mid = c.meta.get("deviceMid").and_then(|d| d.as_str()).unwrap_or("");
+    // 取票结果缓存：bigmodel access_token 有 ~1h 有效期，没必要每个对话请求都打一次
+    // oauth/profile（既增加延迟，也让「每请求一次 profile」成为频率特征）。
+    // 这里按 jwt 指纹缓存 45 分钟（留 15 分钟安全边界），并做**单飞**避免并发重复取票。
+    let cache_key = {
+        use sha2::{Digest, Sha256};
+        let d = Sha256::digest(jwt.as_bytes());
+        d.iter().take(16).map(|b| format!("{b:02x}")).collect::<String>()
+    };
+    {
+        use std::collections::HashMap;
+        use std::sync::{Mutex, OnceLock};
+        static CACHE: OnceLock<Mutex<HashMap<String, (String, std::time::Instant)>>> = OnceLock::new();
+        const TTL: std::time::Duration = std::time::Duration::from_secs(45 * 60);
+        let map = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+        if let Ok(g) = map.lock() {
+            if let Some((t, at)) = g.get(&cache_key) {
+                if at.elapsed() < TTL {
+                    return Ok(t.clone());
+                }
+            }
+        }
+    }
+    // 单飞：并发请求只让一个去取票，其余等它写缓存
+    let single = bigmodel_fetch_lock().lock().await;
+    {
+        use std::collections::HashMap;
+        use std::sync::{Mutex, OnceLock};
+        static CACHE: OnceLock<Mutex<HashMap<String, (String, std::time::Instant)>>> = OnceLock::new();
+        const TTL: std::time::Duration = std::time::Duration::from_secs(45 * 60);
+        let map = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+        if let Ok(g) = map.lock() {
+            if let Some((t, at)) = g.get(&cache_key) {
+                if at.elapsed() < TTL {
+                    return Ok(t.clone());
+                }
+            }
+        }
+    }
+    let tok = fetch_bigmodel_token_uncached(c, jwt, c.meta.get("deviceMid").and_then(|d| d.as_str()).unwrap_or("")).await?;
+    {
+        use std::collections::HashMap;
+        use std::sync::{Mutex, OnceLock};
+        static CACHE: OnceLock<Mutex<HashMap<String, (String, std::time::Instant)>>> = OnceLock::new();
+        let map = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+        if let Ok(mut g) = map.lock() {
+            g.insert(cache_key, (tok.clone(), std::time::Instant::now()));
+        }
+    }
+    drop(single);
+    Ok(tok)
+}
+
+/// 取票单飞锁（并发请求共用一次取票）
+fn bigmodel_fetch_lock() -> &'static tokio::sync::Mutex<()> {
+    static L: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    L.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+/// 实际取票（无缓存）
+async fn fetch_bigmodel_token_uncached(c: &Cred, jwt: &str, mid: &str) -> Result<String, PlatformError> {
+    let _ = c;
     let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(15)).build().unwrap();
     let mut req = client.get(format!("{BASE}/api/v1/oauth/profile"));
     for (k, v) in chat_headers(jwt, mid) {
