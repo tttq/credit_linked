@@ -217,6 +217,12 @@ async fn install_update(file: String) -> Result<serde_json::Value, String> {
     Ok(serde_json::json!({ "ok": true }))
 }
 
+/// 隐藏主窗口到托盘（前端 hide 权限被拒/旧 webview 时的后端兜底，无需前端窗口权限）
+#[tauri::command]
+fn hide_main(window: tauri::WebviewWindow) -> Result<(), String> {
+    window.hide().map_err(|e| e.to_string())
+}
+
 /// 退出应用
 #[tauri::command]
 async fn quit_app(app: tauri::AppHandle) -> Result<(), String> {
@@ -1342,7 +1348,7 @@ fn main() {
             statistics, daily_income, daily_tokens, settings_get, settings_set, account_list_all, open_url,
             login_open_window, login_close_window,
             gateway_status, gateway_set_platform, gateway_add_rule, gateway_update_rule, gateway_delete_rule,
-            gateway_set_limits, gateway_clear_logs, gateway_accounts, gateway_switch_account, tools_info, tools_set_install_dir, tools_refresh_minimax_url, tools_download, tools_install, tools_open_page, quota_refresh_all, quit_app, platform_ensure_running, check_update, download_update, install_update,
+            gateway_set_limits, gateway_clear_logs, gateway_accounts, gateway_switch_account, tools_info, tools_set_install_dir, tools_refresh_minimax_url, tools_download, tools_install, tools_open_page, quota_refresh_all, quit_app, hide_main, platform_ensure_running, check_update, download_update, install_update,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

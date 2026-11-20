@@ -1244,44 +1244,11 @@ $$('[data-goto]').forEach(b => b.addEventListener('click', () => showPage(b.data
 window.addEventListener('resize', () => { charts.ov?.resize(); charts.st?.resize(); });
 window.piconFallback = piconFallback;
 
-// ===== 面板顶栏：最小化到托盘 / 关闭确认（模态在屏幕中间弹出） =====
-(function setupPanelBar() {
-  const curWin = () => { try { return _T?.window?.getCurrent?.() || _T?.window?.getCurrentWindow?.(); } catch { return null; } };
-  const min = document.getElementById('panel-min');
-  if (min) min.addEventListener('click', () => { try { curWin()?.hide?.(); } catch {} });
-  const close = document.getElementById('panel-close');
-  if (close) close.addEventListener('click', () => { document.getElementById('quit-mask').style.display = 'flex'; });
-  // 右下角缩放手柄
-  const handle = document.getElementById('resize-handle');
-  if (handle) handle.addEventListener('mousedown', (e) => {
-    e.preventDefault(); e.stopPropagation();
-    const w = curWin();
-    if (!w) return;
-    try { if (typeof w.startResize === 'function') { w.startResize('SouthEast'); return; } } catch {}
-    try { if (typeof w.startResizeDragging === 'function') { w.startResizeDragging('SouthEast'); } } catch {}
-  });
-})();
-
-// ===== 关闭确认：退至后台 / 退出程序 =====
-(function setupQuitDialog() {
-  const mask = document.getElementById('quit-mask');
-  if (!mask) return;
-  const show = () => { mask.style.display = 'flex'; };
-  const hide = () => { mask.style.display = 'none'; };
-  mask.querySelector('#quit-cancel').addEventListener('click', hide);
-  mask.querySelector('#quit-to-tray').addEventListener('click', () => {
-    hide();
-    try { _T?.window?.getCurrent?.()?.hide?.(); } catch { try { _T?.window?.getCurrentWindow?.()?.hide?.(); } catch {} }
-  });
-  mask.querySelector('#quit-exit').addEventListener('click', async () => {
-    hide();
-    try { await invoke('quit_app'); } catch {}
-  });
-  try {
-    const listen = _T?.event?.listen;
-    if (listen) listen('window-close-requested', show);
-  } catch {}
-})();
+// ===== 面板顶栏窗口控制已迁移到 window-controls.js（自包含，独立加载） =====
+// 旧绑定存在两个致命问题，已废弃：
+//   1. curWin() 走 Tauri v1 的 window.getCurrent()（Tauri 2 已移除）→ 永远 undefined；
+//   2. hide() 需要 core:window:allow-hide 权限，此前 capabilities 未配置 → 静默拒绝。
+// 如需扩展窗口控制逻辑，请编辑 ui/window-controls.js。
 
 document.querySelector('.account-toolbar').style.display = 'none'; // 默认首页隐藏
 refreshAll();
