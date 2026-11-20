@@ -8,6 +8,7 @@ src-tauri/gen/
 # docs (per repo policy: no md files except README)
 *.md
 docs/*
+.agent-kernel
 !README.md
 
 # local data / logs / screenshots
