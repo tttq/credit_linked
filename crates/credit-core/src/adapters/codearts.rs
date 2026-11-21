@@ -396,7 +396,7 @@ impl Adapter for CodeArtsAdapter {
         }
         let items = st.raw.get("items").and_then(|x| x.as_array()).cloned().unwrap_or_default();
         if items.is_empty() {
-            return Ok(Receipt { status: "no-activity".into(), amount: None, message: None });
+            return Ok(Receipt { status: "no-activity".into(), amount: None, message: Some("当前暂无可领取的签到活动（该平台此刻没有可领奖励，或今日已领完）".into()) });
         }
         // 幂等键对齐客户端：claim_{campaignId}_{epoch_ms}（sha256 稳定键会被服务端幂等去重误伤重试）
         let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;

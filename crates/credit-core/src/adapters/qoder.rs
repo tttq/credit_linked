@@ -89,7 +89,7 @@ impl Adapter for QoderAdapter {
         }
         let campaigns = st.raw.get("campaigns").and_then(|x| x.as_array()).cloned().unwrap_or_default();
         if campaigns.is_empty() {
-            return Ok(Receipt { status: "no-activity".into(), amount: None, message: None });
+            return Ok(Receipt { status: "no-activity".into(), amount: None, message: Some("当前暂无可领取的签到活动（该平台此刻没有可领奖励，或今日已领完）".into()) });
         }
         let mut amount: Option<f64> = None;
         for camp in &campaigns {
@@ -98,9 +98,16 @@ impl Adapter for QoderAdapter {
             let d = business(request(c, &format!("/sash/api/v1/me/campaigns/{}/claim", crate::adapters::trae::urlencoding_lite(id)), Method::POST, Some(json!({}))).await?)?;
             let status = d.get("status").and_then(|s| s.as_str()).unwrap_or("");
             match status {
-                "CLAIMED" | "" => {
-                    amount = Some(amount.unwrap_or(0.0)
-                        + d.get("grantedAmount").and_then(|g| g.as_f64()).unwrap_or(0.0));
+                // 徽收状态：上游可能回 CLAIMED / SUCCESS / OK，也可能不回 status（空）
+                "CLAIMED" | "SUCCESS" | "OK" | "" => {
+                    // 关键修复：上游**不返回** `grantedAmount`，真实金额在活动自身的
+                    // `benefit.amount`（实测「每天领 100 Credits」→ amount=100）。
+                    // 旧实现只读 grantedAmount，导致回执 amount=0，UI 看起来像没领到。
+                    let granted = d.get("grantedAmount").and_then(|g| g.as_f64())
+                        .or_else(|| d.pointer("/benefit/amount").and_then(|g| g.as_f64()))
+                        .or_else(|| camp.pointer("/benefit/amount").and_then(|g| g.as_f64()))
+                        .unwrap_or(0.0);
+                    amount = Some(amount.unwrap_or(0.0) + granted);
                 }
                 other => return Ok(Receipt { status: "failed".into(), amount: None, message: Some(other.to_string()) }),
             }

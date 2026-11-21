@@ -85,7 +85,7 @@ impl Adapter for ZcodeAdapter {
     async fn claim(&self, c: &Cred, st: &CheckinState) -> Result<Receipt, PlatformError> {
         let plans = st.raw.get("plans").and_then(|p| p.as_array()).cloned().unwrap_or_default();
         if plans.is_empty() {
-            return Ok(Receipt { status: "no-activity".into(), amount: None, message: None });
+            return Ok(Receipt { status: "no-activity".into(), amount: None, message: Some("当前暂无可领取的签到活动（该平台此刻没有可领奖励，或今日已领完）".into()) });
         }
         // 客户端语义（逆向）：成功 = code===0 && data.plan 存在；失败 = code!==0，
         // data.message + data.plan.ends_at（下次可领时间）。无幂等键（body 只有 plan_id）。
@@ -249,7 +249,174 @@ pub async fn fresh_bigmodel_token(c: &Cred) -> Result<String, PlatformError> {
     Ok(tok)
 }
 
-/// 取票单飞锁（并发请求共用一次取票）
+/// 服务端下发的模型（`builtinModels`，已按账号权益过滤）
+#[derive(Debug, Clone)]
+pub struct ZcodeBuiltinModel {
+    pub model_id: String,
+    pub name: String,
+    pub context_window: Option<u64>,
+    pub max_completion_tokens: Option<u64>,
+    pub supports_images: Option<bool>,
+}
+
+/// 拉取服务端 builtin 模型列表（`/api/v1/client/configs` → `data.builtinModels`）。
+///
+/// 该列表由服务端**按账号权益**下发（无权益模型不出现），比客户端硬编码清单准确，
+/// 可避免调用方选到无权益模型而反复吃 `3006`。
+pub async fn fetch_builtin_models(c: &Cred) -> Result<Vec<ZcodeBuiltinModel>, PlatformError> {
+    let jwt = c.meta.get("zcodeJwt").and_then(|d| d.as_str()).filter(|s| !s.is_empty())
+        .ok_or(PlatformError::Auth)?;
+    let mid = c.meta.get("deviceMid").and_then(|d| d.as_str()).unwrap_or("");
+    let ver = std::env::var("ZCODE_APP_VERSION").ok().unwrap_or_else(|| "3.18.2".to_string());
+    let url = format!("{BASE}/api/v1/client/configs?app_version={ver}&platform=win32-x64");
+    let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(12)).build()
+        .map_err(|e| PlatformError::Network(e.to_string()))?;
+    let resp = client.get(&url)
+        .header("Authorization", format!("Bearer {jwt}"))
+        .header("User-Agent", "ZCode/3.18.2")
+        .header("X-ZCode-App-Version", "3.18.2")
+        .header("X-Device-Mid", mid)
+        .send().await.map_err(|e| PlatformError::Network(e.to_string()))?;
+    let st = resp.status().as_u16();
+    if st != 200 {
+        return Err(if st == 401 { PlatformError::Auth } else {
+            PlatformError::Format(format!("client/configs HTTP {st}"))
+        });
+    }
+    let v: Value = resp.json().await.map_err(|e| PlatformError::Format(e.to_string()))?;
+    let arr = v.pointer("/data/builtinModels").and_then(|x| x.as_array()).cloned().unwrap_or_default();
+    let mut out = Vec::new();
+    for m in arr {
+        let id = m.get("modelId").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
+        if id.is_empty() {
+            continue;
+        }
+        let name = m.get("name").and_then(|x| x.as_str()).unwrap_or(&id).to_string();
+        // 上下文窗口：优先 contextWindow，其次 context_window
+        let ctx = m.get("contextWindow").or_else(|| m.get("context_window")).and_then(|x| x.as_u64());
+        let maxc = m.get("maxCompletionTokens").or_else(|| m.get("max_completion_tokens")).and_then(|x| x.as_u64());
+        let vision = m.pointer("/capabilities/vision").and_then(|x| x.as_bool())
+            .or_else(|| m.pointer("/modalities/input").and_then(|x| x.as_array())
+                .map(|a| a.iter().any(|v| v.as_str() == Some("image"))));
+        out.push(ZcodeBuiltinModel {
+            model_id: id,
+            name,
+            context_window: ctx,
+            max_completion_tokens: maxc,
+            supports_images: vision,
+        });
+    }
+    Ok(out)
+}
+
+/// ZCode 服务端的「请求验证」配置（官方 `/api/v1/client/configs` 下发）。
+///
+/// 逆向依据（app.asar `out/host/index.js`）：
+/// - 端点：`GET {BASE}/api/v1/client/configs?app_version=&platform=`，头 `Authorization: <zcodejwttoken>`
+/// - 判定：`requiresRequestVerification = provider.mode==="start-plan"
+///   && captcha.enabled !== false && captcha.skipModelRequest !== true`
+/// - 客户端缓存 1 小时（服务端建议刷新 300s）
+#[derive(Debug, Clone, Default)]
+pub struct ZcodeCaptchaConfig {
+    /// 验证码总开关
+    pub enabled: bool,
+    /// **关键**：true = 模型请求跳过验证码（直连安全）；false = 必须带验证码头
+    pub skip_model_request: bool,
+    pub region: Option<String>,
+    pub prefix: Option<String>,
+    pub scene_id: Option<String>,
+}
+
+impl ZcodeCaptchaConfig {
+    /// 模型直连是否需要验证码头
+    pub fn needs_captcha_for_model(&self) -> bool {
+        self.enabled && !self.skip_model_request
+    }
+}
+
+/// 拉取服务端请求验证配置（失败返回 Err；调用方按「未知」保守处理）
+pub async fn fetch_client_captcha_config(c: &Cred) -> Result<ZcodeCaptchaConfig, PlatformError> {
+    let jwt = c.meta.get("zcodeJwt").and_then(|d| d.as_str()).filter(|s| !s.is_empty())
+        .ok_or(PlatformError::Auth)?;
+    let mid = c.meta.get("deviceMid").and_then(|d| d.as_str()).unwrap_or("");
+    let ver = std::env::var("ZCODE_APP_VERSION").ok().unwrap_or_else(|| "3.18.2".to_string());
+    let url = format!("{BASE}/api/v1/client/configs?app_version={ver}&platform=win32-x64");
+    let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(12)).build()
+        .map_err(|e| PlatformError::Network(e.to_string()))?;
+    let resp = client.get(&url)
+        .header("Authorization", format!("Bearer {jwt}"))
+        .header("User-Agent", "ZCode/3.18.2")
+        .header("X-ZCode-App-Version", "3.18.2")
+        .header("X-Device-Mid", mid)
+        .send().await.map_err(|e| PlatformError::Network(e.to_string()))?;
+    let st = resp.status().as_u16();
+    if st != 200 {
+        return Err(if st == 401 { PlatformError::Auth } else {
+            PlatformError::Format(format!("client/configs HTTP {st}"))
+        });
+    }
+    let v: Value = resp.json().await.map_err(|e| PlatformError::Format(e.to_string()))?;
+    let captcha = v.pointer("/data/configs/captcha").cloned().unwrap_or(Value::Null);
+    let b = |k_snake: &str, k_camel: &str| {
+        captcha.get(k_snake).or_else(|| captcha.get(k_camel)).and_then(|x| x.as_bool())
+    };
+    let s = |k: &str| captcha.get(k).and_then(|x| x.as_str()).map(|s| s.to_string());
+    Ok(ZcodeCaptchaConfig {
+        enabled: b("enabled", "enabled").unwrap_or(false),
+        skip_model_request: b("skip_model_request", "skipModelRequest").unwrap_or(false),
+        region: s("region"),
+        prefix: s("prefix"),
+        scene_id: s("sceneId").or_else(|| s("scene_id")),
+    })
+}
+
+/// 带缓存 + 单飞的「模型请求是否需要验证码」查询。
+///
+/// 返回 `Some(true)` = 需要（直连会被判异常）；`Some(false)` = 不需要；
+/// `None` = 查询失败（未知，调用方不该因此阻塞正常请求）。
+pub async fn model_request_needs_captcha(c: &Cred) -> Option<bool> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    /// 服务端建议 300s 刷新；这里取 5 分钟
+    const TTL: std::time::Duration = std::time::Duration::from_secs(300);
+    static CACHE: OnceLock<Mutex<HashMap<String, (bool, std::time::Instant)>>> = OnceLock::new();
+    let key = c.meta.get("zcodeJwt").and_then(|d| d.as_str()).unwrap_or("").chars().take(24).collect::<String>();
+    let map = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(g) = map.lock() {
+        if let Some((v, at)) = g.get(&key) {
+            if at.elapsed() < TTL {
+                return Some(*v);
+            }
+        }
+    }
+    let single = captcha_probe_lock().lock().await;
+    if let Ok(g) = map.lock() {
+        if let Some((v, at)) = g.get(&key) {
+            if at.elapsed() < TTL {
+                return Some(*v);
+            }
+        }
+    }
+    let out = match fetch_client_captcha_config(c).await {
+        Ok(cfg) => {
+            let needs = cfg.needs_captcha_for_model();
+            if let Ok(mut g) = map.lock() {
+                g.insert(key, (needs, std::time::Instant::now()));
+            }
+            Some(needs)
+        }
+        Err(_) => None,
+    };
+    drop(single);
+    out
+}
+
+/// 验证配置查询单飞锁
+fn captcha_probe_lock() -> &'static tokio::sync::Mutex<()> {
+    static L: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    L.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
 fn bigmodel_fetch_lock() -> &'static tokio::sync::Mutex<()> {
     static L: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
     L.get_or_init(|| tokio::sync::Mutex::new(()))

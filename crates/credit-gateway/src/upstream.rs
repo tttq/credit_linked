@@ -682,8 +682,9 @@ where
                     if st.produced {
                         return Some((Err(msg), st));
                     }
-                    // 非「中途断开」类错误 → 不重试
-                    if !msg.starts_with(STREAM_DISCONNECT_PREFIX) {
+                    // 非「可重试」错误 ��� 不重试
+                    // 可重试：① 流中途断开；② 账号当日额度耗尽（换号重发才能恢复）
+                    if !msg.starts_with(STREAM_DISCONNECT_PREFIX) && !msg.starts_with(STREAM_QUOTA_PREFIX) {
                         return Some((Err(msg), st));
                     }
                     if st.attempts >= STREAM_RETRY_MAX_ATTEMPTS {
@@ -696,7 +697,8 @@ where
                         ));
                     }
                     eprintln!(
-                        "[gateway] 上游流中途断开且尚未产出内容，自动重试 {}/{}",
+                        "[gateway] {}，自动重试 {}/{}",
+                        if msg.starts_with(STREAM_QUOTA_PREFIX) { "账号额度耗尽，换号重发" } else { "上游流中途断开且尚未产出内容" },
                         st.attempts, STREAM_RETRY_MAX_ATTEMPTS - 1
                     );
                     // 指数退避 + 抖动，避免多个并发请求同时重试打爆上游
@@ -726,6 +728,11 @@ pub type StreamBoxFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Re
 
 /// 「上游流中途断开」错误前缀（可重试标记；重试器据此判定是否值得重发）
 pub const STREAM_DISCONNECT_PREFIX: &str = "上游在流式传输中途断开连接";
+/// 「账号当日额度/计费次数耗尽」错误前缀。
+///
+/// 与「中途断开」共用同一套重试机制（都只在**尚未产出内容**时重发），
+/// 但语义不同：断开是网络问题（同账号重试），额度耗尽必须**换账号**才能恢复。
+pub const STREAM_QUOTA_PREFIX: &str = "账号额度已耗尽";
 
 /// 流式请求的最大尝试次数（首次 + 重试）
 pub const STREAM_RETRY_MAX_ATTEMPTS: u32 = 3;
@@ -783,15 +790,29 @@ pub fn parse_trae_sse(stream: impl Stream<Item = Result<bytes::Bytes, String>> +
 
 // ============================ ZCode（智谱） ============================
 
-/// 智谱模型清单：对齐官方 ZCode 客户端 builtin 目录（3.18.2，resources/glm/provider/
-/// zcode-builtin.json 逆向）——Start Plan（account:zai/bigmodel-start-plan）builtin 声明
-/// GLM-5.3-Flash / GLM-5.2 / GLM-5-Turbo；GLM-5.3 属 Coding Plan 档。
-/// 旧清单（glm-5.3-flash 小写 / glm-5-flash / glm-5.3-air / glm-4.7）是错的，上游不认识。
+/// 智谱模型清单。
 ///
-/// 2026-11-19 Start Plan 端点实测：GLM-5.3-Flash / GLM-5.3 返回 200；GLM-5.2 与
-/// GLM-5-Turbo 返回 400 code=3006（model not allowed）—— 按账号权益放开，故保留在清单里
-/// 但请求时会给出明确报错。
-pub async fn zcode_fetch_models(_cred: &Cred) -> Result<Vec<ModelInfo>, PlatformError> {
+/// **首选：服务端按账号下发的 `builtinModels`**（`/api/v1/client/configs` 的 `data.builtinModels`）。
+/// 2026-11-21 实测：该列表已按账号权益过滤（无权益的 GLM-5.2 / GLM-5-Turbo 不在其中），
+/// 并带 `contextWindow` / `maxCompletionTokens` / `capabilities.vision` / `reasoning` 元数据。
+/// 用它做模型源可以**避免把无权益模型暴露给调用方**（每次 3006 都是无谓的上游请求
+/// 与潜在风控信号）。
+///
+/// 回落清单（服务端不可达时）：官方客户端 builtin 目录声明
+/// GLM-5.3-Flash / GLM-5.2 / GLM-5-Turbo / GLM-5.3，按账号权益放开。
+pub async fn zcode_fetch_models(cred: &Cred) -> Result<Vec<ModelInfo>, PlatformError> {
+    if let Ok(list) = credit_core::adapters::zcode::fetch_builtin_models(cred).await {
+        if !list.is_empty() {
+            return Ok(list.into_iter().map(|m| ModelInfo {
+                id: m.model_id,
+                name: m.name,
+                context_window: m.context_window,
+                max_tokens: m.max_completion_tokens,
+                credit_multiplier: None,
+                supports_images: m.supports_images,
+            }).collect());
+        }
+    }
     let mut out = Vec::new();
     for (id, name, ctx) in [
         ("GLM-5.3-Flash", "GLM-5.3-Flash", 200_000u64),
@@ -858,6 +879,105 @@ fn zcode_apikey_body(body: &Value) -> Value {
         o.insert("stream".into(), Value::Bool(true));
     }
     out
+}
+
+/// ZCode Start Plan 的防封控制器：冷却 + 节流。
+///
+/// 依据（对官方客户端与线上配置的逆向结论）：
+/// - Start Plan 的模型请求是否要人机验证由服务端 `captcha.skip_model_request` 决定；
+///   若为 `false` 而我们不带验证码头直连，就会被判"非官方客户端"并累积风控。
+/// - 被拒（`3012`）后继续高频试探只会加深风控，必须**冷却**。
+/// - 上游判定也看行为分布：常驻进程连发与官方客户端"一次一两轮"差异极大，
+///   因此给 Start Plan 加最小请求间隔（带抖动），默认 1500ms，
+///   可用 `ZCODE_STARTPLAN_MIN_INTERVAL_MS` 覆盖（0 = 关闭）。
+const ZCODE_STARTPLAN_COOLDOWN: Duration = Duration::from_secs(30 * 60);
+
+fn zcode_startplan_min_interval() -> Duration {
+    let ms = std::env::var("ZCODE_STARTPLAN_MIN_INTERVAL_MS").ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(1500);
+    Duration::from_millis(ms)
+}
+
+fn zcode_cooldown_map() -> &'static std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>> {
+    static M: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>> = std::sync::OnceLock::new();
+    M.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// 是否处于 3012 冷却期（是 → 直接跳过 Start Plan，不发送请求）
+fn zcode_startplan_in_cooldown(uid: &str) -> bool {
+    let m = zcode_cooldown_map().lock().unwrap_or_else(|e| e.into_inner());
+    m.get(uid).map(|at| at.elapsed() < ZCODE_STARTPLAN_COOLDOWN).unwrap_or(false)
+}
+
+/// 记录一次 3012 冷却
+fn zcode_startplan_mark_blocked(uid: &str) {
+    let mut m = zcode_cooldown_map().lock().unwrap_or_else(|e| e.into_inner());
+    m.insert(uid.to_string(), std::time::Instant::now());
+}
+
+/// Start Plan 节流：同一账号两次请求之间留最小间隔 + 抖动
+async fn zcode_startplan_pace(uid: &str) {
+    let min = zcode_startplan_min_interval();
+    if min.is_zero() {
+        return;
+    }
+    static LAST: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>> = std::sync::OnceLock::new();
+    let map = LAST.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let wait = {
+        let mut g = map.lock().unwrap_or_else(|e| e.into_inner());
+        let now = std::time::Instant::now();
+        let wait = match g.get(uid) {
+            Some(prev) => min.saturating_sub(now.saturating_duration_since(*prev)),
+            None => Duration::ZERO,
+        };
+        g.insert(uid.to_string(), now + wait);
+        wait
+    };
+    if !wait.is_zero() {
+        // 抖动 0~400ms，避免精确等间隔本身成为机器特征
+        let jitter = (uuid::Uuid::new_v4().as_u128() % 400) as u64;
+        tokio::time::sleep(wait + Duration::from_millis(jitter)).await;
+    }
+}
+
+/// Start Plan 在途并发上限（默认 1：官方客户端本身就是一轮一轮发，串行最像人）。
+/// 可用 `ZCODE_STARTPLAN_CONCURRENCY` 覆盖（0 = 不限）。
+fn zcode_startplan_concurrency() -> usize {
+    std::env::var("ZCODE_STARTPLAN_CONCURRENCY").ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(1)
+}
+
+/// Start Plan 全局在途闸门（进程内共享）
+fn zcode_startplan_gate() -> Option<std::sync::Arc<tokio::sync::Semaphore>> {
+    static G: std::sync::OnceLock<Option<std::sync::Arc<tokio::sync::Semaphore>>> = std::sync::OnceLock::new();
+    G.get_or_init(|| {
+        let n = zcode_startplan_concurrency();
+        if n == 0 { None } else { Some(std::sync::Arc::new(tokio::sync::Semaphore::new(n))) }
+    }).clone()
+}
+
+/// 取一个 Start Plan 在途许可（返回的 permit 需随流存活）
+async fn zcode_startplan_acquire() -> Option<tokio::sync::OwnedSemaphorePermit> {
+    match zcode_startplan_gate() {
+        Some(sem) => sem.acquire_owned().await.ok(),
+        None => None,
+    }
+}
+
+/// 取 ZCode 渠道校验 param（阿里云验证码 `captchaVerifyParam`）。
+///
+/// 来源：账号 meta `captchaVerifyParam`，或环境变量 `ZCODE_CAPTCHA_VERIFY_PARAM`。
+/// 该 param 由官方客户端渲染进程跑阿里云验证码一次性生成（与设备指纹/行为绑定，
+/// 服务端有 F008 复用检测），网关**无法离线生成**，只能走一次官方验证后填入（短时效）。
+fn zcode_captcha_param(cred: &Cred) -> Option<String> {
+    let from_meta = cred.meta.get("captchaVerifyParam").and_then(|v| v.as_str())
+        .unwrap_or("").trim().to_string();
+    if !from_meta.is_empty() {
+        return Some(from_meta);
+    }
+    std::env::var("ZCODE_CAPTCHA_VERIFY_PARAM").ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
 }
 
 /// ZCode 直连智谱开放平台（**API Key 通道**）：`POST {ZCODE_CHAT_BASE}{ZCODE_CHAT_PATH}`。
@@ -943,6 +1063,34 @@ pub async fn zcode_chat_stream(cred: &Cred, body: Value) -> Result<EventStream, 
     }
 
     // —— ① Start Plan 专属端点（官方同款）——
+    //
+    // 防封前置检查（任何一项命中都**不发请求**，避免继续累积风控）：
+    // a) 刚被 3012 拒过 → 冷却期内直接走回退通道
+    // b) 服务端配置要求模型请求带人机验证、而我们没有合法 param → 直连必被判异常
+    let uid_key = if cred.uid.is_empty() { cred.token.chars().take(16).collect::<String>() } else { cred.uid.clone() };
+    if zcode_startplan_in_cooldown(&uid_key) {
+        eprintln!(
+            "[zcode] Start Plan 处于 3012 冷却期（{} 分钟），本轮直接走回退通道",
+            ZCODE_STARTPLAN_COOLDOWN.as_secs() / 60
+        );
+        return zcode_bigmodel_fallback(cred, a_body, &sys, mid).await;
+    }
+    if zcode_captcha_param(cred).is_none() {
+        if let Some(true) = credit_core::adapters::zcode::model_request_needs_captcha(cred).await {
+            return Err(
+                "ZCode Start Plan 当前被服务端要求「模型请求人机验证」（captcha.skip_model_request=false）。\
+                 直连请求缺少 `X-Aliyun-Captcha-Verify-Param` 会被判为非官方客户端并累积风控，\
+                 因此**已阻止本次直连**（不发请求 = 不加深风控）。\
+                 \n出路：① 在官方 ZCode 客户端里正常发一条消息（客户端会完成验证），\
+                 再用可获取到的一次性 param 填入账号 meta.captchaVerifyParam；\
+                 ② 改用智谱开放平台 API Key（ZCODE_API_KEY，无渠道校验）；\
+                 ③ 开通 bigmodel Coding Plan 走回退通道（该通道不需要验证码头）。".to_string()
+            );
+        }
+    }
+    // c) 节流：与官方客户端「一次一两轮」的节奏对齐，避免连发形成机器特征
+    zcode_startplan_pace(&uid_key).await;
+
     // system 前两块必须是官方固定文本，否则服务端返回 3012。
     a_body["system"] = Value::Array(crate::protocol::zcode_start_plan_system_blocks(&sys));
     a_body["stream"] = Value::Bool(true);
@@ -951,15 +1099,55 @@ pub async fn zcode_chat_stream(cred: &Cred, body: Value) -> Result<EventStream, 
     let hs = crate::protocol::zcode_plan_chat_headers(&jwt, mid);
     let mut req = stream_client().post(&url).json(&a_body);
     for (k, v) in &hs { req = req.header(k, v); }
+    // 渠道校验头（阿里云验证码）——仅在 start-plan 且服务端要求时使用。
+    // 头名与构造来自官方 Host 逆向：`requestVerificationClaimHeaders`
+    //   { "X-Aliyun-Captcha-Verify-Param": <param>, ["X-Aliyun-Captcha-Verify-Region": <region>] }
+    // param 由官方渲染进程跑验证码一次性生成（与设备指纹/行为绑定、F008 复用检测），
+    // 网关无法离线生成；若账号 meta/env 提供了合法 param 就带上，否则不发（缺头 < 假头）。
+    if let Some(param) = zcode_captcha_param(cred) {
+        req = req.header("X-Aliyun-Captcha-Verify-Param", param);
+        let region = cred.meta.get("captchaRegion").and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+            .or_else(|| std::env::var("ZCODE_CAPTCHA_VERIFY_REGION").ok()
+                .map(|s| s.trim().to_string()).filter(|s| !s.is_empty()));
+        if let Some(region) = region {
+            req = req.header("X-Aliyun-Captcha-Verify-Region", region);
+        }
+    }
+    // d) 在途并发闸门：官方客户端一轮一轮发，这里默认只允许 1 个在途请求。
+    //    许可随流存活到响应读完，避免「并发批量请求」这种最容易被判代理的特征。
+    let slot = zcode_startplan_acquire().await;
     let resp = match req.send().await {
         Ok(r) => r,
         Err(e) => return Err(format!("ZCode 对话端点请求失败（{url}）：{e}")),
     };
     let st = resp.status().as_u16();
     if st == 200 {
-        return Ok(parse_anthropic_sse(into_sse_stream(resp.bytes_stream())));
+        let ev = parse_anthropic_sse(into_sse_stream(resp.bytes_stream()));
+        // 把许可绑到流上：流读完/被丢弃前一直占着槽位
+        return Ok(Box::pin(ev.map(move |x| {
+            let _ = &slot;
+            x
+        })));
     }
     let txt = resp.text().await.unwrap_or_default();
+    // 渠道校验（阿里云验证码）：start-plan 模式下每个模型请求都要求
+    // `X-Aliyun-Captcha-Verify-Param`（官方渲染进程跑验证码后一次性生成）。
+    // 服务端文案：`请完成安全验证` / `security verification`。
+    if txt.contains("请完成安全验证") || txt.to_lowercase().contains("security verification")
+        || txt.contains("X-Aliyun-Captcha") || txt.contains("captcha")
+    {
+        return Err(format!(
+            "ZCode 渠道校验要求完成人机验证（阿里云验证码，HTTP {st}）：{txt}。\
+             \n【机制】start-plan 模式下模型请求必须携带 `X-Aliyun-Captcha-Verify-Param`；\
+             该参数由官方客户端渲染进程跑阿里云验证码生成，与设备指纹/行为绑定、一次一用\
+             （服务端有 F008 复用检测），网关无法离线生成。\
+             \n【出路】① 改用智谱开放平台 API Key（ZCODE_API_KEY，无任何渠道校验）；\
+             ② 开通 bigmodel Coding Plan 走回退通道（不需要验证码头）；\
+             ③ 若确已从官方客户端取得一次有效 param，可临时填入账号 meta.captchaVerifyParam /\
+             环境变量 ZCODE_CAPTCHA_VERIFY_PARAM 复用一次。"
+        ));
+    }
     // 3012 = 官方客户端身份闸门未过（版本头或 system 块不匹配）
     //
     // 2026-11-20 实测：服务端 3012 的文案已变成
@@ -969,22 +1157,30 @@ pub async fn zcode_chat_stream(cred: &Cred, body: Value) -> Result<EventStream, 
     // 此时 Start Plan 通道对本账号**永久不可用**，再重试无意义 —— 必须走 ② bigmodel 回退，
     // 否则 ZCode 整体不可用（旧实现在这里直接 return Err，回退分支永远走不到）。
     if txt.contains("3012") {
-        eprintln!("[zcode] Start Plan 被拒（code=3012，含账号封禁语义），改走 bigmodel Coding-Plan 回退");
+        // 冷却：3012 多为「非官方客户端/账号受限」，继续高频试探只会加深风控
+        zcode_startplan_mark_blocked(&uid_key);
+        eprintln!(
+            "[zcode] Start Plan 被拒（code=3012），进入 {} 分钟冷却，改走 bigmodel Coding-Plan 回退",
+            ZCODE_STARTPLAN_COOLDOWN.as_secs() / 60
+        );
         // 回退也失败时，把两条通道的原因 + 出路一起报出来
         return match zcode_bigmodel_fallback(cred, a_body, &sys, mid).await {
             Ok(s) => Ok(s),
             Err(fb) => Err(format!(
                 "ZCode Start Plan 被拒（code=3012）：{}；回退到 bigmodel Coding-Plan 也失败：{}。\
-                 \n【为什么被封】Start Plan 是**只允许官方 ZCode 客户端使用**的档位：\
-                 它的渠道校验需要官方桌面 Host 进程在**每个请求上动态签发**运行时凭据\
-                 （`interaction/requestProviderRuntimeHeaders` → accountScope + headers），\
-                 该凭据绑定客户端进程身份，网关注入/伪造不了；\
-                 仅「本机开着 ZCode 客户端」并不构成授权——请求不是那个进程发出的。\
+                 \n【为什么被封】Start Plan 是**只允许官方 ZCode 客户端使用**的档位。\
+                 完整逆向确认它的渠道校验头是**阿里云验证码凭证**：\
+                 `X-Aliyun-Captcha-Verify-Param`（+ 可选 -Region），\
+                 由官方客户端渲染进程跑验证码一次性生成、与设备指纹/行为绑定、一次一用\
+                 （服务端有 F008 复用检测）；网关没有浏览器环境，无法生成。\
+                 仅「本机开着 ZCode 客户端」不构成授权——请求不是那个进程发出的。\
                  所以任何网关/代理方式使用 Start Plan，都会被判为 proxying to non-ZCode clients。\
+                 （完整链路与可复现性分析见 docs/zcode-channel-verification.md）\
                  \n【稳定解法（按推荐顺序）】\
                  ① 智谱开放平台 API Key：设环境变量 ZCODE_API_KEY=<key> 后重启网关\
-                 （走官方标准接口 /api/paas/v4/chat/completions，无渠道校验、按量计费，最稳）；\
-                 ② 开通 bigmodel Coding Plan / 资源包后，回退通道即可直接使用；\
+                 （官方标准接口 /api/paas/v4/chat/completions，无渠道校验、无验证码、按量计费，最稳）；\
+                 ② 开通 bigmodel Coding Plan / 资源包后，回退通道即可直接使用\
+                 （该通道 requiresRequestVerification=false，不需要验证码头）；\
                  ③ 改用其它已可用平台（码道/Qoder/MiniMax/Trae 等）。\
                  被封账号请向 ZCode 申诉；换新号用同样方式仍会被封。",
                 truncate(&txt, 240), fb

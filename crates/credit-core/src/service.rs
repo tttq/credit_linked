@@ -41,6 +41,38 @@ pub fn adapter_for(provider: &str) -> Option<Box<dyn Adapter>> {
     }
 }
 
+// ============================ 签到串行化 / 连点去重 ============================
+
+/// 同一账号签到互斥锁（进程内）：防止双击/并发调用重复领取
+fn checkin_locks() -> &'static std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>> {
+    static M: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>> = std::sync::OnceLock::new();
+    M.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn checkin_lock(key: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    let mut m = checkin_locks().lock().unwrap_or_else(|e| e.into_inner());
+    m.entry(key.to_string()).or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(()))).clone()
+}
+
+/// 「刚刚才签到成功」的短时效标记（90s）：只用于连点幂等，
+/// **不**参与跨窗口判重 —— 各平台领取窗口不同（Qoder 10:00 重置），按自然日判重会误伤。
+const CHECKIN_RECENT_SECS: u64 = 90;
+
+fn checkin_recent() -> &'static std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>> {
+    static M: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>> = std::sync::OnceLock::new();
+    M.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn checkin_recent_success(key: &str) -> bool {
+    let m = checkin_recent().lock().unwrap_or_else(|e| e.into_inner());
+    m.get(key).map(|at| at.elapsed().as_secs() < CHECKIN_RECENT_SECS).unwrap_or(false)
+}
+
+fn checkin_mark_recent(key: &str) {
+    let mut m = checkin_recent().lock().unwrap_or_else(|e| e.into_inner());
+    m.insert(key.to_string(), std::time::Instant::now());
+}
+
 impl Service {
     /// 遇 Auth（401/过期）时尝试恢复凭据：minimax 优先读本机客户端最新 auth.json（本地客户端持续轮换 token），否则走 refresh 链。
     pub async fn refreshed_cred(&self, provider: &str, uid: &str, cred: &Cred) -> Result<Cred, PlatformError> {
@@ -50,10 +82,15 @@ impl Service {
                 let mut nc = crate::adapters::minimax_local::to_cred(live);
                 nc.uid = uid.to_string();
                 nc.name = cred.name.clone();
-                if let Ok(auth) = serde_json::to_string(&nc) {
-                    let _ = self.store.upsert_account(provider, uid, &nc.name, "", &auth);
+                // **只有本机 token 与当前不同（客户端真的轮换过）才采用**。
+                // 旧实现无条件返回本机凭据：当本机文件里也是同一个过期 token 时，
+                // 会把真正的 `adapter.refresh()` 短路掉 → minimax 永远停在 auth-expired。
+                if !nc.token.is_empty() && nc.token != cred.token {
+                    if let Ok(auth) = serde_json::to_string(&nc) {
+                        let _ = self.store.upsert_account(provider, uid, &nc.name, "", &auth);
+                    }
+                    return Ok(nc);
                 }
-                return Ok(nc);
             }
         }
         let nc = adapter.refresh(cred).await?;
@@ -434,6 +471,18 @@ impl Service {
     /// 对单账号执行完整签到：当日已签直接幂等返回 → trae 设备号仲裁 → state/claim 链路 →
     /// 结果与状态落库（平台侧失败也转为 outcome 落库，不向上抛）。
     pub async fn checkin_account(&self, provider: &str, uid: &str) -> Result<CheckinOutcome, PlatformError> {
+        // 同账号签到串行化 + 近期成功去重（双要点两次不会重复领取）
+        let key = format!("{provider}:{uid}");
+        let lock = checkin_lock(&key);
+        // 近期已成功 → 直接幂等返回（仅防连点，不影响跨窗口的再次领取）
+        if checkin_recent_success(&key) {
+            return Ok(CheckinOutcome { provider: provider.into(), uid: uid.into(), status: "already".into(), amount: None, message: Some("刚刚已完成".into()) });
+        }
+        let _guard = lock.lock_owned().await;
+        if checkin_recent_success(&key) {
+            return Ok(CheckinOutcome { provider: provider.into(), uid: uid.into(), status: "already".into(), amount: None, message: Some("刚刚已完成".into()) });
+        }
+
         let accounts = self.store.list_accounts().map_err(|e| PlatformError::Local(e.to_string()))?;
         let Some((_, _, name, secret_b64, auth)) = accounts.iter().find(|(p, u, _, _, _)| p == provider && u == uid) else {
             return Err(PlatformError::Local(format!("account {provider}:{uid} not found")));
@@ -442,24 +491,28 @@ impl Service {
         let _ = secret_b64; // secret 字段保存加密凭据；本轮 cred 明文存 auth 列（单机 DPAPI 由 vault 处理）
         // trae 多账号设备号仲裁（去重/挑空闲）在请求前完成
         self.trae_pick_device(provider, uid, &mut cred);
-        // 码道（CodeArts）：STS 有效期短（约 1h）且客户端会轮换 RT —— 签到前主动续期，
-        // 避免「账号过期」直接失败；续期失败不阻塞（state/claim 链路里还有 Auth 恢复兜底）
+        // 码道（CodeArts）：STS 有效期短（约 1h）且客户端会轮换 RT —— 签到前主动续期。
+        // **但签到路径绝不等客户端、也不拉起客户端 GUI**（allow_wait=false）：
+        // 旧实现用 allow_wait=true，会去 launch 客户端并长时间等待，导致「一键签到」整体挂死。
+        // 这里再套 12s 硬超时，续期失败不阻塞 —— state/claim 链路里还有 Auth 恢复兜底。
         if provider.starts_with("codearts") {
-            if let Ok(fresh) = self.ensure_codearts_fresh(&cred).await {
+            if let Ok(Ok(fresh)) = tokio::time::timeout(
+                std::time::Duration::from_secs(12),
+                self.ensure_codearts_fresh_opts(&cred, false),
+            )
+            .await
+            {
                 cred = fresh;
             }
         }
         let adapter = adapter_for(provider).ok_or_else(|| PlatformError::Local(format!("no adapter for {provider}")))?;
         let cycle = crate::adapters::day_cn();
 
-        // 当日已成功/已领 → 直接 already（幂等）；同时纠正状态列可能的残留失败态
-        if let Ok(rows) = self.store.history_today(provider, uid, &cycle) {
-            if !rows.is_empty() {
-                let _ = self.store.update_account_status(provider, uid, "already", Some("今日已完成"));
-                return Ok(CheckinOutcome { provider: provider.into(), uid: uid.into(), status: "already".into(), amount: None, message: Some("今日已完成".into()) });
-            }
-        }
-
+        // **不再按「自然日」短路**：各平台的领取窗口并不都是零点重置
+        // （如 Qoder「每天领 100 Credits」是 10:00(UTC+8) 开新窗口、次日 09:59 结束）。
+        // 用自然日判重会在 00:00–09:59 之间把当天的真实领取误判成"今日已完成"，
+        // 从而整天空转。这里改为**以服务端 state 为准**：服务端说可领就领，
+        // 说已领就返回 already（各 adapter 的 claim 已内置 st.checked 判断）。
         let mut outcome = match self.state_and_claim(provider, uid, &mut cred, adapter.as_ref()).await {
             Ok(o) => o,
             Err(e) => {
@@ -471,7 +524,12 @@ impl Service {
         // 签到失败/授权过期 → 自动续期（重新扫描本机客户端会话 → STS RT 续期 → 拉起客户端）
         // 后整链重试一次；重试仍失败才落库失败态
         if matches!(outcome.status.as_str(), "failed" | "auth-expired") && provider.starts_with("codearts") {
-            if let Ok(fresh) = self.ensure_codearts_fresh(&cred).await {
+            if let Ok(Ok(fresh)) = tokio::time::timeout(
+                std::time::Duration::from_secs(12),
+                self.ensure_codearts_fresh_opts(&cred, false),
+            )
+            .await
+            {
                 cred = fresh;
                 match self.state_and_claim(provider, uid, &mut cred, adapter.as_ref()).await {
                     Ok(retry) if retry.status != "failed" && retry.status != "auth-expired" => {
@@ -485,6 +543,10 @@ impl Service {
         }
         let _ = self.store.record_history(provider, uid, name, &cycle, &outcome.status, outcome.amount, outcome.message.as_deref(), &crate::adapters::now_iso());
         let _ = self.store.update_account_status(provider, uid, &outcome.status, outcome.message.as_deref());
+        // 连点幂等：成功（或服务端判定已领）都记一笔短时效标记
+        if matches!(outcome.status.as_str(), "success" | "already") {
+            checkin_mark_recent(&key);
+        }
         Ok(outcome)
     }
 
@@ -495,10 +557,13 @@ impl Service {
     /// 与设备号无关 —— 换 x-device-id 只对 9074/9095 有效。正确处理：refresh 换新 token
     /// 后重试一次；refresh 失败才落失败态（提示重新登录）。
     async fn state_and_claim(&self, provider: &str, uid: &str, cred: &mut Cred, adapter: &dyn Adapter) -> Result<CheckinOutcome, PlatformError> {
-        // state 报 Auth（含 trae 1001 映射）→ 先续期再查状态
+        // state 报 Auth（含 trae 1001 映射）→ 先续期再查状态。
+        // **不再要求 refresh_token 存在**：minimax/trae/qoder/wb/codearts 的凭据主要靠
+        // 「本机客户端轮换后重新扫描」恢复（refreshed_cred 内部先读本机会话，再走 refresh 链），
+        // 旧条件 `refresh_token.is_some()` 会把「客户端还开着、只是 token 换了」的账号直接判死。
         let st = match adapter.state(cred).await {
             Ok(s) => s,
-            Err(PlatformError::Auth) if cred.refresh_token.is_some() => {
+            Err(PlatformError::Auth) => {
                 *cred = self.refreshed_cred(provider, uid, cred).await?;
                 adapter.state(cred).await?
             }
@@ -507,7 +572,7 @@ impl Service {
         let receipt = adapter.claim(cred, &st).await;
         // claim 报 BUSINESS code=1001/1002（token 过期）→ refresh 换票后重试一次（不换设备号）
         let receipt = match &receipt {
-            Err(e) if is_auth_business_err(e) && cred.refresh_token.is_some() => {
+            Err(e) if is_auth_business_err(e) => {
                 match self.refreshed_cred(provider, uid, cred).await {
                     Ok(nc) => {
                         *cred = nc;
@@ -586,7 +651,21 @@ impl Service {
     }
 
     /// UI 快照：账号全行 + 最近历史。
+    /// 清理脏账号行（uid 为空）：这类行是早期导入/同步写坏的数据，
+    /// 会导致「一键签到」反复撞同一个不存在的账号、并把 bad cred 当成真实账号展示。
+    pub fn prune_dirty_accounts(&self) -> usize {
+        let Ok(rows) = self.store.list_accounts() else { return 0 };
+        let mut n = 0;
+        for (p, u, _n, _s, _a) in rows {
+            if u.trim().is_empty() && self.store.delete_account(&p, &u).is_ok() {
+                n += 1;
+            }
+        }
+        n
+    }
+
     pub fn ui_snapshot(&self) -> Value {
+        self.prune_dirty_accounts();
         self.reconcile_statuses();
         let accounts = self.store.list_accounts_full().unwrap_or_default();
         let history = self.store.list_history(50).unwrap_or_default();

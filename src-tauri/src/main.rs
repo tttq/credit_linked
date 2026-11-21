@@ -41,14 +41,45 @@ async fn checkin(provider: String, uid: String, all: bool) -> Result<serde_json:
         vec![(provider, uid)]
     };
     let mut out = Vec::new();
+    // 并发执行（上限 4）+ 每账号硬超时：
+    // 旧实现串行且无超时 —— 任何一个平台卡住（凭据自愈/拉起客户端/上游无响应）
+    // 都会让「一键签到」整体挂死。现在单个账号最多拖 75s，其余照常完成。
+    let sem = Arc::new(tokio::sync::Semaphore::new(4));
+    let mut tasks = Vec::new();
     for (p, u) in ids {
-        match s.checkin_account(&p, &u).await {
-            Ok(o) => out.push(serde_json::json!({
-                "provider": o.provider, "uid": o.uid, "name": p_name(&s, &p, &u),
+        if u.trim().is_empty() {
+            continue; // 脏行（uid 为空）直接跳过
+        }
+        let store = s.store.clone();
+        let sem = sem.clone();
+        tasks.push(tokio::spawn(async move {
+            let _permit = sem.acquire_owned().await;
+            let svc = Service { store };
+            let name = p_name(&svc, &p, &u);
+            let r = tokio::time::timeout(
+                std::time::Duration::from_secs(75),
+                svc.checkin_account(&p, &u),
+            )
+            .await;
+            (p, u, name, r)
+        }));
+    }
+    for t in tasks {
+        match t.await {
+            Ok((_p, _u, name, Ok(Ok(o)))) => out.push(serde_json::json!({
+                "provider": o.provider, "uid": o.uid, "name": name,
                 "status": o.status, "amount": o.amount, "message": o.message,
             })),
-            Err(e) => out.push(serde_json::json!({
-                "provider": p, "uid": u, "status": "failed", "message": e.to_string(),
+            Ok((p, u, name, Ok(Err(e)))) => out.push(serde_json::json!({
+                "provider": p, "uid": u, "name": name, "status": "failed", "message": e.to_string(),
+            })),
+            Ok((p, u, name, Err(_elapsed))) => out.push(serde_json::json!({
+                "provider": p, "uid": u, "name": name, "status": "failed",
+                "message": "签到超时（75s，已跳过该账号，不影响其它平台）",
+            })),
+            Err(join) => out.push(serde_json::json!({
+                "provider": "", "uid": "", "status": "failed",
+                "message": format!("签到任务异常结束：{join}"),
             })),
         }
     }

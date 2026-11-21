@@ -490,7 +490,7 @@ async fn refresh_creds_for(st: &Arc<GatewayState>, platform: Platform, stale: &C
 
 /// 模型条目 → OpenAI /v1/models 行
 fn model_entry(m: &upstream::ModelInfo, raw: &str, id: &str) -> Value {
-    json!({
+    let mut v = json!({
         "id": id,
         "object": "model",
         "created": 0,
@@ -501,7 +501,12 @@ fn model_entry(m: &upstream::ModelInfo, raw: &str, id: &str) -> Value {
         "context_window": m.context_window,
         "max_tokens": m.max_tokens,
         "credit_multiplier": m.credit_multiplier,
-    })
+    });
+    // 多模态能力：只在已知时输出（客户端据此决定能否发图）
+    if let Some(si) = m.supports_images {
+        v["supports_images"] = json!(si);
+    }
+    v
 }
 
 /// 最近实际用过的模型 (platform, 裸 model id)，按最近使用排序去重。
@@ -968,6 +973,7 @@ async fn chat_completions(
             }
         }
     }
+    let pinned = pinned_account.is_some();
     let creds: Vec<Cred> = match pinned_account {
         Some(c) => vec![c],
         None => {
@@ -990,6 +996,9 @@ async fn chat_completions(
         return err_response(StatusCode::SERVICE_UNAVAILABLE, "no_account",
             &format!("平台 {} 没有可用账号，请先在账号管理添加或扫描导入", platform.display()));
     }
+    // 额度冷却过滤：把「今日额度已耗尽」的账号排到队尾（若还有别的账号可用就不选它）。
+    // 这类账号本身是健康的，只是当天额度用完 —— 不能永久标 failed，也不该每次请求都撞一次。
+    let creds = order_by_quota_cooldown(platform, creds, pinned);
 
     // 长上下文保护：按所选模型的上下文窗口截断请求（Agent 累积历史/超大 system 会在上游
     // 挂死或长时间无响应）。截断在 normalize 之前做，保留 assistant.tool_calls 与 tool 回复的配对。
@@ -1020,7 +1029,7 @@ async fn chat_completions(
         }
         for cred in &creds {
             let mut attempt_cred = cred.clone();
-            let mut outcome = dispatch_stream(&st, platform, &attempt_cred, &model, &messages, &system, max_tokens, reasoning_effort.as_deref(), &tools, tool_choice.as_ref()).await;
+            let mut outcome = dispatch_stream(&st, platform, &attempt_cred, &creds, &model, &messages, &system, max_tokens, reasoning_effort.as_deref(), &tools, tool_choice.as_ref()).await;
             // 凭据自愈：minimax/zcode/码道的 token 由本机客户端持续轮换，401 时重读客户端存储
             // （token 未变则自动拉起客户端并等其刷新）再试一次
             if let Err((code, msg)) = &outcome {
@@ -1065,7 +1074,7 @@ async fn chat_completions(
                                 .and_then(|(_, _, _, _, auth)| serde_json::from_str::<Cred>(auth).ok()));
                         if let Some(nc) = pick {
                             attempt_cred = nc;
-                            outcome = dispatch_stream(&st, platform, &attempt_cred, &model, &messages, &system, max_tokens, reasoning_effort.as_deref(), &tools, tool_choice.as_ref()).await;
+                            outcome = dispatch_stream(&st, platform, &attempt_cred, &creds, &model, &messages, &system, max_tokens, reasoning_effort.as_deref(), &tools, tool_choice.as_ref()).await;
                         }
                     }
                 }
@@ -1101,21 +1110,31 @@ async fn chat_completions(
                     let api_key_failure = platform == Platform::Zcode
                         && msg.contains("ZCode(API Key)");
                     // 额度耗尽也视作可切换（各平台错误文案不一）
-                    let quota_exhausted = msg.contains("额度") || msg.contains("不足") || msg.contains("exhaust")
-                        || msg.contains("quota") || msg.contains("credit") || msg.contains("insufficient")
-                        || msg.contains("429") || msg.contains("rate_limit");
+                    let quota_exhausted = is_quota_exhausted_msg(&msg);
                     let failover_worthy = !api_key_failure
                         && (code == "auth" || code == "rate" || code == "network" || code == "upstream" || quota_exhausted);
-                    if failover_worthy && !is_channel_block {
+                    if quota_exhausted && !api_key_failure {
+                        // 额度类：**不标 failed**（账号健康，只是当天用完），改为冷却 + 换号。
+                        // 标 failed 会让账号在本机长期不可用，属于误伤。
+                        let key = format!("{}:{}", attempt_cred.provider, attempt_cred.uid);
+                        let d = mark_quota_cooldown(&key);
+                        eprintln!(
+                            "[gateway] 账号 {} 当日额度/计费次数已耗尽，进入 {} 分钟冷却并切换到其它账号",
+                            key, d.as_secs() / 60
+                        );
+                    } else if failover_worthy && !is_channel_block {
                         // 渠道拦截不算账号故障（账号本身正常，别标 failed）
                         let _ = st.store.update_account_status(&attempt_cred.provider, &attempt_cred.uid, "failed", Some(msg.as_str()));
+                    }
+                    if failover_worthy && !is_channel_block && !quota_exhausted {
                         // 自动切换：当前账号不可用时，把选中账号切到同平台下一个可用账号
                         let cur_ref = format!("{}:{}", attempt_cred.provider, attempt_cred.uid);
                         let selected = st.store.get_setting("gw_account", "").unwrap_or_default();
                         if selected == cur_ref || selected.is_empty() {
                             if let Some(next) = creds.iter().find(|c| {
                                 let r = format!("{}:{}", c.provider, c.uid);
-                                r != cur_ref && !c.token.is_empty()
+                                let pk = format!("{}:{}", platform.as_str(), c.uid);
+                                r != cur_ref && !c.token.is_empty() && !quota_cooldown_active(&pk)
                             }) {
                                 let next_ref = format!("{}:{}", next.provider, next.uid);
                                 let _ = st.store.set_setting("gw_account", &next_ref);
@@ -1157,6 +1176,82 @@ async fn chat_completions(
     err_response(StatusCode::BAD_GATEWAY, &code, &msg)
 }
 
+/// 判断一条上游错误是否是「账号当日额度/计费次数耗尽」。
+///
+/// 与「账号坏了」必须分开处理：额度耗尽时账号本身健康，只是当天用完，
+/// 第二天自动恢复 —— 若按 failed 处理会让账号长期不可用，属于误伤。
+///
+/// Qoder 实测文案：`Qoder 上游错误（110）：Billing daily count exceeded`
+/// 官方错误码表（worker 逆向）：110 = todayUsageLimitExceeded，并归入 quota_exhausted 集合。
+fn is_quota_exhausted_msg(msg: &str) -> bool {
+    let m = msg.to_lowercase();
+    m.contains("billing daily count exceeded")
+        || m.contains("daily count exceeded")
+        || m.contains("todayusagelimitexceeded")
+        || m.contains("user quota exhausted")
+        || m.contains("personalcreditsdrainedout")
+        || m.contains("billinggroupcreditslimitreached")
+        || m.contains("vela free limit") // 119 velaModelFreeLimitReached
+        || msg.contains("额度") || msg.contains("余额不足")
+        || m.contains("insufficient_balance")
+        || m.contains("quota exhausted")
+        || m.contains("rate_limit")
+}
+
+/// 额度冷却时长：到次日（北京时间）再加 5 分钟；兜底 6 小时，上限 12 小时。
+///
+/// Qoder / 智谱均为国内站点，日额度按 UTC+8 零点重置。
+fn quota_cooldown_duration() -> std::time::Duration {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default().as_secs() as i64;
+    let cn = now + 8 * 3600;
+    let next_day_cn = (cn / 86400 + 1) * 86400 + 5 * 60;
+    let secs = (next_day_cn - cn).clamp(6 * 3600, 12 * 3600) as u64;
+    std::time::Duration::from_secs(secs)
+}
+
+/// 额度冷却表（进程内）：key = `provider:uid` → 到期时刻
+fn quota_cooldown_map() -> &'static std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>> {
+    static M: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>> = std::sync::OnceLock::new();
+    M.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn quota_cooldown_active(key: &str) -> bool {
+    let mut m = quota_cooldown_map().lock().unwrap_or_else(|e| e.into_inner());
+    match m.get(key) {
+        Some(at) if *at > std::time::Instant::now() => true,
+        Some(_) => { m.remove(key); false }
+        None => false,
+    }
+}
+
+fn mark_quota_cooldown(key: &str) -> std::time::Duration {
+    let d = quota_cooldown_duration();
+    let mut m = quota_cooldown_map().lock().unwrap_or_else(|e| e.into_inner());
+    m.insert(key.to_string(), std::time::Instant::now() + d);
+    d
+}
+
+/// 把额度冷却中的账号排到队尾（若全部都在冷却则保持原顺序，避免直接无号可用）。
+fn order_by_quota_cooldown(platform: Platform, creds: Vec<Cred>, pinned: bool) -> Vec<Cred> {
+    if pinned || creds.len() < 2 {
+        return creds;
+    }
+    let mut hot: Vec<Cred> = Vec::new();
+    let mut cold: Vec<Cred> = Vec::new();
+    for c in creds {
+        let key = format!("{}:{}", platform.as_str(), c.uid);
+        if quota_cooldown_active(&key) { cold.push(c) } else { hot.push(c) }
+    }
+    if hot.is_empty() {
+        // 全在冷却：仍然尝试（可能额度已恢复/判断有误），但保持原顺序
+        cold
+    } else {
+        hot.extend(cold);
+        hot
+    }
+}
+
 /// 单账号派发：先建流（失败 → (code, msg) 供换号 failover），
 /// 再给流加上「中途断开自动重试」（见 upstream::retry_stream_with）。
 ///
@@ -1170,6 +1265,8 @@ async fn dispatch_stream(
     st: &Arc<GatewayState>,
     platform: Platform,
     cred: &Cred,
+    // 同平台其它候选账号（额度耗尽时用于自动换号重发）
+    alternates: &[Cred],
     model: &str,
     messages: &[Value],
     system: &str,
@@ -1183,10 +1280,27 @@ async fn dispatch_stream(
     // 与官方客户端一次一两轮的节奏差异极大，是最廉价可判的异常信号。
     // 可在设置里用 gatewayConcurrency 调整（默认 6；0 = 不限，恢复旧行为）。
     let permit = acquire_account_permit(st, cred).await;
-    let first = dispatch_once(st, platform, cred, model, messages, system, max_tokens, reasoning_effort, tools, tool_choice).await?;
+    let first_raw = dispatch_once(st, platform, cred, model, messages, system, max_tokens, reasoning_effort, tools, tool_choice).await?;
+    // 额度类错误（Qoder 110 等）是**流内错误事件**：包一层把它转成可重试的 Err，
+    // 这样 retry_stream_with 会自动换账号重发（仅在尚未产出内容时，语义安全）。
+    let first = wrap_quota_to_retry(first_raw, platform, &cred.uid);
+    // 换号池：当前账号优先，其余同平台且不在额度冷却中的账号依次顶上
+    let pool: std::sync::Arc<Vec<Cred>> = std::sync::Arc::new({
+        let mut v = vec![cred.clone()];
+        for c in alternates {
+            if c.uid == cred.uid || c.token.is_empty() {
+                continue;
+            }
+            let k = format!("{}:{}", platform.as_str(), c.uid);
+            if !quota_cooldown_active(&k) {
+                v.push(c.clone());
+            }
+        }
+        v
+    });
+    let idx = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     // 为中途断开的重试准备 owned 副本（只在重试时克隆，正常路径零开销）
     let st2 = st.clone();
-    let cred2 = cred.clone();
     let model2 = model.to_string();
     let messages2 = messages.to_vec();
     let system2 = system.to_string();
@@ -1194,8 +1308,23 @@ async fn dispatch_stream(
     let tools2 = tools.to_vec();
     let tool_choice2 = tool_choice.cloned();
     Ok(Box::pin(upstream::retry_stream_with(first, move || {
+        // 轮换账号：从轮转基准位开始，优先挑「不在额度冷却中」的账号；
+        // 全都冷却时退回基准位那个（总比直接失败好）。
+        let base = idx.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let mut pick: Option<Cred> = None;
+        for off in 0..pool.len() {
+            let c = pool[(base + off) % pool.len()].clone();
+            let k = format!("{}:{}", platform.as_str(), c.uid);
+            if pick.is_none() {
+                pick = Some(c.clone());
+            }
+            if !quota_cooldown_active(&k) {
+                pick = Some(c);
+                break;
+            }
+        }
+        let cred = pick.unwrap_or_else(|| pool[base % pool.len()].clone());
         let st = st2.clone();
-        let cred = cred2.clone();
         let model = model2.clone();
         let messages = messages2.clone();
         let system = system2.clone();
@@ -1203,9 +1332,10 @@ async fn dispatch_stream(
         let tools = tools2.clone();
         let tool_choice = tool_choice2.clone();
         Box::pin(async move {
-            dispatch_once(&st, platform, &cred, &model, &messages, &system, max_tokens, reasoning.as_deref(), &tools, tool_choice.as_ref())
+            let raw = dispatch_once(&st, platform, &cred, &model, &messages, &system, max_tokens, reasoning.as_deref(), &tools, tool_choice.as_ref())
                 .await
-                .map_err(|(_code, msg)| msg)
+                .map_err(|(_code, msg)| msg)?;
+            Ok(wrap_quota_to_retry(raw, platform, &cred.uid))
         }) as upstream::StreamBoxFuture
     })
     .map(move |ev| {
@@ -1213,6 +1343,29 @@ async fn dispatch_stream(
         let _ = &permit;
         ev
     })))
+}
+
+/// 把「额度耗尽」的流内错误事件转成可重试的 `Err`，并给该账号打额度冷却。
+///
+/// 动机：Qoder 的 `110 Billing daily count exceeded` 是 HTTP 200 + `error` 事件，
+/// 建流阶段看不到它，因此外层换号分支永远收不到 —— 表现为「必须手动重发一次」。
+/// 转成带 [`upstream::STREAM_QUOTA_PREFIX`] 的 `Err` 后，`retry_stream_with`
+/// 会在**尚未产出内容**时自动换账号重发，用户无感。
+fn wrap_quota_to_retry(stream: EventStream, platform: Platform, uid: &str) -> EventStream {
+    let key = format!("{}:{}", platform.as_str(), uid);
+    Box::pin(stream.map(move |ev| match ev {
+        Ok(upstream::StreamEvent::Error(msg, _code)) if is_quota_exhausted_msg(&msg) => {
+            if !quota_cooldown_active(&key) {
+                let d = mark_quota_cooldown(&key);
+                eprintln!(
+                    "[gateway] 账号 {} 当日额度已耗尽（流内错误），进入 {} 分钟冷却并自动换号重发",
+                    key, d.as_secs() / 60
+                );
+            }
+            Err(format!("{}{}", upstream::STREAM_QUOTA_PREFIX, msg))
+        }
+        other => other,
+    }))
 }
 
 /// 按账号取并发许可（`gatewayConcurrency`，默认 6；0 = 不限，返回 None）。

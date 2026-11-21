@@ -186,7 +186,7 @@ impl Adapter for MiniMaxAdapter {
             return Ok(Receipt { status: "already".into(), amount: None, message: Some("今日已领取".into()) });
         }
         if !st.claimable {
-            return Ok(Receipt { status: "no-activity".into(), amount: None, message: None });
+            return Ok(Receipt { status: "no-activity".into(), amount: None, message: Some("当前暂无可领取的签到活动（该平台此刻没有可领奖励，或今日已领完）".into()) });
         }
         let v = api_post(c, &format!("/minimax-cloud/api/v1/signin/claim{SUFFIX}"), None).await?;
         let status = v.get("base_resp").and_then(|b| b.get("status_code")).and_then(|s| s.as_i64());
