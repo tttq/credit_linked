@@ -1530,15 +1530,23 @@ fn sanitize_tool_arguments(raw: &str) -> String {
     if raw.is_empty() || raw == "\"" || raw == "\"\"" {
         return "{}".to_string();
     }
+    if serde_json::from_str::<serde_json::Value>(raw).is_ok() {
+        return raw.to_string();
+    }
+    // 首尾空参数伪影：Qoder 会在 tool_call 首帧/收尾帧各发一次 `arguments:""`，
+    // 旧解析会把它拼成字面量 `""` 分片，得到 `""{"name": "x"}""`。
+    // 先剥掉外层伪影、取最外层 JSON 值重试，能救回完整参数就别退化成 `{}`。
+    if let Some(inner) = outer_json_slice(raw) {
+        if serde_json::from_str::<serde_json::Value>(&inner).is_ok() {
+            return inner;
+        }
+    }
     if !raw.starts_with('{') && !raw.starts_with('[') {
         // 完整 JSON 字符串（如 "\"北京\""）仍尝试修复；明显残片直接置空
         if serde_json::from_str::<serde_json::Value>(raw).is_ok() {
             return raw.to_string();
         }
         return "{}".to_string();
-    }
-    if serde_json::from_str::<serde_json::Value>(raw).is_ok() {
-        return raw.to_string();
     }
     let mut cur = raw.to_string();
     for _ in 0..16 {
@@ -1579,10 +1587,28 @@ fn sanitize_tool_arguments(raw: &str) -> String {
         cur = out;
     }
     if serde_json::from_str::<serde_json::Value>(&cur).is_ok() {
-        cur
-    } else {
-        raw.to_string()
+        return cur;
     }
+    // 修复循环仍失败时再抠一次最外层 JSON（伪影 + 掐流组合形态）
+    if let Some(inner) = outer_json_slice(&cur) {
+        if serde_json::from_str::<serde_json::Value>(&inner).is_ok() {
+            return inner;
+        }
+    }
+    raw.to_string()
+}
+
+/// 取字符串里**最外层的 JSON 对象/数组**切片（首 `{`/`[` 到末 `}`/`]`）。
+///
+/// 用途：剥掉上游在参数流首尾塞进来的伪影（如 `""{"name": "x"}""` 两端的两个引号），
+/// 只要中间还剩下完整的 JSON 就能救回来。返回值未经校验，调用方须再 `from_str` 验证。
+fn outer_json_slice(s: &str) -> Option<String> {
+    let start = s.find(['{', '['])?;
+    let end = s.rfind(['}', ']'])?;
+    if end <= start {
+        return None;
+    }
+    Some(s[start..=end].to_string())
 }
 
 /// 将缓冲的工具调用参数 flush 成 ToolCall 事件（结束帧/收尾流共用）。
@@ -2190,5 +2216,40 @@ mod tool_args_tests {
             other => panic!("期望 ToolCall，得到 {other:?}"),
         };
         assert_eq!(args, "{}");
+    }
+
+    #[test]
+    fn strips_leading_and_trailing_empty_fragment_artifacts() {
+        // 实测形态（Qoder gfmodel + DSH skill 工具）：首帧与收尾帧各有一个
+        // `arguments:""`，被当成字面量 `""` 分片拼进来 →
+        // `""{"name": "novel-comic-drama"}""`。必须救回完整参数，而不是退化成 `{}`。
+        let raw = format!("\"\"{}\"\"", r#"{"name": "novel-comic-drama"}"#);
+        let v = parse(&sanitize_tool_arguments(&raw));
+        assert_eq!(v["name"], "novel-comic-drama");
+
+        // 只有首部伪影同样要救回
+        let raw = format!("\"{}\"", r#"{"limit": 10}"#);
+        assert_eq!(parse(&sanitize_tool_arguments(&raw))["limit"], 10);
+    }
+
+    #[test]
+    fn flush_keeps_full_args_when_empty_fragments_polluted() {
+        // 缓冲区被首尾空分片污染时，flush 下发的参数仍必须是完整合法 JSON
+        let mut buf: ToolCallBuf = Default::default();
+        buf.insert(
+            0,
+            (
+                Some("call_x".into()),
+                "skill".into(),
+                "\"\"{\"name\": \"novel-comic-drama\"}\"\"".into(),
+            ),
+        );
+        let mut out = Vec::new();
+        flush_tool_buf(&mut buf, &mut out);
+        let args = match &out[0] {
+            StreamEvent::ToolCall { arguments, .. } => arguments.clone().unwrap_or_default(),
+            other => panic!("期望 ToolCall，得到 {other:?}"),
+        };
+        assert_eq!(args, r#"{"name": "novel-comic-drama"}"#);
     }
 }

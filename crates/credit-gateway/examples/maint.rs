@@ -15,6 +15,12 @@ async fn main() -> anyhow::Result<()> {
     let store = Arc::new(Store::open_default()?);
     let svc = Service { store: store.clone() };
 
+    // 清理 uid 为空的脏行（accounts 主键是 (provider, uid)，空 uid 会挤掉真实账号）
+    let pruned = svc.prune_dirty_accounts();
+    if pruned > 0 {
+        println!("已清理 uid 为空的脏账号 {pruned} 条");
+    }
+
     println!("=== 库内账号 ===");
     for (p, u, n, _s, auth) in store.list_accounts()? {
         let exp = serde_json::from_str::<serde_json::Value>(&auth).ok()

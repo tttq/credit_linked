@@ -60,6 +60,13 @@ pub fn cancel_all() {
     }
 }
 
+/// 只取消一个登录会话（多账号并行登录时必须按会话取消，否则会连带清掉别的账号）。
+/// 返回被移除会话的 provider（便于调用方按需关闭对应小窗）。
+pub fn cancel_one(session_id: &str) -> Option<String> {
+    let mut m = flows().lock().ok()?;
+    m.remove(session_id).map(|f| f.provider)
+}
+
 fn new_id() -> String { uuid::Uuid::new_v4().to_string() }
 
 fn rand_b64url(n: usize) -> String {
@@ -248,21 +255,28 @@ fn new_p256_jwk() -> Value {
 
 async fn trae_wait_task(sid: String, listener: TcpListener, login: crate::adapters::trae::TraeLogin, _shared: Arc<Mutex<Option<Result<Cred, String>>>>) {
     let res: Result<Cred, String> = async {
-        // 授权页在真正回调前可能先打一发不含 authCode 的请求（OPTIONS 预检、
-        // 监听探活、中转跳转等）——逐个消费，直到出现 authCode 或显式 error，
-        // 总预算约 5 分钟。之前首个请求即被消费，导致 "missing authCode"。
+        // 授权页在真正回调前可能先打一发不含 AuthCode 的请求（OPTIONS 预检、
+        // 监听探活、中转跳转等）——逐个消费，直到出现 AuthCode 或显式错误，
+        // 总预算约 5 分钟。官方回调字段是 `authCodeInfo`（JSON 串，含
+        // `AuthCode`）而不是 `authCode`，早期版本按 `authCode` 判等导致
+        // 一直认不出回调 →「授权后窗口不关也不导入」。
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(299);
         let params = loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() { return Err("登录回调等待超时（5 分钟未完成）".into()); }
             let query = wait_callback(&listener, remaining, "/authorize", "授权完成，请返回应用。").await.map_err(|e| e.to_string())?;
             let p = parse_query(&query);
-            if p.contains_key("authCode") { break p; }
+            // 官方 error_code 表示被风控/拒绝
+            if let Some(ec) = p.get("error_code").filter(|s| !s.is_empty()) {
+                return Err(format!("TRAE 授权被拒绝（error_code={ec}），该账号可能已被风控，请更换账号"));
+            }
+            if crate::adapters::trae::auth_code_of(&p).is_some() { break p; }
             if p.get("error").map(|s| !s.is_empty()).unwrap_or(false) {
                 return Err("TRAE 授权未完成或已取消，请重新发起".into());
             }
         };
-        if let Some(tid) = params.get("loginTraceID") {
+        // 官方链路没有 loginTraceID 回调字段，仅在存在时才校验（保留 CSRF 防线）
+        if let Some(tid) = params.get("loginTraceID").or_else(|| params.get("login_trace_id")) {
             if *tid != login.trace_id { return Err("回调 traceId 不匹配（CSRF 防护），请重新发起".into()); }
         }
         let exchange = crate::adapters::trae::TraeLogin {
@@ -368,11 +382,19 @@ async fn codearts_wait_task(
 
 // ===== 轮询 =====
 
-/// 轮询结果：status = pending | ready | expired；ready 时携带凭据。
-pub struct PollOut { pub status: String, pub credential: Option<Cred> }
+/// 轮询结果：status = pending | ready | error | expired；ready 时携带凭据，error 时带原因。
+/// 三种终态（ready/error/expired）都应当由调用方关闭授权小窗，前端和后端各有兜底。
+pub struct PollOut { pub status: String, pub credential: Option<Cred>, pub error: Option<String> }
+
+impl PollOut {
+    /// 是否是终态（可以关窗、停止轮询）
+    pub fn is_final(&self) -> bool {
+        matches!(self.status.as_str(), "ready" | "error" | "expired")
+    }
+}
 
 /// 查询登录进度：trae/codearts 读后台回调任务结果，minimax/qoder/workbuddy 现场轮询换票；
-/// 拿到凭据即移除会话，会话过期返回 expired。
+/// 拿到凭据即移除会话，会话过期返回 expired，失败返回 error（不再抛 Err，前端能拿到结构化状态）。
 pub async fn poll_login(session_id: &str) -> Result<PollOut, PlatformError> {
     let f = {
         let m = flows().lock().unwrap();
@@ -383,12 +405,15 @@ pub async fn poll_login(session_id: &str) -> Result<PollOut, PlatformError> {
         }
     };
     let Some(f) = f else {
-        return Ok(PollOut { status: "expired".into(), credential: None });
+        return Ok(PollOut { status: "expired".into(), credential: None, error: None });
     };
     let cred = match f.data {
         FlowData::Done(res) => match res {
             Ok(c) => Some(c),
-            Err(e) => { flows().lock().unwrap().remove(session_id); return Err(PlatformError::Local(e)); }
+            Err(e) => {
+                flows().lock().unwrap().remove(session_id);
+                return Ok(PollOut { status: "error".into(), credential: None, error: Some(e) });
+            }
         },
         FlowData::Mini { verifier, device_code, interval_secs } => {
             let st = crate::adapters::minimax::MiniStart { device_code, verification_uri: String::new(), interval_secs, verifier };
@@ -461,7 +486,7 @@ pub async fn poll_login(session_id: &str) -> Result<PollOut, PlatformError> {
     };
     let status = if cred.is_some() { "ready" } else { "pending" };
     if cred.is_some() { flows().lock().unwrap().remove(session_id); }
-    Ok(PollOut { status: status.into(), credential: cred })
+    Ok(PollOut { status: status.into(), credential: cred, error: None })
 }
 
 // ===== 工具 =====

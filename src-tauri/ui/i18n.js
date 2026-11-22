@@ -161,6 +161,7 @@
       login: '登录', open_auth_page: '打开授权页面', refresh_auth_window: '刷新授权窗口',
       login_title: '登录 {p}', starting_auth: ' 正在发起授权…', auth_link_ready: '授权链接已生成（5 分钟内有效）：',
       waiting_auth: '等待授权完成…', login_ok: '✔ 登录成功：', auth_timeout: '授权已超时，请重新发起',
+      login_failed: '授权失败', login_retry_hint: '可关闭本窗口后重新点击平台卡片上的登录按钮再试一次。',
       // 静态页面文案
       checkin_sub: '按账号查看领取进度；支持多个独立授权账号，逐个执行。',
       sched_checkin_label: '计划签到时间（北京时间）', beijing_note: '所有平台统一按北京时间执行',
@@ -314,6 +315,7 @@
       login: 'Sign in', open_auth_page: 'Open authorization page', refresh_auth_window: 'Refresh authorization window',
       login_title: 'Sign in to {p}', starting_auth: ' Starting authorization…', auth_link_ready: 'Authorization link generated (valid for 5 minutes):',
       waiting_auth: 'Waiting for authorization…', login_ok: '✔ Signed in: ', auth_timeout: 'Authorization timed out — please try again',
+      login_failed: 'Authorization failed', login_retry_hint: 'Close this window and click the login button on the platform card to retry.',
       checkin_sub: 'View claim progress per account; supports multiple independently authorized accounts, run one by one.',
       sched_checkin_label: 'Scheduled check-in time (Beijing)', beijing_note: 'All platforms run on Beijing time',
       stats_sub: 'Switch by signed-in account to view daily / weekly / monthly / yearly points summaries.',

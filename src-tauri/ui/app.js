@@ -40,6 +40,15 @@ let overviewRange = 7;
 let statPeriod = 'day', statAccount = 'all';
 let checkinFilter = 'all';
 let loginTimer = null, curLoginSid = null;
+// 多账号并行登录：每个会话独立轮询，互不干扰（旧版共用一个 loginTimer / curLoginSid，
+// 启动第二个账号会顶掉第一个的轮询 → 第一个账号永远等不到结果、小窗也永不关闭）
+const loginSeqs = new Map(); // sessionId -> { timer, provider }
+function stopLoginSeq(sid) {
+  const s = loginSeqs.get(sid);
+  if (!s) return;
+  clearInterval(s.timer);
+  loginSeqs.delete(sid);
+}
 let charts = { ov: null, st: null };
 let statTokens = []; // token consume per day for statistics chart
 
@@ -1158,60 +1167,92 @@ $('#settings-save').addEventListener('click', async () => {
 });
 
 // ===== 登录模态 =====
+// 关键点：
+// ① 每个会话独立轮询（loginSeqs），可以同时登录多个账号，互不顶掉；
+// ② 三种终态 ready / error / expired 都要主动关闭授权小窗（后端也会兜底关）；
+// ③ error 时把失败原因显示出来，不再静默留一个空窗口。
 async function startLogin(p) {
   const meta = PLAT[p] || {};
   $('#login-title').textContent = t('login_title', { p: platName(p) });
   $('#login-desc').textContent = meta.desc || '';
   $('#login-body').innerHTML = '<div style="padding:18px 0"><span class="spin"></span>' + t('starting_auth') + '</div>';
   $('#login-mask').classList.add('show');
-  clearInterval(loginTimer);
   try {
     const r = await invoke('login_start', { provider: p });
+    const sid = r.sessionId;
+    curLoginSid = sid;
     $('#login-body').innerHTML =
       '<div style="font-size:12.5px;color:var(--subtle);margin-bottom:10px">' + t('auth_link_ready') + '</div>' +
       '<div style="word-break:break-all;font-size:12px;background:var(--bg);border-radius:8px;padding:10px;max-height:120px;overflow:auto">' + esc(r.url) + '</div>' +
       '<div id="login-status" style="margin-top:12px;font-size:13px"><span class="spin"></span> ' + t('waiting_auth') + '</div>';
     // 应用内授权子窗口（不是系统浏览器）：iframe 会被平台 X-Frame-Options 拒绝，Tauri 子窗口不受限
-    await invoke('login_open_window', { sessionId: r.sessionId, url: r.url, provider: p });
-    curLoginSid = r.sessionId;
+    await invoke('login_open_window', { sessionId: sid, url: r.url, provider: p });
     $('#login-open').textContent = t('refresh_auth_window');
     $('#login-open').onclick = async () => {
-      await invoke('login_open_window', { sessionId: r.sessionId, url: r.url, provider: p });
+      await invoke('login_open_window', { sessionId: sid, url: r.url, provider: p });
     };
-    loginTimer = setInterval(async () => {
-      try {
-        const s = await invoke('login_poll', { sessionId: r.sessionId });
-        if (s.status === 'ready') {
-          clearInterval(loginTimer);
-          invoke('login_close_window', { sessionId: r.sessionId }).catch(() => {});
-          curLoginSid = null;
-          $('#login-body').innerHTML = '<div style="color:var(--green);font-weight:600;padding:16px 0">' + t('login_ok') + esc(s.account?.name || '') + ' · ' + t('fetching_quota') + '</div>';
-          toast(t('login_ok_toast', { n: s.account?.name || '' }));
-          // 登录后立即获取：余额 + 状态
-          try { await invoke('quota_refresh', { provider: s.account.provider, uid: s.account.uid }); } catch {}
-          await refreshAll();
-          $('#login-mask').classList.remove('show');
-          showPage('accounts');
-        } else if (s.status === 'expired') {
-          clearInterval(loginTimer);
-          $('#login-status').innerHTML = '<span style="color:var(--amber)">' + t('auth_timeout') + '</span>';
+    // 关窗统一走这里：先尝试后端关（幂等），再清本地轮询
+    const finish = async (status, payload) => {
+      stopLoginSeq(sid);
+      invoke('login_close_window', { sessionId: sid }).catch(() => {});
+      if (curLoginSid === sid) curLoginSid = null;
+      if (status === 'ready') {
+        $('#login-body').innerHTML = '<div style="color:var(--green);font-weight:600;padding:16px 0">' + t('login_ok') + esc((payload && payload.account && payload.account.name) || '') + ' · ' + t('fetching_quota') + '</div>';
+        toast(t('login_ok_toast', { n: (payload && payload.account && payload.account.name) || '' }));
+        try { if (payload && payload.account) await invoke('quota_refresh', { provider: payload.account.provider, uid: payload.account.uid }); } catch {}
+        await refreshAll();
+        $('#login-mask').classList.remove('show');
+        showPage('accounts');
+      } else if (status === 'error') {
+        const msg = (payload && payload.error) || '';
+        // 其它账号的会话失败时不抢当前模态展示
+        if (curLoginSid === null) {
+          $('#login-body').innerHTML = '<div style="color:var(--red);padding:14px 0;font-size:13px">' + esc(msg) + '</div>' +
+            '<div style="font-size:12px;color:var(--subtle)">' + t('login_retry_hint') + '</div>';
         }
+        toast(msg || t('login_failed'), 5200);
+      } else if (status === 'expired') {
+        if (curLoginSid === null) {
+          $('#login-body').innerHTML = '<div style="color:var(--amber);padding:14px 0">' + t('auth_timeout') + '</div>';
+        }
+      }
+    };
+    const timer = setInterval(async () => {
+      try {
+        const s = await invoke('login_poll', { sessionId: sid });
+        if (s.status === 'ready') { await finish('ready', s); }
+        else if (s.status === 'error') { await finish('error', s); }
+        else if (s.status === 'expired') { await finish('expired', s); }
       } catch (e) {
-        clearInterval(loginTimer);
-        $('#login-status').innerHTML = '<span style="color:var(--red)">' + esc(String(e)) + '</span>';
+        // 轮询本身抛错（IPC 异常等）→ 停止该会话并关窗，不留僵尸窗口
+        const st = $('#login-status');
+        if (st && curLoginSid === sid) st.innerHTML = '<span style="color:var(--red)">' + esc(String(e)) + '</span>';
+        await finish('error', { error: String(e) });
       }
     }, 3000);
+    loginSeqs.set(sid, { timer, provider: p });
   } catch (e) {
     $('#login-body').innerHTML = '<div style="color:var(--red);padding:12px 0">' + esc(String(e)) + '</div>';
   }
 }
 $('#login-cancel').addEventListener('click', () => {
-    clearInterval(loginTimer);
+  const sid = curLoginSid;
+  if (sid) {
+    stopLoginSeq(sid);
+    invoke('login_cancel_one', { sessionId: sid }).catch(() => {});
+    invoke('login_close_window', { sessionId: sid }).catch(() => {});
+    curLoginSid = null;
+  } else {
+    // 没有当前会话时兜底：把所有已开的小窗与轮询一起收掉
+    for (const sid2 of Array.from(loginSeqs.keys())) {
+      stopLoginSeq(sid2);
+      invoke('login_close_window', { sessionId: sid2 }).catch(() => {});
+    }
     invoke('login_cancel').catch(() => {});
-    if (curLoginSid) { invoke('login_close_window', { sessionId: curLoginSid }).catch(() => {}); curLoginSid = null; }
-    $('#login-open').textContent = t('open_auth_page');
-    $('#login-mask').classList.remove('show');
-  });
+  }
+  $('#login-open').textContent = t('open_auth_page');
+  $('#login-mask').classList.remove('show');
+});
 
 // ===== 顶部 =====
 async function checkinAll(btn) {

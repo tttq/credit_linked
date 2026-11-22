@@ -499,13 +499,22 @@ fn parse_event_block(block: &str) -> Option<(String, String)> {
 }
 
 /// 工具参数归一化为字符串：上游可能给 string（增量片段）或已解析的 object。
+///
+/// **空串分片必须归一成 `None`**：Qoder 的 tool_call 首帧与收尾帧都会发
+/// `"arguments": ""`（没有参数内容）。旧实现只把「非空字符串」匹配到第一支，
+/// 空串落进 `other.to_string()` 兜底 → 变成字面量 `""`（两个引号）的分片，
+/// 被拼进参数流后得到 `""{"name": "x"}""`，客户端必然 JSON 解析失败
+/// （或经 sanitize 兜底成 `{}`，工具调用因缺必填字段而报错）。
 fn tool_args_str(v: Option<&Value>) -> Option<String> {
     match v {
-        Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
+        Some(Value::String(s)) => {
+            if s.is_empty() { None } else { Some(s.clone()) }
+        }
         Some(Value::Null) | None => None,
         Some(other) => {
             let s = other.to_string();
-            if s.is_empty() { None } else { Some(s) }
+            // `null` 等价于未提供；空对象/空数组不是合法「参数分片」，同样丢弃
+            if s.is_empty() || s == "null" || s == "\"\"" { None } else { Some(s) }
         }
     }
 }

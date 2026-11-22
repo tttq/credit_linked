@@ -164,7 +164,74 @@ fn read_app_version(path: &std::path::Path) -> Option<String> {
     v.get("appVersion").and_then(|x| x.as_str()).filter(|s| !s.trim().is_empty()).map(|s| s.to_string())
 }
 
-fn os_version_string() -> String {
+/// 安装目录 `product.json` 里的登录真值：官方登录 URL 与 ExchangeToken 都用这几个字段，
+/// 硬编码版本号是「假指纹」，版本一升级就会和客户端对不上。
+#[derive(Default, Clone, Debug)]
+pub struct TraeProductMeta {
+    /// 应用版本（如 3.4.22）——DeviceInfo.ClientVersion / IDEVersion
+    pub app_version: Option<String>,
+    /// 插件构建号（如 2.3.105403）——登录 URL 的 plugin_version
+    pub tron_version: Option<String>,
+    /// 控制台域名（如 https://www.trae.cn）——登录页 host
+    pub console_host: Option<String>,
+    /// 发行通道 client_id（authConfig.TRAE.stable，如 ono9krqynydwx5）
+    pub client_id: Option<String>,
+}
+
+fn json_scalar(v: Option<&Value>) -> Option<String> {
+    let s = match v? {
+        Value::String(s) => s.trim().to_string(),
+        Value::Number(n) => n.to_string(),
+        _ => return None,
+    };
+    if s.is_empty() { None } else { Some(s) }
+}
+
+/// 读取安装目录 product.json 的关键字段（读不到就用调用方的 const 兜底）
+pub fn product_meta() -> TraeProductMeta {
+    let Some(p) = find_product_json() else { return TraeProductMeta::default() };
+    let Ok(text) = std::fs::read_to_string(&p) else { return TraeProductMeta::default() };
+    let Ok(v) = serde_json::from_str::<Value>(text.trim_start_matches('\u{feff}')) else {
+        return TraeProductMeta::default();
+    };
+    TraeProductMeta {
+        app_version: json_scalar(v.get("appVersion")),
+        tron_version: json_scalar(v.get("tronBuildVersion")),
+        console_host: json_scalar(v.get("consoleHost")),
+        client_id: json_scalar(v.pointer("/iCubeApp/authConfig/TRAE/stable")),
+    }
+}
+
+/// 官方 `uUe()`：DeviceName 取系统里的「全名」（`net user <name>` 的 Full Name），
+/// 拿不到再退回用户名——与客户端上报完全一致的设备名。
+pub fn user_display_name() -> String {
+    if cfg!(windows) {
+        if let Ok(user) = std::env::var("USERNAME") {
+            if !user.trim().is_empty() {
+                let mut cmd = std::process::Command::new("net");
+                cmd.args(["user", user.trim()]);
+                if let Ok(o) = crate::proc_util::hide_console(cmd).output() {
+                    let s = String::from_utf8_lossy(&o.stdout);
+                    if let Some(idx) = s.find("Full Name") {
+                        let rest = &s[idx + "Full Name".len()..];
+                        let name = rest.trim_start_matches([' ', '\t', '.']).lines().next().unwrap_or("").trim();
+                        if !name.is_empty() {
+                            return name.to_string();
+                        }
+                    }
+                }
+                return user.trim().to_string();
+            }
+        }
+    }
+    std::env::var("USER")
+        .ok()
+        .or_else(|| std::env::var("USERNAME").ok())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default()
+}
+
+pub fn os_version_string() -> String {
     if cfg!(windows) {
         // 与插件同格式："Windows 10.0.22631"；用 cmd ver 拿不到内部版本号时退回 "Windows"
         let mut cmd = std::process::Command::new("cmd");

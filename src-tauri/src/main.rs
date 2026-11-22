@@ -278,9 +278,11 @@ async fn login_start(provider: String) -> Result<serde_json::Value, String> {
     Ok(serde_json::json!({ "sessionId": sid, "url": url, "expiresIn": exp }))
 }
 
-/// 轮询登录结果；拿到凭据时自动入库（同 provider+uid 覆盖）
+/// 轮询登录结果；拿到凭据时自动入库（同 provider+uid 覆盖）。
+/// 终态（ready/error/expired）一律由后端兜底关闭授权小窗——不依赖前端调用，
+/// 之前只在 ready 时前端才关窗，换码失败/超时就会留下一个永不消失的小框。
 #[tauri::command]
-async fn login_poll(session_id: String) -> Result<serde_json::Value, String> {
+async fn login_poll(app: tauri::AppHandle, session_id: String) -> Result<serde_json::Value, String> {
     let out = credit_core::login::poll_login(&session_id).await.map_err(|e| e.to_string())?;
     let mut v = serde_json::json!({ "status": out.status });
     if let Some(c) = &out.credential {
@@ -291,9 +293,31 @@ async fn login_poll(session_id: String) -> Result<serde_json::Value, String> {
         if let Some(exp) = &c.expires_at {
             let _ = s.store.update_account_expires(&c.provider, &c.uid, Some(exp));
         }
+        // 入库后无需额外动作：下轮 snapshot／后台维护会从 DB 载入（保持 auto 状态）
         v["account"] = serde_json::json!({ "provider": c.provider, "uid": c.uid, "name": c.name });
     }
+    if let Some(err) = &out.error {
+        v["error"] = serde_json::json!(err);
+    }
+    // 终态兜底关窗（ready / error / expired）
+    if out.is_final() {
+        let label = format!("auth-{}", session_id.replace('-', ""));
+        if let Some(w) = app.get_webview_window(&label) {
+            let _ = w.close();
+        }
+    }
     Ok(v)
+}
+
+/// 取消指定会话的登录（多账号并行登录时只影响该会话）
+#[tauri::command]
+async fn login_cancel_one(app: tauri::AppHandle, session_id: String) -> Result<(), String> {
+    credit_core::login::cancel_one(&session_id);
+    let label = format!("auth-{}", session_id.replace('-', ""));
+    if let Some(w) = app.get_webview_window(&label) {
+        let _ = w.close();
+    }
+    Ok(())
 }
 
 /// 取消全部进行中的登录会话
@@ -1374,7 +1398,7 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             snapshot, import, checkin, quota_refresh, history,
-            login_start, login_poll, login_cancel,
+            login_start, login_poll, login_cancel, login_cancel_one,
             account_delete, account_toggle_auto, trae_local_devices, trae_set_device, codearts_sync_local,
             statistics, daily_income, daily_tokens, settings_get, settings_set, account_list_all, open_url,
             login_open_window, login_close_window,
