@@ -34,7 +34,10 @@ fn os_key(cred_file: &std::path::Path) -> Option<[u8; 32]> {
     if env_secret.is_some() && env_file.is_some() {
         return None; // 两者同时设置客户端直接报错
     }
+    
+    // 优先使用环境变量（备用方案）
     if let Some(secret) = env_secret {
+        eprintln!("[ZCode] Using ZCODE_CREDENTIAL_SECRET for decryption");
         let key: [u8; 32] = Sha256::digest(secret.as_bytes()).into();
         return Some(key);
     }
@@ -42,10 +45,15 @@ fn os_key(cred_file: &std::path::Path) -> Option<[u8; 32]> {
         // 内容须为 32–4096 字节；key = SHA256(文件内容字符串)
         let s = std::fs::read_to_string(path).ok()?;
         let n = s.len();
-        if !(32..=4096).contains(&n) { return None; }
+        if !(32..=4096).contains(&n) { 
+            eprintln!("[ZCode] Invalid ZCODE_CREDENTIAL_SECRET_FILE length: {}", n);
+            return None; 
+        }
+        eprintln!("[ZCode] Using ZCODE_CREDENTIAL_SECRET_FILE for decryption");
         let key: [u8; 32] = Sha256::digest(s.as_bytes()).into();
         return Some(key);
     }
+    
     #[cfg(windows)]
     {
         let abs = std::fs::canonicalize(cred_file).ok()?;
@@ -53,6 +61,9 @@ fn os_key(cred_file: &std::path::Path) -> Option<[u8; 32]> {
         let abs_str = abs_str.strip_prefix("\\\\?\\").unwrap_or(&abs_str);
         let hash = hex_lower(&Sha256::digest(abs_str.as_bytes()));
         let target = format!("{}.ZCode Credential Encryption", hash);
+        
+        eprintln!("[ZCode] Looking for credential encryption key, target: {}", target);
+        
         let candidates = [
             std::env::var("ZCODE_OSKEY_SCRIPT").ok().map(std::path::PathBuf::from),
             // 打包后：Tauri resource_dir / scripts
@@ -61,15 +72,57 @@ fn os_key(cred_file: &std::path::Path) -> Option<[u8; 32]> {
             std::env::current_exe().ok().and_then(|e| e.parent().map(|x| x.join("../resources/scripts/zcode-oskey.ps1"))),
             std::env::current_dir().ok().map(|d| d.join("crates/credit-core/scripts/zcode-oskey.ps1")),
         ];
-        let script = candidates.into_iter().flatten().find(|x| x.exists())?;
+        
+        let script = candidates.into_iter().flatten().find(|x| {
+            let exists = x.exists();
+            if exists {
+                eprintln!("[ZCode] Found script candidate: {:?}", x);
+            }
+            exists
+        })?;
+        
+        eprintln!("[ZCode] Executing PowerShell script: {:?}", script);
+        
         let mut cmd = std::process::Command::new("powershell.exe");
         cmd.args(["-NoProfile", "-File"]).arg(&script)
             .args(["-Target", &target]);
-        let out = crate::proc_util::hide_console(cmd).output().ok()?;
+            
+        let out = crate::proc_util::hide_console(cmd).output();
+        
+        match &out {
+            Ok(out) => {
+                if !out.status.success() {
+                    eprintln!("[ZCode] PowerShell script failed with status: {}", out.status);
+                    if !out.stderr.is_empty() {
+                        eprintln!("[ZCode] Script stderr: {}", String::from_utf8_lossy(&out.stderr));
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("[ZCode] Failed to execute PowerShell script: {}", e);
+            }
+        }
+        
+        let out = out.ok()?;
         let b64 = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        
+        if b64.is_empty() {
+            eprintln!("[ZCode] ERROR: PowerShell script returned empty output");
+            eprintln!("[ZCode] TIP: Check that ZCode client is logged in and credentials exist in Windows Credential Manager");
+            eprintln!("[ZCode] TIP: Or set ZCODE_CREDENTIAL_SECRET environment variable as workaround");
+            return None;
+        }
+        
         let key = B64URL.decode(b64.as_bytes()).ok()?;
-        if key.len() != 32 { return None; }
-        let mut r = [0u8; 32]; r.copy_from_slice(&key); Some(r)
+        if key.len() != 32 { 
+            eprintln!("[ZCode] ERROR: Decoded key length is {} (expected 32)", key.len());
+            return None; 
+        }
+        
+        eprintln!("[ZCode] Successfully retrieved encryption key from Windows Credential Manager");
+        let mut r = [0u8; 32]; 
+        r.copy_from_slice(&key); 
+        Some(r)
     }
     #[cfg(not(windows))]
     {
@@ -82,7 +135,7 @@ fn os_key(cred_file: &std::path::Path) -> Option<[u8; 32]> {
         let secret = entry.get_password().ok()?;
         let key = B64URL.decode(secret.as_bytes()).ok()?;
         if key.len() != 32 { return None; }
-        let mut r = [0u8; 32]; r.copy_from_slice(&key); Some(r)
+        let mut r = [u8; 32]; r.copy_from_slice(&key); Some(r)
     }
 }
 
@@ -217,8 +270,23 @@ pub fn read_live_auth() -> Option<ZcodeLiveAuth> {
     
     eprintln!("[ZCode] Reading credentials from: {:?}", cred_file);
     
+    // 检查文件是否存在
+    if !cred_file.exists() {
+        eprintln!("[ZCode] ERROR: credentials.json not found at {:?}", cred_file);
+        return None;
+    }
+    
     let cred: Value = serde_json::from_reader(std::fs::File::open(&cred_file).ok()?).ok()?;
     let key = os_key(&cred_file);
+    
+    if key.is_none() {
+        eprintln!("[ZCode] ERROR: Failed to read encryption key");
+        eprintln!("[ZCode] TIP: Ensure ZCode client is logged in");
+        eprintln!("[ZCode] TIP: Check Windows Credential Manager for 'ZCode Credential Encryption' entries");
+        eprintln!("[ZCode] TIP: Or set ZCODE_CREDENTIAL_SECRET environment variable as workaround");
+        return None;
+    }
+    
     let secret = fallback_secret();
     
     let read = |k: &str| -> Option<String> { 
@@ -236,7 +304,7 @@ pub fn read_live_auth() -> Option<ZcodeLiveAuth> {
         else if provider == "zai" { ("oauth:zai:user_info", "oauth:zai:access_token") }
         else if provider == "bigmodel" { ("oauth:bigmodel:user_info", "oauth:bigmodel:access_token") }
         else { 
-            eprintln!("[ZCode] Unsupported provider: {}", provider);
+            eprintln!("[ZCode] Unsupported provider: {}. Supported: zai_cn, zai, bigmodel", provider);
             return None; 
         };
     
@@ -261,12 +329,17 @@ pub fn read_live_auth() -> Option<ZcodeLiveAuth> {
     let tele_file = dir.join(TELEMETRY_FILENAME);
     eprintln!("[ZCode] Looking for telemetry file: {:?}", tele_file);
     
+    if !tele_file.exists() {
+        eprintln!("[ZCode] WARNING: telemetry-state.json not found, using default deviceMid");
+    }
+    
     let tele: Value = serde_json::from_reader(std::fs::File::open(tele_file).ok()?).ok()?;
     let device_mid = tele.get("deviceMid").and_then(|d| d.as_str()).unwrap_or_default().to_string();
     
     let name = user.get("name").and_then(|n| n.as_str()).map(|s| s.to_string());
     
-    eprintln!("[ZCode] Successfully loaded auth for user: {}", name.as_deref().unwrap_or("unknown"));
+    eprintln!("[ZCode] Successfully loaded auth for user: {} (UID: {})", 
+               name.as_deref().unwrap_or("unknown"), uid);
     
     Some(ZcodeLiveAuth { uid, name, access_token, device_mid, zcode_jwt })
 }

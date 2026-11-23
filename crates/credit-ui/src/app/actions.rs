@@ -836,7 +836,6 @@ pub(crate) fn simple_select(
                         .text_size(px(12.5))
                         .rounded(px(6.))
                         .when(selected, |el| el.bg(mix_color(accent(), 0.12)).text_color(rgb(accent())).font_weight(FontWeight::SEMIBOLD))
-                        .hover(|s| s.bg(mix_color(accent(), 0.06)))
                         .on_click(move |_, window, cx| {
                             if let Ok(tx) = SELECT_TX.lock() {
                                 if let Some(tx) = tx.as_ref() {

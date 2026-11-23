@@ -126,7 +126,14 @@ async fn main() -> anyhow::Result<()> {
                     };
                     save_cred(&s, &cred)?;
                 }
-                other => anyhow::bail!("platform {other} 不支持 CLI 导入（doubao 需窗口驱动，codearts/minimax 走登录流程）"),
+                "minimax" => {
+                    // 走 Service::import_account 的真实导入路径（含 profile uid/name 校正与多记录导入），
+                    // 保证 CLI 与 GUI「扫描本机」完全同一条链路。
+                    let svc = Service { store: s.clone() };
+                    let v = svc.import_account("minimax", intl).await?;
+                    println!("saved minimax:{} ({})", v.get("uid").and_then(|u| u.as_str()).unwrap_or(""), v.get("name").and_then(|n| n.as_str()).unwrap_or(""));
+                }
+                other => anyhow::bail!("platform {other} 不支持 CLI 导入（doubao 需窗口驱动，codearts 走登录流程）"),
             }
             Ok(())
         }

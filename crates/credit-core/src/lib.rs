@@ -27,3 +27,5 @@ pub use error::PlatformError;
 pub mod platform_dirs;
 /// 子进程启动工具（Windows 隐藏控制台窗口）。
 pub mod proc_util;
+/// GUI 调试日志工具（写入文件而非控制台）。
+pub mod debug_log;

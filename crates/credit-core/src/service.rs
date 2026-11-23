@@ -715,7 +715,34 @@ impl Service {
         })
     }
 
-    /// 本机扫描导入（trae/wb/qoder），对齐 CLI import 逻辑。
+    /// MiniMax Code 账号身份校正（best-effort）：GET /matrix/api/v1/user/profile
+    /// 取 `user_id` / `user_name`，覆盖 `to_cred` 从本机文件猜出来的 uid/name。
+    /// 失败（离线 / token 过期）时保留原值，不阻塞导入。
+    async fn resolve_minimax_identity(cred: &mut Cred) {
+        if cred.token.is_empty() {
+            return;
+        }
+        let adapter = crate::adapters::minimax::MiniMaxAdapter;
+        let Ok(profile) = Adapter::verify(&adapter, cred).await else { return };
+        let uid = json_id_string(profile.get("user_id").unwrap_or(&Value::Null));
+        let name = profile.get("user_name").and_then(|n| n.as_str()).unwrap_or("").trim().to_string();
+        if !uid.is_empty() {
+            cred.uid = uid;
+        }
+        if !name.is_empty() {
+            cred.name = name;
+        }
+        // 头像/邮箱一并留档，UI 与网关都能直接用
+        for k in ["avatar_url", "email"] {
+            if let Some(v) = profile.get(k) {
+                if !v.is_null() && v.as_str().map(|s| !s.is_empty()).unwrap_or(true) {
+                    cred.meta[k] = v.clone();
+                }
+            }
+        }
+    }
+
+    /// 本机扫描导入（trae/wb/qoder/minimax/zcode/codearts），对齐 CLI import 逻辑。
     pub async fn import_account(&self, platform: &str, intl: bool) -> Result<Value, PlatformError> {
         let cred = match platform {
             "trae" => {
@@ -788,9 +815,31 @@ impl Service {
                 }
             }
             "minimax" => {
-                let live = crate::adapters::minimax_local::read_live_auth()
-                    .ok_or_else(|| PlatformError::Local("未发现 MiniMax Code 登录信息（客户端未安装或未登录）".into()))?;
-                crate::adapters::minimax_local::to_cred(live)
+                let all = crate::adapters::minimax_local::read_all_live_auths();
+                let Some(first) = all.first().cloned() else {
+                    return Err(PlatformError::Local("未发现 MiniMax Code 登录信息（客户端未安装或未登录）".into()));
+                };
+                // 主记录：本机 auth.json 的 accessToken 是 `mmoat_*` 不透明串（不是 JWT），
+                // uid 拿不到时会退化成记录键/哈希。这里用 profile 接口（user_id/user_name）
+                // 校正成权威账号标识——否则入库 uid 可能为空，被 ui_snapshot 的脏行清理删掉，
+                // 现象就是「提示导入成功但账号列表里没有」。
+                let mut cred = crate::adapters::minimax_local::to_cred(first);
+                Self::resolve_minimax_identity(&mut cred).await;
+                // 客户端多账号登录时 records 会有多条：其余记录一并入库（失败不影响主账号）
+                for live in all.into_iter().skip(1) {
+                    let mut extra = crate::adapters::minimax_local::to_cred(live);
+                    Self::resolve_minimax_identity(&mut extra).await;
+                    if extra.uid.trim().is_empty() || extra.uid == cred.uid {
+                        continue;
+                    }
+                    if let Ok(auth) = serde_json::to_string(&extra) {
+                        let _ = self.store.upsert_account(&extra.provider, &extra.uid, &extra.name, "", &auth);
+                        if let Some(exp) = extra.expires_at.as_deref().filter(|e| !e.trim().is_empty()) {
+                            let _ = self.store.update_account_expires(&extra.provider, &extra.uid, Some(exp.trim()));
+                        }
+                    }
+                }
+                cred
             }
             "zcode" => {
                 let Some(live) = crate::adapters::zcode_local::read_live_auth() else {
@@ -873,11 +922,25 @@ impl Service {
                 }
                 cred
             }
-            other => return Err(PlatformError::Local(format!("platform {other} 暂不支持本机扫描导入（minimax/codearts 走登录流程，doubao 走窗口驱动）"))),
+            other => return Err(PlatformError::Local(format!("platform {other} 暂不支持本机扫描导入（doubao 走窗口驱动）"))),
         };
+        // 兜底：uid 为空的行会被 ui_snapshot → prune_dirty_accounts 当脏行删掉，
+        // 表现成「提示导入成功但账号列表里没有」。宁可报错，也不写入必被清理的空行。
+        if cred.uid.trim().is_empty() {
+            return Err(PlatformError::Local(format!(
+                "未能解析出 {} 的账号标识（uid），本次不写入（请确认客户端已登录后重新扫描）",
+                cred.provider
+            )));
+        }
         let auth = serde_json::to_string(&cred).map_err(|e| PlatformError::Local(e.to_string()))?;
         self.store.upsert_account(&cred.provider, &cred.uid, &cred.name, "", &auth)
             .map_err(|e| PlatformError::Local(e.to_string()))?;
+        // 到期时间落列：UI 账号行直接展示，自动续期巡检也依赖它
+        if let Some(exp) = cred.expires_at.as_deref() {
+            if !exp.trim().is_empty() {
+                let _ = self.store.update_account_expires(&cred.provider, &cred.uid, Some(exp.trim()));
+            }
+        }
         Ok(json!({ "provider": cred.provider, "uid": cred.uid, "name": cred.name }))
     }
 
@@ -977,6 +1040,15 @@ fn is_auth_business_err(e: &PlatformError) -> bool {
 /// 单个账号凭据自愈的硬超时：自愈链会等客户端刷新（15~20s）+ 走 STS 换票，
 /// 给 120s 足够；超时则跳过该账号，避免后台巡检被单个卡死账号拖住。
 const HEAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// JSON 里的 id 可能是字符串也可能是数字（MiniMax profile 的 user_id 是数字）→ 统一成字符串。
+fn json_id_string(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.trim().to_string(),
+        Value::Number(n) => n.to_string(),
+        _ => String::new(),
+    }
+}
 
 /// provider → (import_account 的平台名, 是否国际版)。/// `import_account` 按 (平台名, intl) 决定最终 provider，故国际版要拆开传。
 fn import_target(provider: &str) -> (&'static str, bool) {
