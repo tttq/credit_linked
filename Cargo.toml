@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/credit-core", "crates/credit-cli", "crates/credit-gateway", "src-tauri"]
+members = ["crates/credit-core", "crates/credit-cli", "crates/credit-gateway", "crates/credit-ui"]
 
 [workspace.package]
 version = "0.1.2"

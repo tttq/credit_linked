@@ -1,0 +1,27 @@
+[package]
+name = "credit-ui"
+build = "build.rs"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "credit-ui"
+path = "src/main.rs"
+
+[dependencies]
+credit-core = { path = "../credit-core" }
+credit-gateway = { path = "../credit-gateway" }
+gpui-kit = "0.10.0"
+tokio.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+reqwest = { workspace = true, features = ["json"] }
+regex = "1"
+rust-embed = "8"
+backtrace = "0.3"
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.55"
+
+[build-dependencies]
+winresource = "0.1"

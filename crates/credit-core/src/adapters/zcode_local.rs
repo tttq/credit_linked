@@ -231,3 +231,39 @@ pub fn wait_for_token_change(old_fp: Option<&str>, timeout: std::time::Duration)
         std::thread::sleep(std::time::Duration::from_millis(1500));
     }
 }
+/// 本机 ZCode 客户端版本（用于请求头与 app_version 参数）。
+///
+/// 硬编码版本号是**致命**的：客户端升级后服务端会以 `app_version too old`
+/// 拒绝 preview/claim/balance 与模型请求，表现为「整个 ZCode 都用不了」。
+/// 探测顺序：环境变量 → 安装目录里的 package.json → 目录名中的版本号 → 兜底。
+pub fn client_version() -> String {
+    static CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| {
+        if let Ok(v) = std::env::var("ZCODE_APP_VERSION") {
+            let v = v.trim().to_string();
+            if !v.is_empty() { return v; }
+        }
+        let Some(exe) = find_client_exe() else { return "3.18.2".into() };
+        let root = exe.parent().map(|p| p.to_path_buf());
+        if let Some(root) = root {
+            // Electron 打包：resources/app/package.json 或 resources/app/package.json
+            for rel in ["resources/app/package.json", "resources/app/package.json", "package.json"] {
+                let p = root.join(rel);
+                if let Ok(s) = std::fs::read_to_string(&p) {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
+                        if let Some(ver) = v.get("version").and_then(|x| x.as_str()) {
+                            if ver.split('.').count() >= 2 { return ver.to_string(); }
+                        }
+                    }
+                }
+            }
+            // 便携版常见布局：<root>/<版本号>/ZCode.exe
+            if let Some(name) = root.file_name().and_then(|n| n.to_str()) {
+                if name.split('.').count() >= 3 && name.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+                    return name.to_string();
+                }
+            }
+        }
+        "3.18.2".into()
+    }).clone()
+}

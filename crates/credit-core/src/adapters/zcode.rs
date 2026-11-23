@@ -36,8 +36,8 @@ async fn request_with(c: &Cred, path: &str, method: Method, body: Option<Value>,
         ("Authorization".to_string(), format!("Bearer {}", token)),
         ("Content-Type".to_string(), "application/json".to_string()),
         // 客户端公共源头发射器（逆向）：claim/balance 请求带版本与平台标识
-        ("User-Agent".to_string(), "ZCode/3.18.2".to_string()),
-        ("X-ZCode-App-Version".to_string(), "3.18.2".to_string()),
+        ("User-Agent".to_string(), format!("ZCode/{}", crate::adapters::zcode_local::client_version())),
+        ("X-ZCode-App-Version".to_string(), crate::adapters::zcode_local::client_version()),
         ("X-Platform".to_string(), "win32-x64".to_string()),
         ("HTTP-Referer".to_string(), "https://zcode.z.ai".to_string()),
         ("X-Os-Category".to_string(), "windows".to_string()),
@@ -65,11 +65,12 @@ impl Adapter for ZcodeAdapter {
     async fn state(&self, c: &Cred) -> Result<CheckinState, PlatformError> {
         // 活动来源（逆向确认）：GET /billing/preview?app_version=…&platform=… 的 data.plans[]
         // （configs.startPlanPreview 只是免费套餐展示配置，可领性以 preview 为准）
-        let v = billing_request(c, "/api/v1/zcode-plan/billing/preview?app_version=3.18.2&platform=win32-x64", Method::GET, None).await?;
+        let ver = crate::adapters::zcode_local::client_version();
+        let v = billing_request(c, &format!("/api/v1/zcode-plan/billing/preview?app_version={ver}&platform=win32-x64"), Method::GET, None).await?;
         let d = business(v)?;
         let plans: Vec<Value> = d.get("plans").and_then(|p| p.as_array()).cloned().unwrap_or_default();
         // captcha 门（仅提示用）：enabled 且 skip_model_request!==true 时 claim 需要验证码
-        let cfg = business(request(c, "/api/v1/client/configs?app_version=3.18.2&platform=win32-x64", Method::GET, None).await?).unwrap_or(Value::Null);
+        let cfg = business(request(c, &format!("/api/v1/client/configs?app_version={ver}&platform=win32-x64"), Method::GET, None).await?).unwrap_or(Value::Null);
         let captcha_block = cfg.pointer("/configs/captcha/enabled").and_then(|b| b.as_bool()).unwrap_or(false)
             && !cfg.pointer("/configs/captcha/skip_model_request").and_then(|b| b.as_bool()).unwrap_or(false);
         Ok(CheckinState {
@@ -161,7 +162,8 @@ impl Adapter for ZcodeAdapter {
 /// 余额查询（/billing/balance，只认 zcodejwttoken）
 pub async fn balance(c: &Cred) -> Result<Value, PlatformError> {
     // 真实端点（逆向）：/billing/balance?app_version=…，响应 { plans, balances }，只认 zcodejwttoken
-    let v = billing_request(c, "/api/v1/zcode-plan/billing/balance?app_version=3.18.2", Method::GET, None).await?;
+    let ver = crate::adapters::zcode_local::client_version();
+    let v = billing_request(c, &format!("/api/v1/zcode-plan/billing/balance?app_version={ver}"), Method::GET, None).await?;
     let d = business(v)?;
     Ok(d.get("data").cloned().unwrap_or(d))
 }
@@ -175,8 +177,8 @@ fn chat_headers(token: &str, device_mid: &str) -> Vec<(String, String)> {
         ("Content-Type".to_string(), "application/json".to_string()),
         ("Accept".to_string(), "application/json".to_string()),
         ("anthropic-version".to_string(), "2023-06-01".to_string()),
-        ("User-Agent".to_string(), "ZCode/3.18.2".to_string()),
-        ("X-ZCode-App-Version".to_string(), "3.18.2".to_string()),
+        ("User-Agent".to_string(), format!("ZCode/{}", crate::adapters::zcode_local::client_version())),
+        ("X-ZCode-App-Version".to_string(), crate::adapters::zcode_local::client_version()),
         ("X-Platform".to_string(), "win32-x64".to_string()),
         ("X-Os-Category".to_string(), "windows".to_string()),
         ("X-Client-Language".to_string(), "zh-CN".to_string()),
@@ -267,14 +269,14 @@ pub async fn fetch_builtin_models(c: &Cred) -> Result<Vec<ZcodeBuiltinModel>, Pl
     let jwt = c.meta.get("zcodeJwt").and_then(|d| d.as_str()).filter(|s| !s.is_empty())
         .ok_or(PlatformError::Auth)?;
     let mid = c.meta.get("deviceMid").and_then(|d| d.as_str()).unwrap_or("");
-    let ver = std::env::var("ZCODE_APP_VERSION").ok().unwrap_or_else(|| "3.18.2".to_string());
+    let ver = crate::adapters::zcode_local::client_version();
     let url = format!("{BASE}/api/v1/client/configs?app_version={ver}&platform=win32-x64");
     let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(12)).build()
         .map_err(|e| PlatformError::Network(e.to_string()))?;
     let resp = client.get(&url)
         .header("Authorization", format!("Bearer {jwt}"))
-        .header("User-Agent", "ZCode/3.18.2")
-        .header("X-ZCode-App-Version", "3.18.2")
+        .header("User-Agent", format!("ZCode/{}", crate::adapters::zcode_local::client_version()))
+        .header("X-ZCode-App-Version", crate::adapters::zcode_local::client_version())
         .header("X-Device-Mid", mid)
         .send().await.map_err(|e| PlatformError::Network(e.to_string()))?;
     let st = resp.status().as_u16();
@@ -339,14 +341,14 @@ pub async fn fetch_client_captcha_config(c: &Cred) -> Result<ZcodeCaptchaConfig,
     let jwt = c.meta.get("zcodeJwt").and_then(|d| d.as_str()).filter(|s| !s.is_empty())
         .ok_or(PlatformError::Auth)?;
     let mid = c.meta.get("deviceMid").and_then(|d| d.as_str()).unwrap_or("");
-    let ver = std::env::var("ZCODE_APP_VERSION").ok().unwrap_or_else(|| "3.18.2".to_string());
+    let ver = crate::adapters::zcode_local::client_version();
     let url = format!("{BASE}/api/v1/client/configs?app_version={ver}&platform=win32-x64");
     let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(12)).build()
         .map_err(|e| PlatformError::Network(e.to_string()))?;
     let resp = client.get(&url)
         .header("Authorization", format!("Bearer {jwt}"))
-        .header("User-Agent", "ZCode/3.18.2")
-        .header("X-ZCode-App-Version", "3.18.2")
+        .header("User-Agent", format!("ZCode/{}", crate::adapters::zcode_local::client_version()))
+        .header("X-ZCode-App-Version", crate::adapters::zcode_local::client_version())
         .header("X-Device-Mid", mid)
         .send().await.map_err(|e| PlatformError::Network(e.to_string()))?;
     let st = resp.status().as_u16();

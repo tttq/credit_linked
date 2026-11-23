@@ -54,6 +54,23 @@ fn checkin_lock(key: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
     m.entry(key.to_string()).or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(()))).clone()
 }
 
+// ==================== 凭据刷新单飞（single-flight） ====================
+//
+// 背景：MiniMax / CodeArts 这类平台的 refresh_token 是**一次性**的（用一次即轮换作废）。
+// 若同一账号的签到与额度刷新并发触发 refresh，第二次必然拿到 `invalid_grant`
+// —— 表现就是「一个账号签到成功，另一个账号报授权失效」。
+// 做法：同一账号的 refresh 串行化；拿到锁后**重新读库**，若已被别人刷新过就直接复用。
+
+fn cred_locks() -> &'static std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>> {
+    static M: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>> = std::sync::OnceLock::new();
+    M.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn cred_lock(key: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    let mut m = cred_locks().lock().unwrap_or_else(|e| e.into_inner());
+    m.entry(key.to_string()).or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(()))).clone()
+}
+
 /// 「刚刚才签到成功」的短时效标记（90s）：只用于连点幂等，
 /// **不**参与跨窗口判重 —— 各平台领取窗口不同（Qoder 10:00 重置），按自然日判重会误伤。
 const CHECKIN_RECENT_SECS: u64 = 90;
@@ -76,6 +93,18 @@ fn checkin_mark_recent(key: &str) {
 impl Service {
     /// 遇 Auth（401/过期）时尝试恢复凭据：minimax 优先读本机客户端最新 auth.json（本地客户端持续轮换 token），否则走 refresh 链。
     pub async fn refreshed_cred(&self, provider: &str, uid: &str, cred: &Cred) -> Result<Cred, PlatformError> {
+        // 单飞：同一账号的刷新串行化（refresh_token 一次性，并发刷新必有一方 invalid_grant）
+        let key = format!("{provider}:{uid}");
+        let lock = cred_lock(&key);
+        let _guard = lock.lock_owned().await;
+
+        // 拿锁后重读库：若别的路径已经刷新过（token 变了），直接复用，不再消耗 RT
+        if let Some(latest) = self.pick_cred(provider, uid) {
+            if !latest.token.is_empty() && latest.token != cred.token {
+                return Ok(latest);
+            }
+        }
+
         let adapter = adapter_for(provider).ok_or_else(|| PlatformError::Local(format!("no adapter for {provider}")))?;
         if provider == "minimax" {
             if let Some(live) = crate::adapters::minimax_local::read_live_auth() {
@@ -93,7 +122,17 @@ impl Service {
                 }
             }
         }
-        let nc = adapter.refresh(cred).await?;
+        let nc = match adapter.refresh(cred).await {
+            Ok(nc) => nc,
+            Err(e) => {
+                // 一次性 RT 已作废：标记为需重新登录，避免后续巡检反复空转
+                if matches!(&e, PlatformError::Business { code, .. } if code.as_str() == Some("invalid_grant")) {
+                    let _ = self.store.update_account_status(provider, uid, "auth-expired",
+                        Some("授权已失效（refresh_token 已轮换），请重新登录该平台客户端后再扫描导入"));
+                }
+                return Err(e);
+            }
+        };
         if let Ok(auth) = serde_json::to_string(&nc) {
             let _ = self.store.upsert_account(provider, uid, &nc.name, "", &auth);
         }
@@ -758,14 +797,10 @@ impl Service {
                     return Err(PlatformError::Local("未发现 ZCode 登录信息（客户端未安装或未登录）".into()));
                 };
                 // ZCode 客户端同一时间只有一个登录账号：导入后清理旧 uid 账号（重登会换 uid）
-                let new_uid = live.uid.clone();
-                if let Ok(rows) = self.store.list_accounts() {
-                    for (p, u, _, _, _) in rows {
-                        if p == "zcode" && u != new_uid {
-                            let _ = self.store.delete_account("zcode", &u);
-                        }
-                    }
-                }
+                // 多账号：**不再删除**其它 ZCode 账号。
+                // 每个账号各自保存自己的 zcodeJwt（meta.zcodeJwt），可分别签到/查额度；
+                // 客户端同时只登录一个账号时，只有「本机当前登录」的那个能自动取票，
+                // 其余账号保留记录并在状态里提示需重新登录，不再被静默删除。
                 crate::adapters::Cred {
                     provider: "zcode".into(),
                     uid: live.uid,
