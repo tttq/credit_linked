@@ -114,20 +114,78 @@ pub fn decode_zcode_value(raw: &str, secret: &str, os_key: Option<&[u8; 32]>) ->
 
 /// 定位 ~/.zcode/v2：ZCODE_HOME 覆盖 → setting.json dataBaseDir 兜底
 pub fn zcode_v2_dir() -> Option<std::path::PathBuf> {
-    let home = std::env::var("ZCODE_HOME").ok().map(std::path::PathBuf::from).or_else(dirs::home_dir)?;
-    let v2 = home.join(".zcode").join("v2");
-    if v2.join(CREDENTIAL_FILENAME).exists() { return Some(v2); }
-    let sf = v2.join("setting.json");
-    if sf.exists() {
-        if let Ok(v) = serde_json::from_reader::<_, Value>(std::fs::File::open(&sf).ok()?) {
-            if let Some(base) = v.get("dataBaseDir").and_then(|d| d.as_str()) {
-                if std::path::Path::new(base).is_absolute() {
-                    let alt = std::path::PathBuf::from(base).join(".zcode").join("v2");
-                    if alt.join(CREDENTIAL_FILENAME).exists() { return Some(alt); }
+    // Try multiple possible locations for ZCode data directory
+    
+    // 1. ZCODE_HOME environment variable
+    if let Ok(zcode_home) = std::env::var("ZCODE_HOME") {
+        let path = std::path::PathBuf::from(&zcode_home);
+        let v2 = path.join(".zcode").join("v2");
+        if v2.join(CREDENTIAL_FILENAME).exists() {
+            eprintln!("[ZCode] Found v2 dir via ZCODE_HOME: {:?}", v2);
+            return Some(v2);
+        }
+    }
+    
+    // 2. APPDATA (Windows Electron app data)
+    if let Ok(appdata) = std::env::var("APPDATA") {
+        let candidates = vec![
+            std::path::PathBuf::from(&appdata).join("ZCode"),
+            std::path::PathBuf::from(&appdata).join("zcode"),
+            std::path::PathBuf::from(&appdata).join("BigModel"),
+            std::path::PathBuf::from(&appdata).join("bigmodel"),
+        ];
+        
+        for base in candidates {
+            let v2 = base.join(".zcode").join("v2");
+            if v2.join(CREDENTIAL_FILENAME).exists() {
+                eprintln!("[ZCode] Found v2 dir via APPDATA: {:?}", v2);
+                return Some(v2);
+            }
+            
+            // Also try direct .zcode in APPDATA
+            let direct = base.join(".zcode");
+            if direct.join(CREDENTIAL_FILENAME).exists() {
+                eprintln!("[ZCode] Found .zcode dir via APPDATA: {:?}", direct);
+                return Some(direct);
+            }
+        }
+    }
+    
+    // 3. Home directory (~/.zcode)
+    if let Some(home) = dirs::home_dir() {
+        let v2 = home.join(".zcode").join("v2");
+        if v2.join(CREDENTIAL_FILENAME).exists() {
+            eprintln!("[ZCode] Found v2 dir via HOME: {:?}", v2);
+            return Some(v2);
+        }
+        
+        // Also try direct .zcode in home
+        let direct = home.join(".zcode");
+        if direct.join(CREDENTIAL_FILENAME).exists() {
+            eprintln!("[ZCode] Found .zcode dir via HOME: {:?}", direct);
+            return Some(direct);
+        }
+    }
+    
+    // 4. Check setting.json for dataBaseDir override
+    if let Some(home) = dirs::home_dir() {
+        let sf = home.join(".zcode").join("v2").join("setting.json");
+        if sf.exists() {
+            if let Ok(v) = serde_json::from_reader::<_, Value>(std::fs::File::open(&sf).ok()?) {
+                if let Some(base) = v.get("dataBaseDir").and_then(|d| d.as_str()) {
+                    if std::path::Path::new(base).is_absolute() {
+                        let alt = std::path::PathBuf::from(base).join(".zcode").join("v2");
+                        if alt.join(CREDENTIAL_FILENAME).exists() {
+                            eprintln!("[ZCode] Found v2 dir via setting.json: {:?}", alt);
+                            return Some(alt);
+                        }
+                    }
                 }
             }
         }
     }
+    
+    eprintln!("[ZCode] No valid credential directory found");
     None
 }
 
@@ -156,24 +214,60 @@ pub fn read_credential(key_name: &str) -> Option<String> {
 pub fn read_live_auth() -> Option<ZcodeLiveAuth> {
     let dir = zcode_v2_dir()?;
     let cred_file = dir.join(CREDENTIAL_FILENAME);
+    
+    eprintln!("[ZCode] Reading credentials from: {:?}", cred_file);
+    
     let cred: Value = serde_json::from_reader(std::fs::File::open(&cred_file).ok()?).ok()?;
     let key = os_key(&cred_file);
     let secret = fallback_secret();
-    let read = |k: &str| -> Option<String> { decode_zcode_value(cred.get(k)?.as_str()?, &secret, key.as_ref()) };
+    
+    let read = |k: &str| -> Option<String> { 
+        let result = decode_zcode_value(cred.get(k)?.as_str()?, &secret, key.as_ref());
+        if result.is_none() {
+            eprintln!("[ZCode] Failed to decode credential: {}", k);
+        }
+        result
+    };
+    
     let provider = read("oauth:active_provider")?;
+    eprintln!("[ZCode] Active provider: {}", provider);
+    
     let (uk, tk) = if provider == "zai_cn" { ("oauth:zai_cn:user_info", "oauth:zai_cn:access_token") }
         else if provider == "zai" { ("oauth:zai:user_info", "oauth:zai:access_token") }
         else if provider == "bigmodel" { ("oauth:bigmodel:user_info", "oauth:bigmodel:access_token") }
-        else { return None; };
-    let user: Value = serde_json::from_str(&read(uk)?).ok()?;
+        else { 
+            eprintln!("[ZCode] Unsupported provider: {}", provider);
+            return None; 
+        };
+    
+    let user_raw = read(uk)?;
+    eprintln!("[ZCode] Decoded user info");
+    
+    let user: Value = serde_json::from_str(&user_raw).ok()?;
     let uid = user.get("user_id").or_else(|| user.get("id")).and_then(|x| x.as_str())?.to_string();
     let access_token = read(tk)?;
-    if access_token.is_empty() { return None; }
+    
+    eprintln!("[ZCode] UID: {}, Token length: {}", uid, access_token.len());
+    
+    if access_token.is_empty() { 
+        eprintln!("[ZCode] Access token is empty");
+        return None; 
+    }
+    
     // zcodejwttoken：plan/billing 接口专用；可能缺失或为空
     let zcode_jwt = read("zcodejwttoken").filter(|s| !s.is_empty());
-    let tele: Value = serde_json::from_reader(std::fs::File::open(dir.join(TELEMETRY_FILENAME)).ok()?).ok()?;
+    
+    // Read telemetry for deviceMid
+    let tele_file = dir.join(TELEMETRY_FILENAME);
+    eprintln!("[ZCode] Looking for telemetry file: {:?}", tele_file);
+    
+    let tele: Value = serde_json::from_reader(std::fs::File::open(tele_file).ok()?).ok()?;
     let device_mid = tele.get("deviceMid").and_then(|d| d.as_str()).unwrap_or_default().to_string();
+    
     let name = user.get("name").and_then(|n| n.as_str()).map(|s| s.to_string());
+    
+    eprintln!("[ZCode] Successfully loaded auth for user: {}", name.as_deref().unwrap_or("unknown"));
+    
     Some(ZcodeLiveAuth { uid, name, access_token, device_mid, zcode_jwt })
 }
 
