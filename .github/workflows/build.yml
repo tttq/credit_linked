@@ -1,12 +1,10 @@
-name: Build CI
+name: Build Check
 
-# main 分支日常构建检查（Windows x64 编译可用性）。
-# 正式发布走 release.yml（git tag vxxx && git push origin vxxx），
-# 这里不再监听 tag，避免与 release.yml 重复发版。
+# 仅手动触发（workflow_dispatch）的编译检查：**不打包、不上传任何产物**。
+# 正式打包发版只在推送 tag 时执行：git tag v0.1.9 && git push origin v0.1.9（见 release.yml）。
+# 日常 push 到 main 不会触发任何构建/打包（一推送就打包已取消）。
 
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -14,7 +12,7 @@ permissions:
 
 jobs:
   build:
-    name: Build Windows x64
+    name: Build Windows x64 (check only)
     runs-on: windows-latest
     steps:
       - name: Checkout
@@ -28,22 +26,5 @@ jobs:
       - name: Rust cache
         uses: swatinem/rust-cache@v2
 
-      - name: Build release
+      - name: Build release (check only, no artifact)
         run: cargo build --release -p credit-ui
-
-      - name: Rename artifact
-        id: name
-        shell: pwsh
-        run: |
-          $version = (Select-String -Path Cargo.toml -Pattern '^\s*version\s*=\s*"(.+)"').Matches[0].Groups[1].Value
-          if (-not $version) { $version = "0.0.0" }
-          $name = "credit-ui-$version-windows-x64.exe"
-          Copy-Item target/release/credit-ui.exe $name
-          "artifact=$name" | Add-Content $env:GITHUB_OUTPUT
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ steps.name.outputs.artifact }}
-          path: ${{ steps.name.outputs.artifact }}
-          if-no-files-found: error

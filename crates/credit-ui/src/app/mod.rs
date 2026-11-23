@@ -379,17 +379,17 @@ impl Render for AppView {
         if !self.page_loaded_once {
             self.page_loaded_once = true;
             self.scroll.set_offset(gpui_kit::point(gpui_kit::px(0.), gpui_kit::px(0.)));
-            // 关闭窗口 → 弹框让用户选择「最小化到后台」或「退出程序」。
+            // 关闭窗口（标题栏 ✕ / Alt+F4 / 任务栏右键关闭）→ 弹框二选一：
+            // 「后台运行」= 主窗口隐藏到右下角托盘（网关与自动签到继续跑），
+            // 「退出程序」= 真正退出。
             // 必须用 on_window_should_close 拦截：标题栏 ✕ 是 gpui 自己画的控件，
             // 组件级 on_close_window 对它不生效（会直接 remove_window）。
             //
-            // 防重入不使用自定义 AtomicBool：取消路径（Esc / 遮罩 / 弹框右上角 ✕）
-            // 走组件库内部的 Cancel action，自定义标志无法在所有路径上复位，
-            // 一旦卡在 true 后续点击 ✕ 就永远没反应。改用组件库的
-            // has_active_dialog 查询真实弹框状态，任何取消路径都能自愈。
+            // 防重入：用组件库 has_active_dialog 查真实弹框状态（Esc / 遮罩 /
+            // 弹框右上角 ✕ 等取消路径都能自愈），不用自定义标志位。
             window.on_window_should_close(cx, |window, cx| {
                 if window.has_active_dialog(cx) {
-                    return false; // 弹框已打开：吞掉本次关闭，让用户在弹框里选
+                    return false; // 弹框已打开：吞掉本次关闭
                 }
                 show_close_prompt(window, cx);
                 false // 阻止本次关闭
@@ -479,7 +479,7 @@ impl AppView {
         //   系统拖拽模态循环，鼠标释放被吞掉，on_click 永远不触发；
         // - 最小化/关闭按钮各自声明 WindowControlArea::Min / ::Close，
         //   走平台原生命中（HTMINBUTTON → SW_MINIMIZE，HTCLOSE → WM_CLOSE
-        //   → on_window_should_close 回调弹确认框）。
+        //   → on_window_should_close 回调，弹「后台运行 / 退出程序」二选一）。
         h_flex()
             .id("title-bar")
             .items_center()
@@ -491,6 +491,14 @@ impl AppView {
                 h_flex()
                     .id("bar")
                     .window_control_area(WindowControlArea::Drag)
+                    // 取消「双击标题栏全屏/最大化」：第二次按下（click_count>=2）直接吞掉，
+                    // 不再落进 DefWindowProc 的默认行为；单击（click_count==1）照常透传，
+                    // 系统照旧进入拖拽模态循环（窗口拖动不受影响）。
+                    .on_mouse_down(MouseButton::Left, |event, _window, cx| {
+                        if event.click_count >= 2 {
+                            cx.stop_propagation();
+                        }
+                    })
                     .items_center()
                     .gap(px(9.))
                     .px(px(14.)).py(px(9.))
@@ -534,6 +542,7 @@ impl AppView {
                     .child(
                         window_control_button("wc-close", "✕", true)
                             .window_control_area(WindowControlArea::Close)
+                            // 关闭 → 弹框二选一：后台运行（托盘）/ 退出程序
                             .on_click(move |_, window, cx| {
                                 let _ = weak.update(cx, |_v, cx| {
                                     show_close_prompt(window, cx);
@@ -719,11 +728,16 @@ fn window_control_button(id: &'static str, glyph: &'static str, close: bool) -> 
         .text_size(px(12.))
         .text_color(rgb(color))
 }
+
 /// 关闭确认弹框（标题栏 ✕ 与系统关闭共用）
 ///
-/// 弹框存在与否以 `window.has_active_dialog(cx)` 为准（调用方已做防重入）。
-/// 不再维护自定义标志位：取消路径（Esc / 遮罩 / 弹框右上角 ✕）由组件库
-/// 内部处理，任何路径关闭后再次点击 ✕ 都能重新弹出。
+/// 两个选项：
+/// - **后台运行**：主窗口隐藏，右下角托盘小图标常驻（网关与自动签到继续跑）；
+///   托盘不可用（非 Windows / 注册失败）时退化为最小化到任务栏，避免窗口找不回来。
+/// - **退出程序**：真正退出进程。
+///
+/// 防重入以 `window.has_active_dialog(cx)` 为准（调用方已查），取消路径
+/// （Esc / 遮罩 / 弹框右上角 ✕）由组件库内部处理，再次点击 ✕ 都能重新弹出。
 fn show_close_prompt(window: &mut Window, cx: &mut App) {
     if window.has_active_dialog(cx) {
         return;
@@ -746,7 +760,14 @@ fn show_close_prompt(window: &mut Window, cx: &mut App) {
                             .label(t("close_to_background"))
                             .on_click(|_, window, cx| {
                                 window.close_dialog(cx);
-                                window.minimize_window();
+                                if crate::tray::ready() {
+                                    // 微信式：窗口隐藏，右下角留托盘小图标；给个气泡提示去哪找
+                                    crate::tray::hide_main();
+                                    crate::tray::balloon(t("app_name"), t("tray_balloon"));
+                                } else {
+                                    // 没有托盘 → 退化为最小化到任务栏，绝不把窗口藏到无处恢复
+                                    window.minimize_window();
+                                }
                             }),
                     )
                     .child(

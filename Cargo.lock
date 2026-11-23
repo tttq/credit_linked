@@ -1351,11 +1351,13 @@ dependencies = [
  "credit-core",
  "credit-gateway",
  "gpui-kit",
+ "raw-window-handle",
  "regex",
  "reqwest",
  "rust-embed",
  "serde_json",
  "tokio",
+ "windows 0.58.0",
  "winreg 0.55.0",
  "winresource",
 ]

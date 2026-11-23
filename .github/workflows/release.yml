@@ -1,17 +1,18 @@
 name: Release Build
 
-# 推送 tag（git tag v0.1.8 && git push origin v0.1.8）自动触发：
+# 唯一打包入口：推送版本 tag（git tag v0.1.8 && git push origin v0.1.8）触发。
 # 1) 把 tag 里的版本号写进 Cargo.toml [workspace.package].version
 #    （credit-ui 经 version.workspace = true 继承 → CARGO_PKG_VERSION 即应用版本，
 #     应用内“检查更新”用它与 GitHub releases/latest 的 tag 动态比较）
 # 2) 各平台编译打包：Windows exe / macOS app(arm64+x64) / Linux 二进制
 # 3) 全部产物附加到与该 tag 对应的 GitHub Release
+#
+# 注意：普通 commit push（含 main）不会触发本工作流，也不会打包任何产物。
 
 on:
   push:
     tags:
       - 'v*'
-  workflow_dispatch:
 
 permissions:
   contents: write
@@ -73,7 +74,7 @@ jobs:
           if [[ "${GITHUB_REF_NAME:-}" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
             VER="${BASH_REMATCH[1]}"
           else
-            # workflow_dispatch 等无 tag 场景：回退用 Cargo.toml 里现有版本
+            # 兜底：tag 不是 vX.Y.Z 形态时，回退用 Cargo.toml 里现有版本
             VER=$(sed -n '/\[workspace\.package\]/,/^\[/ { s/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p; }' Cargo.toml | head -n1)
           fi
           if [ -z "$VER" ]; then echo "cannot resolve app version"; exit 1; fi

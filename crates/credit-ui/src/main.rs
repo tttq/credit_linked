@@ -4,6 +4,7 @@
 //! - platform  : 平台元数据与嵌入图标
 //! - i18n      : 双语文案（平移自 ui/i18n.js）
 //! - app       : 根视图 + 导航 + 六个页面（首页/账号/签到/统计/路由/设置）
+//! - tray      : Windows 右下角托盘图标（关闭时「后台运行」用）
 
 // 纯 GUI 程序：不要附带控制台窗口（否则启动时会闪一个黑框）。
 // 诊断信息统一写 credit-ui-panic.log，不依赖 stdout/stderr。
@@ -15,6 +16,7 @@ mod i18n;
 mod login_window;
 mod platform;
 mod theme;
+mod tray;
 
 fn main() {
     // panic 日志（崩溃排查，对齐原版）：带 backtrace，写文件 + stderr
@@ -72,7 +74,50 @@ fn run_app() {
                 window_min_size: Some(gpui_kit::size(gpui_kit::px(360.), gpui_kit::px(420.))),
                 ..Default::default()
             };
-            gpui_kit::open_window(opts, cx, |window, cx| gpui_kit::AppContext::new(cx, |cx| app::AppView::new(window, cx)))
-                .expect("failed to open main window");
+            gpui_kit::open_window(opts, cx, |window, cx| {
+                // Windows：
+                // 1) 去掉 WS_MAXIMIZEBOX —— 双击标题栏 / Alt+Space / Win+↑ 不再最大化（全屏）；
+                // 2) 建右下角托盘图标 —— 关闭窗口时可选「后台运行」收进托盘。
+                #[cfg(windows)]
+                if let Some(hwnd) = main_window_hwnd(window) {
+                    disable_maximize_box(hwnd);
+                    tray::init(hwnd, "AI Free Router");
+                }
+                gpui_kit::AppContext::new(cx, |cx| app::AppView::new(window, cx))
+            })
+            .expect("failed to open main window");
         });
+}
+
+/// 取 gpui 主窗口的原生 HWND（Windows）。
+#[cfg(windows)]
+fn main_window_hwnd(window: &mut gpui_kit::Window) -> Option<isize> {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    let handle = HasWindowHandle::window_handle(&*window).ok()?;
+    match handle.as_raw() {
+        RawWindowHandle::Win32(win32) => Some(win32.hwnd.get()),
+        _ => None,
+    }
+}
+
+/// 去掉主窗口的 `WS_MAXIMIZEBOX` 样式位（Windows）。
+///
+/// gpui 建窗时只要 `is_resizable=true` 就会加 `WS_THICKFRAME | WS_MAXIMIZEBOX`，
+/// 于是双击标题栏（hit-test = HTCAPTION）会触发 DefWindowProc 的默认「最大化/还原」，
+/// 看上去像全屏。去掉 MAXIMIZEBOX 之后：双击标题栏、Alt+Space 菜单里的「最大化」、
+/// Win+↑、拖到屏幕顶端自动最大化全部失效；`WS_THICKFRAME` 保留，拖边缩放不受影响。
+#[cfg(windows)]
+fn disable_maximize_box(hwnd: isize) {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GWL_STYLE, GetWindowLongPtrW, SetWindowLongPtrW, WS_MAXIMIZEBOX,
+    };
+
+    let hwnd = HWND(hwnd as *mut core::ffi::c_void);
+    unsafe {
+        let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+        if style & (WS_MAXIMIZEBOX.0 as isize) != 0 {
+            SetWindowLongPtrW(hwnd, GWL_STYLE, style & !(WS_MAXIMIZEBOX.0 as isize));
+        }
+    }
 }

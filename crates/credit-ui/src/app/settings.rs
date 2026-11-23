@@ -103,6 +103,8 @@ impl AppView {
             .child(
                 v_flex()
                     .flex_1()
+                    // 允许收缩，否则长描述会把右侧控件挤出卡片（flex item 默认 min-width:auto）
+                    .min_w_0()
                     .child(
                         div()
                             .text_size(px(13.))
@@ -672,6 +674,16 @@ impl AppView {
                         }),
                 ),
             )
+            // 微信式收后台后唯一的退出入口：设置页显式退出
+            .child(self.setting_row(
+                t("quit_app"),
+                t("quit_app_desc"),
+                Button::new("app-quit")
+                    .label(t("quit_app"))
+                    .danger()
+                    .small()
+                    .on_click(|_, _window, cx| cx.quit()),
+            ))
             .child(
                 self.setting_row(
                     t("data_dir"),
