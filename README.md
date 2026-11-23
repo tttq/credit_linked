@@ -2,7 +2,7 @@
 
 多平台 AI 编程工具**积分管理 + 账号路由**桌面应用。
 
-Rust 原生 GUI（`gpui_kit` 0.10），**已完全移除 Tauri / WebView**：界面、业务、网关全部在同一进程内，启动无控制台黑框、exe 自带图标。
+Rust 原生 GUI（`gpui_kit` 0.10）,界面、业务、网关全部在同一进程内，启动无控制台黑框、exe 自带图标。
 
 支持平台：**Trae / WorkBuddy / MiniMax / Qoder / ZCode / 华为云码道**。
 
@@ -167,35 +167,8 @@ GET  /v1/platforms           平台清单与当前平台
 
 ---
 
-## 常见问题
+## 免责声明
 
-**启动后没有黑框了？**
-已设置 `#![windows_subsystem = "windows"]`。诊断信息改写到 `credit-ui-panic.log`。
-
-**exe 图标是紫色的那个吗？**
-是。`crates/credit-ui/build.rs` 在构建时把 `assets/app.ico` 编入 exe；构建日志会打印 `icon resource embedded OK`。
-
-**「跟随系统」不生效？**
-程序用 `winreg` 直读 `HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize\AppsUseLightTheme`（`0` = 深色）。也可手动在「设置 → 通用 → 外观」固定浅色/深色。
-
-**miniMax 报 `invalid_grant`？**
-`refresh_token` 是一次性的，被客户端轮换后旧值即失效。该账号需在 MiniMax Code 客户端**重新登录**，再到「账号管理 → 扫描本机」重新导入。程序已对同一账号的刷新做单飞串行，避免自身并发把它用废。
-
-**ZCode 全部功能失败？**
-ZCode 请求需要携带客户端版本号。程序会自动探测（环境变量 `ZCODE_APP_VERSION` → 安装目录 `resources/app/package.json` → 目录名版本号），客户端升级后无需改代码。
-
-**账号额度显示 `—`？**
-该账号尚未查询过额度，点「额度」按钮拉取一次即可；之后启动会直接展示。
-
----
-
-## 从 Tauri 迁移说明
-
-原 `src-tauri/`（Rust 后端 + `ui/index.html` / `app.js` / `i18n.js` 前端）**已整体删除**，包括：
-
-- workspace 成员与全部 Tauri 依赖
-- WebView 前端页面与脚本
-- Tauri 命令桥（`#[tauri::command]`）→ 改为 `credit-ui/src/backend.rs` 的普通 `async fn`
-
-界面迁移到 `gpui_kit` 原生渲染，业务逻辑复用 `credit-core`，网关复用 `credit-gateway`。
-如需查看历史实现：`git log -- src-tauri/`（文件仍可 `git checkout <commit> -- src-tauri` 恢复）。
+- 本项目**仅供学习和技术研究使用**，严禁用于任何商业用途
+- **禁止二次开发后销售**或以任何形式付费分发本项目及其衍生版本
+- 使用本项目产生的一切后果由使用者自行承担，与项目作者无关
