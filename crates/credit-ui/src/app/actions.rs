@@ -414,7 +414,9 @@ impl AppView {
                 match r {
                     Ok(_) => {
                         v.toast(format!("{}{}", t("switched_platform"), label), cx);
+                        // 切换平台后，同时刷新网关状态和主账号列表（确保所有平台数据同步）
                         v.refresh_gateway(cx);
+                        v.refresh_all(cx);
                     }
                     Err(e) => v.toast(format!("{}{}", t("switch_failed"), e), cx),
                 }
@@ -439,7 +441,12 @@ impl AppView {
             }
             this.update(cx, |v, cx| {
                 match r {
-                    Ok(_) => { v.toast(format!("{}{}", t("switched_account"), verify), cx); v.refresh_gateway(cx); }
+                    Ok(_) => { 
+                        v.toast(format!("{}{}", t("switched_account"), verify), cx); 
+                        // 切换账号后，同时刷新网关状态和主账号列表（确保所有平台数据同步）
+                        v.refresh_gateway(cx);
+                        v.refresh_all(cx);
+                    }
                     Err(e) => v.toast(format!("{}{}", t("switch_failed"), e), cx),
                 }
             }).ok();
