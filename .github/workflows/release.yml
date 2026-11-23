@@ -26,16 +26,16 @@ jobs:
         include:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            artifact: credit-ui-windows-x64
+            artifact: ai-free-router-windows-x64
           - os: macos-latest
             target: aarch64-apple-darwin
-            artifact: credit-ui-macos-arm64
+            artifact: ai-free-router-macos-arm64
           - os: macos-latest
             target: x86_64-apple-darwin
-            artifact: credit-ui-macos-x64
+            artifact: ai-free-router-macos-x64
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
-            artifact: credit-ui-linux-x64
+            artifact: ai-free-router-linux-x64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -108,8 +108,8 @@ jobs:
         shell: bash
         run: |
           VER="${{ steps.ver.outputs.version }}"
-          cp "target/x86_64-pc-windows-msvc/release/credit-ui.exe" "credit-ui-${VER}-windows-x64.exe"
-          ls -la "credit-ui-${VER}-windows-x64.exe"
+          cp "target/x86_64-pc-windows-msvc/release/credit-ui.exe" "AI Free Router-${VER}-windows-x64.exe"
+          ls -la "AI Free Router-${VER}-windows-x64.exe"
 
       - name: Package (macOS)
         if: runner.os == 'macOS'
@@ -142,8 +142,8 @@ jobs:
           EOF
           # 本地临时签名，保证可双击启动
           codesign --force --deep --sign - "$APP"
-          tar -czf "credit-ui-${VER}-macos-${ARCH}.tar.gz" "$APP"
-          ls -la "credit-ui-${VER}-macos-${ARCH}.tar.gz"
+          tar -czf "AI Free Router-${VER}-macos-${ARCH}.tar.gz" "$APP"
+          ls -la "AI Free Router-${VER}-macos-${ARCH}.tar.gz"
 
       - name: Package (linux)
         if: runner.os == 'Linux'
@@ -153,16 +153,16 @@ jobs:
           mkdir -p pkg
           cp "target/x86_64-unknown-linux-gnu/release/credit-ui" pkg/credit-ui
           chmod +x pkg/credit-ui
-          tar -czf "credit-ui-${VER}-linux-x64.tar.gz" -C pkg credit-ui
-          ls -la "credit-ui-${VER}-linux-x64.tar.gz"
+          tar -czf "AI Free Router-${VER}-linux-x64.tar.gz" -C pkg credit-ui
+          ls -la "AI Free Router-${VER}-linux-x64.tar.gz"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
           path: |
-            credit-ui-*.exe
-            credit-ui-*.tar.gz
+            AI Free Router-*.exe
+            AI Free Router-*.tar.gz
           if-no-files-found: error
 
   release:
