@@ -37,6 +37,7 @@ pub fn meta(provider: &str) -> &'static PlatMeta {
 static FALLBACK: PlatMeta = PlatMeta { provider: "", color: "#456", login: "none", icon_file: None, multi: false };
 
 /// 平台登录方式
+#[allow(dead_code)]
 pub fn login_mode(provider: &str) -> &'static str {
     meta(provider).login
 }
@@ -47,6 +48,7 @@ pub fn can_import(provider: &str) -> bool {
 }
 
 /// 平台图标二进制（嵌入资源），用于 gpui 渲染
+#[allow(dead_code)]
 pub fn icon_bytes(provider: &str) -> Option<&'static [u8]> {
     let m = meta(provider);
     m.icon_file.and_then(|f| PlatformAssets::get(f).map(|d| Box::leak(d.data.to_vec().into_boxed_slice()) as &'static [u8]))
@@ -88,11 +90,13 @@ pub const GW_PLATFORMS: &[(&str, &str, bool)] = &[
     ("codearts-desktop", "gw_codearts_desktop",  true),
 ];
 
+#[allow(dead_code)]
 pub fn gw_chat(channel: &str) -> bool {
     GW_PLATFORMS.iter().find(|(n, _, _)| *n == channel).map(|(_, _, c)| *c).unwrap_or(false)
 }
 
 /// 通道 → 账号 provider（与原版前端映射一致）
+#[allow(dead_code)]
 pub fn gw_provider(channel: &str) -> String {
     match channel {
         "workbuddy-intl" => "workbuddy-intl".into(),

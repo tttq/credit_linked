@@ -6,25 +6,19 @@
 //!   （gpui 执行器无 tokio reactor，直调会 panic "no reactor running"）
 
 use crate::backend;
-use crate::i18n::{t, tf};
+use crate::i18n::t;
 use crate::platform;
 use gpui_kit::component::{
     ActiveTheme as _,
     button::{Button, ButtonVariants as _},
-    chart::{BarChart, LineChart},
-    input::{Input, InputState},
-    switch::Switch,
-    TitleBar,
+    input::InputState,
     h_flex, v_flex,
-    Disableable as _, Selectable as _,
+    Selectable as _,
     Sizable as _,
 };
 use gpui_kit::*;
 use gpui_kit::component::WindowExt as _;
 use std::sync::Arc;
-
-/// 关闭确认弹框是否已弹出（防止重复弹窗）
-static CLOSE_PROMPT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub mod overview;
 pub mod accounts;
@@ -36,13 +30,14 @@ pub mod actions;
 
 // 主题色：随当前亮/暗模式动态取值（只读一个原子量 + 常量元组，开销极小）
 pub fn accent() -> u32 { crate::theme::current_palette().0 }
-pub fn accent_soft() -> u32 { crate::theme::current_palette().1 }
 pub fn line_color() -> u32 { crate::theme::current_palette().2 }
 pub fn subtle() -> u32 { crate::theme::current_palette().3 }
+#[allow(dead_code)]
 pub fn text_color() -> u32 { crate::theme::current_palette().4 }
 pub fn green() -> u32 { crate::theme::current_palette().5 }
 pub fn amber() -> u32 { crate::theme::current_palette().6 }
 pub fn red() -> u32 { crate::theme::current_palette().7 }
+#[allow(dead_code)]
 pub fn token_blue() -> u32 { 0x20b9ec }
 
 // ---- FluentBuilder 本地实现（gpui-pre 未在根导出 when/when_some） ----
@@ -63,10 +58,6 @@ impl MyFluent for gpui_kit::component::input::Input {}
 // 设置页下拉选择事件通道：SimpleSelect 选项点击 → AppView 处理
 // (tag, value)；tag 区分语言 / 外观
 pub(crate) static SELECT_TX: std::sync::Mutex<Option<std::sync::mpsc::Sender<(&'static str, String)>>> = std::sync::Mutex::new(None);
-// 删除账号确认事件通道
-pub(crate) static DELETE_TX: std::sync::Mutex<Option<std::sync::mpsc::Sender<(String, String)>>> = std::sync::Mutex::new(None);
-// 设备号保存事件通道
-pub(crate) static DEVICE_TX: std::sync::Mutex<Option<std::sync::mpsc::Sender<(String, String, String)>>> = std::sync::Mutex::new(None);
 
 /// UI 快照中的一个账号行（从 ui_snapshot JSON 解出）
 #[derive(Clone, Debug, Default)]
@@ -187,8 +178,6 @@ pub struct AppView {
     // 路由页
     pub gw_status: Option<serde_json::Value>,
     pub gw_accounts: Option<serde_json::Value>,
-    /// 网关数据（状态/账号/日志）刷新进行中：刷新与清空按钮的加载态
-    pub gw_loading: bool,
     pub gw_models: Vec<String>,
     pub gw_test_model: Option<String>,
     pub gw_test_status: String,
@@ -206,11 +195,10 @@ pub struct AppView {
     pub input_tools_dir: Option<Entity<InputState>>,
     // 登录会话
     pub login_seq: Option<(String, String)>,
-    // 设备号弹窗状态
-    pub pending_dev: Option<(String, String)>,
+    // Trae 设备号列表（账号页弹框点选用，启动/刷新时预取）
     pub dev_devices: Vec<String>,
 
-    // 事件接收器（SELECT_TX / DELETE_TX / DEVICE_TX 的对端）
+    // 事件接收器（SELECT_TX 的对端）
     pub select_rx: Option<std::sync::mpsc::Receiver<(&'static str, String)>>,
     /// 首帧加载标记：启动直接落在某个页面时，也要拉取该页数据
     pub page_loaded_once: bool,
@@ -257,7 +245,6 @@ impl AppView {
             checkin_filter: "all".into(),
             gw_status: None,
             gw_accounts: None,
-            gw_loading: false,
             gw_models: Vec::new(),
             gw_test_model: None,
             gw_test_status: String::new(),
@@ -273,7 +260,6 @@ impl AppView {
             update_progress: String::new(),
             input_tools_dir: Some(input_tools_dir),
             login_seq: None,
-            pending_dev: None,
             dev_devices: Vec::new(),
             select_rx: Some(rx),
             page_loaded_once: false,
@@ -293,6 +279,8 @@ impl AppView {
     /// 全量刷新：并行拉快照 / 设置 / 网关 / 首页图 / 统计（全部经 bg 派发）
     pub fn refresh_all(&mut self, cx: &mut Context<Self>) {
         self.loading = true;
+        // Trae 本机设备号预取（设备号弹框点选列表的数据源）
+        self.refresh_local_devices(cx);
         cx.notify();
         cx.spawn(async move |this, cx| {
             let (snap, settings, gw, income, stat, tokens) = backend::bg(async {
@@ -394,45 +382,16 @@ impl Render for AppView {
             // 关闭窗口 → 弹框让用户选择「最小化到后台」或「退出程序」。
             // 必须用 on_window_should_close 拦截：标题栏 ✕ 是 gpui 自己画的控件，
             // 组件级 on_close_window 对它不生效（会直接 remove_window）。
+            //
+            // 防重入不使用自定义 AtomicBool：取消路径（Esc / 遮罩 / 弹框右上角 ✕）
+            // 走组件库内部的 Cancel action，自定义标志无法在所有路径上复位，
+            // 一旦卡在 true 后续点击 ✕ 就永远没反应。改用组件库的
+            // has_active_dialog 查询真实弹框状态，任何取消路径都能自愈。
             window.on_window_should_close(cx, |window, cx| {
-                if CLOSE_PROMPT.load(std::sync::atomic::Ordering::Relaxed) {
-                    return false;
+                if window.has_active_dialog(cx) {
+                    return false; // 弹框已打开：吞掉本次关闭，让用户在弹框里选
                 }
-                CLOSE_PROMPT.store(true, std::sync::atomic::Ordering::Relaxed);
-                window.open_dialog(cx, |dialog, _window, _cx| {
-                    dialog
-                        .title(t("close_title"))
-                        .child(
-                            div()
-                                .text_size(px(12.5))
-                                .text_color(rgb(crate::theme::current_palette().3))
-                                .child(t("close_desc")),
-                        )
-                        .footer(
-                            h_flex()
-                                .gap(px(8.))
-                                .justify_end()
-                                .child(
-                                    Button::new("close-bg")
-                                        .label(t("close_to_background"))
-                                        .on_click(|_, window, cx| {
-                                            CLOSE_PROMPT.store(false, std::sync::atomic::Ordering::Relaxed);
-                                            window.close_dialog(cx);
-                                            window.minimize_window();
-                                        }),
-                                )
-                                .child(
-                                    Button::new("close-quit")
-                                        .label(t("quit_app"))
-                                        .danger()
-                                        .on_click(|_, window, cx| {
-                                            CLOSE_PROMPT.store(false, std::sync::atomic::Ordering::Relaxed);
-                                            window.close_dialog(cx);
-                                            cx.quit();
-                                        }),
-                                ),
-                        )
-                });
+                show_close_prompt(window, cx);
                 false // 阻止本次关闭
             });
             // 快照/账号/设置：所有页面都要用，启动即拉一次
@@ -481,7 +440,7 @@ impl Render for AppView {
             .border_1()
             .border_color(rgb(if dark { 0x33324a } else { 0xe4e2f0 }))
             .overflow_hidden()
-            .child(self.render_title_bar(window, cx))
+            .child(self.render_title_bar(cx))
             .child(self.render_nav(cx))
             .child(
                 div()
@@ -493,7 +452,7 @@ impl Render for AppView {
                     .overflow_y_scroll()
                     .px(px(16.))
                     .pb(px(14.))
-                    .child(self.render_page(window, cx)),
+                    .child(self.render_page(cx)),
             )
             .child(self.render_toast())
     }
@@ -501,7 +460,7 @@ impl Render for AppView {
 
 impl AppView {
     /// 顶栏：原版渐变背景 + FR 渐变标 + 标题 + 今日周期
-    pub(crate) fn render_title_bar(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(crate) fn render_title_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let cycle = self.snap.as_ref()
             .and_then(|s| s.get("cycle")).and_then(|c| c.as_str()).unwrap_or("")
             .to_string();
@@ -514,12 +473,15 @@ impl AppView {
         // 自定义标题栏：只保留「最小化」「关闭」两个按钮（不要最大化）。
         // 组件 TitleBar 会无条件画出最大化按钮，所以这里自己渲染。
         //
-        // 拖动区域：`app_owns_titlebar_drag: true`（见 main.rs）时系统不再把
-        // 顶栏当标题栏处理，必须显式声明 WindowControlArea::Drag，否则按住顶栏
-        // 拖不动窗口（gpui 官方 TitleBar 的 "bar" 容器正是这么做的）。
+        // 命中区划分（对齐官方 TitleBar）：
+        // - WindowControlArea::Drag 只声明在**内容区**（id("bar")），
+        //   不能套在外层容器——否则按钮坐标返回 HTCAPTION，按下即进入
+        //   系统拖拽模态循环，鼠标释放被吞掉，on_click 永远不触发；
+        // - 最小化/关闭按钮各自声明 WindowControlArea::Min / ::Close，
+        //   走平台原生命中（HTMINBUTTON → SW_MINIMIZE，HTCLOSE → WM_CLOSE
+        //   → on_window_should_close 回调弹确认框）。
         h_flex()
             .id("title-bar")
-            .window_control_area(WindowControlArea::Drag)
             .items_center()
             .w_full()
             .bg(grad)
@@ -527,6 +489,8 @@ impl AppView {
             .border_color(rgb(if dark { 0x3a3949 } else { 0xeae9f1 }))
             .child(
                 h_flex()
+                    .id("bar")
+                    .window_control_area(WindowControlArea::Drag)
                     .items_center()
                     .gap(px(9.))
                     .px(px(14.)).py(px(9.))
@@ -564,10 +528,12 @@ impl AppView {
                 h_flex().items_center().h_full().flex_shrink_0()
                     .child(
                         window_control_button("wc-min", "—", false)
+                            .window_control_area(WindowControlArea::Min)
                             .on_click(|_, window, _cx| window.minimize_window()),
                     )
                     .child(
                         window_control_button("wc-close", "✕", true)
+                            .window_control_area(WindowControlArea::Close)
                             .on_click(move |_, window, cx| {
                                 let _ = weak.update(cx, |_v, cx| {
                                     show_close_prompt(window, cx);
@@ -606,13 +572,13 @@ impl AppView {
     }
 
     /// 页面分发
-    pub(crate) fn render_page(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    pub(crate) fn render_page(&mut self, cx: &mut Context<Self>) -> AnyElement {
         match self.page {
             Page::Overview => self.render_overview(cx).into_any_element(),
             Page::Accounts => self.render_accounts(cx).into_any_element(),
             Page::Checkin => self.render_checkin(cx).into_any_element(),
             Page::Statistics => self.render_statistics(cx).into_any_element(),
-            Page::Routing => self.render_routing(window, cx).into_any_element(),
+            Page::Routing => self.render_routing(cx).into_any_element(),
             Page::Settings => self.render_settings(cx).into_any_element(),
         }
     }
@@ -753,13 +719,15 @@ fn window_control_button(id: &'static str, glyph: &'static str, close: bool) -> 
         .text_size(px(12.))
         .text_color(rgb(color))
 }
-
 /// 关闭确认弹框（标题栏 ✕ 与系统关闭共用）
+///
+/// 弹框存在与否以 `window.has_active_dialog(cx)` 为准（调用方已做防重入）。
+/// 不再维护自定义标志位：取消路径（Esc / 遮罩 / 弹框右上角 ✕）由组件库
+/// 内部处理，任何路径关闭后再次点击 ✕ 都能重新弹出。
 fn show_close_prompt(window: &mut Window, cx: &mut App) {
-    if CLOSE_PROMPT.load(std::sync::atomic::Ordering::Relaxed) {
+    if window.has_active_dialog(cx) {
         return;
     }
-    CLOSE_PROMPT.store(true, std::sync::atomic::Ordering::Relaxed);
     window.open_dialog(cx, |dialog, _window, _cx| {
         dialog
             .title(t("close_title"))
@@ -777,7 +745,6 @@ fn show_close_prompt(window: &mut Window, cx: &mut App) {
                         Button::new("close-bg")
                             .label(t("close_to_background"))
                             .on_click(|_, window, cx| {
-                                CLOSE_PROMPT.store(false, std::sync::atomic::Ordering::Relaxed);
                                 window.close_dialog(cx);
                                 window.minimize_window();
                             }),
@@ -787,7 +754,6 @@ fn show_close_prompt(window: &mut Window, cx: &mut App) {
                             .label(t("quit_app"))
                             .danger()
                             .on_click(|_, window, cx| {
-                                CLOSE_PROMPT.store(false, std::sync::atomic::Ordering::Relaxed);
                                 window.close_dialog(cx);
                                 cx.quit();
                             }),

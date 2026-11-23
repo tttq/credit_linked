@@ -13,7 +13,6 @@
 
 use std::path::PathBuf;
 use std::sync::Mutex;
-use std::time::SystemTime;
 
 /// 各浏览器候选路径（按优先级）
 fn browser_candidates() -> Vec<PathBuf> {
@@ -41,8 +40,6 @@ struct LoginWindow {
     pid: u32,
     /// 窗口 data 目录（关闭后清理）
     data_dir: PathBuf,
-    /// 打开时刻（兜底：10 分钟后允许强制清理）
-    opened_at: SystemTime,
 }
 
 /// 用 app 模式小窗打开登录授权页。
@@ -73,7 +70,7 @@ pub fn open_login_window(url: &str, w: i32, h: i32) -> Result<bool, String> {
     // drop child 不杀进程（Chrome 会立刻派生子进程接管窗口，主进程可能退出）
     std::mem::forget(child);
     if let Ok(mut g) = LOGIN_WINDOW.lock() {
-        *g = Some(LoginWindow { pid, data_dir: data_dir.clone(), opened_at: SystemTime::now() });
+        *g = Some(LoginWindow { pid, data_dir: data_dir.clone() });
     }
     Ok(true)
 }

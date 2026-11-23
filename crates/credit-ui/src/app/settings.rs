@@ -1,20 +1,17 @@
 use super::actions::simple_select;
 use super::{
-    mix_color, platform_name, st_color, st_kind, AccountRow, AppView, DayBar, MyFluent, Page,
-    accent, green, red, SELECT_TX, subtle, token_blue,
+    mix_color, platform_name, AppView, MyFluent,
+    accent, green, subtle,
 };
-use crate::backend;
 use crate::i18n::{t, tf};
-use crate::platform;
 use gpui_kit::component::{
     button::{Button, ButtonVariants as _},
     h_flex,
-    input::{Input, InputState},
+    input::Input,
     switch::Switch,
-    v_flex, ActiveTheme as _, Disableable as _, Selectable as _, Sizable as _,
+    v_flex, Selectable as _, Sizable as _,
 };
 use gpui_kit::*;
-use std::sync::Arc;
 // =====================================================================
 // 设置页：任务 / 通用（语言与外观用下拉框）/ 工具安装 / 数据与版本
 // =====================================================================
@@ -378,11 +375,6 @@ impl AppView {
 
         let mut rows: Vec<AnyElement> = Vec::new();
         // 安装包下载路径：标题在上，输入框在下（对齐要求）
-        let path_display = if dl_dir.is_empty() {
-            t("tools_dl_path_ph").to_string()
-        } else {
-            dl_dir.clone()
-        };
         let dir_for_open = dl_dir.clone();
         rows.push(
             v_flex()
@@ -437,8 +429,6 @@ impl AppView {
                 .get("installed")
                 .and_then(|x| x.as_bool())
                 .unwrap_or(false);
-            let accounts_n = it.get("accounts").and_then(|x| x.as_i64()).unwrap_or(0);
-            let quota_total = it.get("quotaTotal").and_then(|x| x.as_f64());
             let dl = downloads
                 .iter()
                 .find(|d| d.get("platform").and_then(|x| x.as_str()) == Some(p.as_str()));
@@ -452,17 +442,6 @@ impl AppView {
                 "downloading" => tf("dl_state_downloading", &[("n", dl_prog.to_string())]),
                 "downloaded" => t("dl_state_downloaded").to_string(),
                 _ => String::new(),
-            };
-            let qtxt = if accounts_n > 0 {
-                format!(
-                    "{}{}",
-                    tf("installed_accounts", &[("n", accounts_n.to_string())]),
-                    quota_total
-                        .map(|q| format!("{}{}", t("remaining_quota"), crate::i18n::fmt_num(q)))
-                        .unwrap_or_default()
-                )
-            } else {
-                t("no_account_added").to_string()
             };
             let name_key = format!("tool_{p}");
             let name = if t(&name_key) == name_key {

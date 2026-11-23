@@ -1,21 +1,16 @@
 use super::{
-    accent, green, red, amber, token_blue, subtle, MyFluent, AccountRow, Page, DayBar, AppView,
-    st_color, st_kind, platform_name, mix_color, SELECT_TX,
+    accent, amber, subtle, MyFluent, AccountRow, AppView,
+    platform_name, mix_color,
 };
-use crate::backend;
-use crate::i18n::{t, tf};
+use crate::i18n::t;
 use crate::platform;
 use gpui_kit::component::{
-    ActiveTheme as _,
     button::{Button, ButtonVariants as _},
-    input::{Input, InputState},
-    switch::Switch,
     h_flex, v_flex,
-    Disableable as _, Selectable as _,
+    Selectable as _,
     Sizable as _,
 };
 use gpui_kit::*;
-use std::sync::Arc;
 // =====================================================================
 // 签到中心：进度 hero + 筛选 pills + 账号行（顶部按钮与账号管理一致）
 // =====================================================================

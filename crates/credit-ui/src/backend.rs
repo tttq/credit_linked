@@ -242,11 +242,13 @@ pub async fn install_update(file: String) -> Result<serde_json::Value, String> {
 }
 
 /// 退出应用（跨平台进程级退出）
+#[allow(dead_code)]
 pub async fn quit_app() -> Result<(), String> {
     std::process::exit(0);
 }
 
 /// 查询签到历史（默认最近 50 条）
+#[allow(dead_code)]
 pub async fn history(limit: Option<i64>) -> Result<serde_json::Value, String> {
     let s = svc()?;
     let rows = s.store.list_history(limit.unwrap_or(50)).map_err(|e| e.to_string())?;
@@ -281,12 +283,14 @@ pub async fn login_poll(session_id: String) -> Result<serde_json::Value, String>
 }
 
 /// 取消指定会话的登录
+#[allow(dead_code)]
 pub async fn login_cancel_one(session_id: String) -> Result<(), String> {
     credit_core::login::cancel_one(&session_id);
     Ok(())
 }
 
 /// 取消全部进行中的登录会话
+#[allow(dead_code)]
 pub async fn login_cancel() -> Result<(), String> {
     credit_core::login::cancel_all();
     Ok(())
@@ -305,6 +309,7 @@ pub async fn account_toggle_auto(provider: String, uid: String, auto: bool) -> R
 }
 
 /// 从码道客户端 secretStorage 同步最新会话到已存账号
+#[allow(dead_code)]
 pub async fn codearts_sync_local() -> Result<serde_json::Value, String> {
     use credit_core::adapters::codearts_local;
     let mut synced = Vec::new();
@@ -446,6 +451,7 @@ pub async fn settings_set(key: String, value: String) -> Result<(), String> {
 }
 
 /// 全量账号行（含状态/额度/最近签到时间）
+#[allow(dead_code)]
 pub async fn account_list_all() -> Result<serde_json::Value, String> {
     let s = svc()?;
     let rows = s.store.list_accounts_full().map_err(|e| e.to_string())?;
@@ -1125,6 +1131,7 @@ pub async fn gateway_switch_account(account_ref: Option<String>) -> Result<serde
     Ok(serde_json::json!({ "ok": true, "platform": raw, "active": chosen, "available": valid.len() }))
 }
 
+#[allow(dead_code)]
 pub async fn gateway_add_rule(model_pattern: String, platform: String, account: String, weight: i64, enabled: bool) -> Result<serde_json::Value, String> {
     let router = gw_router()?;
     let rule = credit_gateway::RouteRule {
@@ -1140,12 +1147,14 @@ pub async fn gateway_add_rule(model_pattern: String, platform: String, account: 
     serde_json::to_value(saved).map_err(|e| e.to_string())
 }
 
+#[allow(dead_code)]
 pub async fn gateway_update_rule(rule: serde_json::Value) -> Result<(), String> {
     let router = gw_router()?;
     let r: credit_gateway::RouteRule = serde_json::from_value(rule).map_err(|e| e.to_string())?;
     if router.update_rule(r) { Ok(()) } else { Err("规则不存在".into()) }
 }
 
+#[allow(dead_code)]
 pub async fn gateway_delete_rule(id: String) -> Result<(), String> {
     let router = gw_router()?;
     if router.delete_rule(&id) { Ok(()) } else { Err("规则不存在".into()) }

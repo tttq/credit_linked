@@ -1,21 +1,16 @@
 use super::{
-    accent, green, red, token_blue, subtle, MyFluent, AccountRow, Page, DayBar, AppView,
-    st_color, st_kind, platform_name, mix_color, SELECT_TX,
+    accent, subtle, MyFluent, AccountRow, AppView,
+    platform_name, mix_color,
 };
-use crate::backend;
-use crate::i18n::{t, tf};
+use crate::i18n::t;
 use crate::platform;
 use gpui_kit::component::{
-    ActiveTheme as _,
     button::{Button, ButtonVariants as _},
-    input::{Input, InputState},
-    switch::Switch,
     h_flex, v_flex,
-    Disableable as _, Selectable as _,
+    Selectable as _,
     Sizable as _,
 };
 use gpui_kit::*;
-use std::sync::Arc;
 // =====================================================================
 // 首页（overview）：积分趋势柱状图 + 我的 AI 工具卡
 // =====================================================================
@@ -84,7 +79,6 @@ impl AppView {
     pub(crate) fn render_tool_card(&self, a: &AccountRow) -> AnyElement {
         let m = platform::meta(&a.provider);
         let color = m.color_hex_u32();
-        let done = a.done();
         let quota_text = a.remaining.map(crate::i18n::fmt_num).unwrap_or_else(|| "—".into());
         let last = if a.last_checkin.len() >= 10 { format!("{}{}", t("last"), &a.last_checkin[5..10]) } else { String::new() };
 

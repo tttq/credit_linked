@@ -1,37 +1,43 @@
 name: Release Build
 
+# 推送 tag（git tag v0.1.8 && git push origin v0.1.8）自动触发：
+# 1) 把 tag 里的版本号写进 Cargo.toml [workspace.package].version
+#    （credit-ui 经 version.workspace = true 继承 → CARGO_PKG_VERSION 即应用版本，
+#     应用内“检查更新”用它与 GitHub releases/latest 的 tag 动态比较）
+# 2) 各平台编译打包：Windows exe / macOS app(arm64+x64) / Linux 二进制
+# 3) 全部产物附加到与该 tag 对应的 GitHub Release
+
 on:
   push:
     tags:
       - 'v*'
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
-    permissions:
-      contents: write
+    name: Build ${{ matrix.target }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - platform: 'macos-latest'
-            args: '--target aarch64-apple-darwin --bundles app,dmg'
-          - platform: 'macos-latest'
-            args: '--target x86_64-apple-darwin --bundles app,dmg'
-          - platform: 'ubuntu-22.04'
-            args: '--bundles deb,appimage,rpm'
-          - platform: 'windows-latest'
-            args: '--bundles nsis'
-
-    runs-on: ${{ matrix.platform }}
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: credit-ui-windows-x64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact: credit-ui-macos-arm64
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            artifact: credit-ui-macos-x64
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            artifact: credit-ui-linux-x64
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install dependencies (ubuntu)
-        if: matrix.platform == 'ubuntu-22.04'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf libgtk-3-dev
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -41,30 +47,39 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+          targets: ${{ matrix.target }}
 
       - name: Rust cache
         uses: swatinem/rust-cache@v2
         with:
           workspaces: |
             .
+          key: ${{ matrix.target }}
 
-      - name: Sync app version with git tag (vX.Y.Z → tauri.conf.json / Cargo.toml)
-        if: startsWith(github.ref, 'refs/tags/v')
+      - name: Install dependencies (linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          # gpui(Linux/wayland+x11) 编译期依赖：xkbcommon / wayland / fontconfig / freetype
+          sudo apt-get install -y build-essential pkg-config \
+            libxkbcommon-dev libxkbcommon-x11-dev \
+            libwayland-dev libfontconfig1-dev libfreetype-dev
+
+      - name: Sync app version with git tag (vX.Y.Z → Cargo.toml)
+        id: ver
         shell: bash
         run: |
-          VER="${GITHUB_REF_NAME#v}"
-          echo "Syncing version to $VER"
-          # tauri.conf.json: 只替换第一处 "version"
-          node -e "
-            const fs = require('fs');
-            const f = 'src-tauri/tauri.conf.json';
-            const j = JSON.parse(fs.readFileSync(f, 'utf8'));
-            j.version = process.argv[1];
-            fs.writeFileSync(f, JSON.stringify(j, null, 2) + '\n');
-          " "$VER"
-          # Cargo.toml workspace.package.version（credit-tauri 继承 workspace 版本，CARGO_PKG_VERSION 即应用版本）
-          # macOS 的 BSD sed 不兼容 GNU sed 的 -i/0,/re/ 语法，改用 node 跨平台替换
+          VER=""
+          if [[ "${GITHUB_REF_NAME:-}" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            VER="${BASH_REMATCH[1]}"
+          else
+            # workflow_dispatch 等无 tag 场景：回退用 Cargo.toml 里现有版本
+            VER=$(sed -n '/\[workspace\.package\]/,/^\[/ { s/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p; }' Cargo.toml | head -n1)
+          fi
+          if [ -z "$VER" ]; then echo "cannot resolve app version"; exit 1; fi
+          echo "Packing version: $VER"
+          # Cargo.toml workspace.package.version（credit-ui 继承 workspace 版本，CARGO_PKG_VERSION 即应用版本）
+          # macOS 的 BSD sed 与 GNU sed 不兼容，统一用 node 跨平台替换
           node -e "
             const fs = require('fs');
             const f = 'Cargo.toml';
@@ -80,39 +95,93 @@ jobs:
             }
             if (!done) { console.error('version under [workspace.package] not found'); process.exit(1); }
             fs.writeFileSync(f, lines.join('\n'));
+            console.log('Cargo.toml workspace.version -> ' + ver);
           " "$VER"
-          echo "tauri.conf.json version: $(node -p "JSON.parse(require('fs').readFileSync('src-tauri/tauri.conf.json','utf8')).version")"
-          echo "Cargo.toml workspace version: $(grep -m1 -A1 '\[workspace.package\]' Cargo.toml | grep version)"
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
 
-      - name: Install Tauri CLI
-        run: cargo install tauri-cli --version 2.12.5 --locked
+      - name: Build (credit-ui)
+        run: cargo build --release --target ${{ matrix.target }} -p credit-ui
 
-      - name: Build (credit-tauri)
+      - name: Package (windows)
+        if: runner.os == 'Windows'
         shell: bash
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # Linux AppImage 打包在无 FUSE 的 CI 环境需要解包运行 linuxdeploy
-          APPIMAGE_EXTRACT_AND_RUN: 1
         run: |
-          set -o pipefail
-          cargo tauri build --verbose ${{ matrix.args }} 2>&1 | tee build.log || {
-            echo "=== ERROR LINES ==="
-            grep -nE "error(\[E[0-9]+\])?:|error\[|panicked|failed to" build.log | tail -n 60 | while IFS= read -r line; do echo "::error::$line" ; done || true
-            echo "=== RAW TAIL ==="
-            tail -n 200 build.log | while IFS= read -r line; do echo "::error::$line" ; done || true
-            exit 1
-          }
-      - name: Release (tauri-action)
-        if: success()
-        uses: tauri-apps/tauri-action@v0
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VER="${{ steps.ver.outputs.version }}"
+          cp "target/x86_64-pc-windows-msvc/release/credit-ui.exe" "credit-ui-${VER}-windows-x64.exe"
+          ls -la "credit-ui-${VER}-windows-x64.exe"
+
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          VER="${{ steps.ver.outputs.version }}"
+          case "${{ matrix.target }}" in
+            aarch64-apple-darwin) ARCH=arm64 ;;
+            *) ARCH=x64 ;;
+          esac
+          APP="AI Free Router.app"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          cp "target/${{ matrix.target }}/release/credit-ui" "$APP/Contents/MacOS/credit-ui"
+          cat > "$APP/Contents/Info.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key><string>AI Free Router</string>
+            <key>CFBundleDisplayName</key><string>AI Free Router</string>
+            <key>CFBundleIdentifier</key><string>com.tttq.credit-linked</string>
+            <key>CFBundleExecutable</key><string>credit-ui</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleVersion</key><string>$VER</string>
+            <key>CFBundleShortVersionString</key><string>$VER</string>
+            <key>LSMinimumSystemVersion</key><string>10.15</string>
+            <key>NSHighResolutionCapable</key><true/>
+          </dict>
+          </plist>
+          EOF
+          # 本地临时签名，保证可双击启动
+          codesign --force --deep --sign - "$APP"
+          tar -czf "credit-ui-${VER}-macos-${ARCH}.tar.gz" "$APP"
+          ls -la "credit-ui-${VER}-macos-${ARCH}.tar.gz"
+
+      - name: Package (linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          VER="${{ steps.ver.outputs.version }}"
+          mkdir -p pkg
+          cp "target/x86_64-unknown-linux-gnu/release/credit-ui" pkg/credit-ui
+          chmod +x pkg/credit-ui
+          tar -czf "credit-ui-${VER}-linux-x64.tar.gz" -C pkg credit-ui
+          ls -la "credit-ui-${VER}-linux-x64.tar.gz"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
         with:
-          projectPath: .
-          tauriScript: cargo tauri
-          tagName: ${{ github.ref_name }}
-          releaseName: 'AI Free Router ${{ github.ref_name }}'
-          releaseBody: '多平台桌面版：Windows (NSIS exe/msi)、macOS (dmg, Intel/Apple Silicon)、Linux (deb/AppImage)。'
-          releaseDraft: false
+          name: ${{ matrix.artifact }}
+          path: |
+            credit-ui-*.exe
+            credit-ui-*.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all platform artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Attach assets to tag Release
+        uses: softprops/action-gh-release@v2
+        with:
+          # tag 推送触发时自动使用当前 tag 创建/复用 Release
+          files: dist/*
+          generate_release_notes: true
+          draft: false
           prerelease: false
-          args: ${{ matrix.args }}
+          fail_on_unmatched_files: true

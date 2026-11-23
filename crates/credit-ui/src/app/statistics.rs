@@ -1,22 +1,19 @@
 use super::{
-    accent, green, red, token_blue, subtle, MyFluent, AccountRow, Page, DayBar, AppView,
-    st_color, st_kind, platform_name, mix_color, aggregate_tokens, short_day, SELECT_TX,
+    accent, token_blue, subtle, MyFluent, AppView, DayBar,
+    aggregate_tokens, short_day,
 };
 use crate::backend;
-use crate::i18n::{t, tf};
+use crate::i18n::t;
 use crate::platform;
 use gpui_kit::component::{
     chart::{BarChart, LineChart},
     ActiveTheme as _,
     button::{Button, ButtonVariants as _},
-    input::{Input, InputState},
-    switch::Switch,
     h_flex, v_flex,
-    Disableable as _, Selectable as _,
+    Selectable as _,
     Sizable as _,
 };
 use gpui_kit::*;
-use std::sync::Arc;
 // =====================================================================
 // 积分统计：账号/周期 pills + 指标卡 + 官方 LineChart
 // =====================================================================
@@ -255,7 +252,7 @@ struct StatDatum { x: gpui_kit::SharedString, points: f64, tokens: f64 }
 fn dominant_provider_color(d: &DayBar) -> (Rgba, String) {
     let best = d.by_provider.iter().max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
     if let Some((provider, _)) = best {
-        (rgb(platform::meta(provider).color_hex_u32()), provider.clone())
+        (rgb(platform::meta(provider).color_hex_u32()), provider.to_string())
     } else {
         (rgb(accent()), "checkin".into())
     }

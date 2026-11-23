@@ -19,6 +19,7 @@ pub mod light {
     pub const RED: u32 = 0xd5455c;
     pub const BG: u32 = 0xf7f7fb;
     pub const SHELL_BG: u32 = 0xfafafe;
+    #[allow(dead_code)]
     pub const SHELL_BORDER: u32 = 0xe4e2f0;
     pub const TOPBAR_A: u32 = 0xeeebff;
     pub const TOPBAR_B: u32 = 0xf4f1ff;
@@ -37,6 +38,7 @@ pub mod dark {
     pub const RED: u32 = 0xe9607a;
     pub const BG: u32 = 0x1b1b26;
     pub const SHELL_BG: u32 = 0x181824;
+    #[allow(dead_code)]
     pub const SHELL_BORDER: u32 = 0x33324a;
     pub const TOPBAR_A: u32 = 0x2c2a4a;
     pub const TOPBAR_B: u32 = 0x232238;
@@ -139,6 +141,7 @@ pub fn apply(cx: &mut gpui_kit::App) {
 }
 
 /// 顶栏渐变色（亮/暗各一对）
+#[allow(dead_code)]
 pub fn topbar_gradient(dark: bool) -> (u32, u32) {
     if dark {
         (dark::TOPBAR_A, dark::TOPBAR_B)

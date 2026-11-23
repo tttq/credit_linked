@@ -1,6 +1,6 @@
 use super::{
-    mix_color, platform_name, st_color, st_kind, AccountRow, AppView, DayBar, MyFluent, Page,
-    accent, green, red, SELECT_TX, subtle, token_blue,
+    mix_color, AppView, MyFluent,
+    accent, green, red, subtle,
 };
 use crate::backend;
 use crate::i18n::{t, tf};
@@ -8,12 +8,11 @@ use crate::platform;
 use gpui_kit::component::{
     button::{Button, ButtonVariants as _},
     h_flex,
-    input::{Input, InputState},
+    input::Input,
     switch::Switch,
-    v_flex, ActiveTheme as _, Disableable as _, Selectable as _, Sizable as _,
+    v_flex, Disableable as _, Sizable as _,
 };
 use gpui_kit::*;
-use std::sync::Arc;
 // =====================================================================
 // 账号路由：网关卡 / 请求平台 / 账号切换 / 模型测试 / 请求日志
 // =====================================================================
@@ -56,7 +55,6 @@ impl AppView {
 
     pub(crate) fn render_routing(
         &mut self,
-        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let Some(st) = self.gw_status.clone() else {
@@ -78,8 +76,6 @@ impl AppView {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        let port = st.get("port").and_then(|v| v.as_i64()).unwrap_or(8756);
-        let rpm = st.get("rpm").and_then(|v| v.as_i64()).unwrap_or(0);
         let strict = st.get("strict").and_then(|v| v.as_bool()).unwrap_or(true);
         let cur_platform = st
             .get("platform")

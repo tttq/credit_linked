@@ -1,21 +1,17 @@
 use super::{
-    accent, green, red, token_blue, subtle, MyFluent, AccountRow, Page, DayBar, AppView,
-    st_color, st_kind, platform_name, mix_color, SELECT_TX,
+    accent, red, st_color, subtle, MyFluent, AccountRow, AppView,
+    platform_name, mix_color,
 };
-use crate::backend;
 use crate::i18n::{t, tf};
 use crate::platform;
 use gpui_kit::component::{
-    ActiveTheme as _,
     button::{Button, ButtonVariants as _},
-    input::{Input, InputState},
     switch::Switch,
     h_flex, v_flex,
-    Disableable as _, Selectable as _,
+    Disableable as _,
     Sizable as _,
 };
 use gpui_kit::*;
-use std::sync::Arc;
 // =====================================================================
 // 账号管理：平台分组卡片 + 账号行操作
 // =====================================================================

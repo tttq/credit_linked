@@ -1,22 +1,16 @@
 use super::{
-    accent, green, red, token_blue, subtle, MyFluent, AccountRow, Page, DayBar, AppView,
-    st_color, st_kind, platform_name, mix_color, SELECT_TX,
+    accent, mix_color, MyFluent, AppView, SELECT_TX,
 };
 use crate::backend;
 use crate::i18n::{t, tf};
-use crate::platform;
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::{
-    ActiveTheme as _,
     button::{Button, ButtonVariants as _},
     input::{Input, InputState},
-    switch::Switch,
     h_flex, v_flex,
-    Disableable as _, Selectable as _,
     Sizable as _,
 };
 use gpui_kit::*;
-use std::sync::Arc;
 // =====================================================================
 // 动作方法：全部业务交互（backend 调用一律经 backend::bg 派发到全局 runtime）
 // =====================================================================
@@ -292,7 +286,8 @@ impl AppView {
         });
     }
 
-    /// 预取本机 Trae 已注册设备号（供设备号弹框点选；避免弹框内 await）
+    /// 预取本机 Trae 已注册设备号（供设备号弹框点选；避免弹框内 await）。
+    /// 在 refresh_all 与账号页打开时调用，保证弹框始终有可用列表。
     pub fn refresh_local_devices(&mut self, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
             let devices = backend::bg(async { backend::trae_local_devices().await })
@@ -336,11 +331,6 @@ impl AppView {
         }).detach();
     }
 
-    pub fn switch_locale(&mut self, loc: &'static str, cx: &mut Context<Self>) {
-        crate::i18n::set_locale(loc);
-        self.set_setting_raw("locale", loc.to_string(), cx);
-    }
-
     pub fn set_theme_mode(&mut self, mode: &'static str, cx: &mut Context<Self>) {
         use gpui_kit::component::{Theme, ThemeMode};
         // system → 跟随 Windows 个性化开关（winreg 直读 DWORD，见 theme::resolve_dark）
@@ -358,94 +348,6 @@ impl AppView {
     }
 
     // ---- 网关动作 ----
-
-    /// 端口编辑对话框（在回调中创建 InputState，避免 render 内 cx.new 栈溢出）
-    pub fn edit_gw_port(&mut self, current: i64, window: &mut Window, cx: &mut Context<Self>) {
-        let input = cx.new(|cx| InputState::new(window, cx).default_value(current.to_string()));
-        let weak = cx.weak_entity();
-        window.open_dialog(cx, move |dialog, _window, _cx| {
-            let inp = input.clone();
-            let weak2 = weak.clone();
-            dialog
-                .title(t("port"))
-                .child(Input::new(&inp).w(px(180.)))
-                .footer(h_flex().gap(px(8.)).justify_end()
-                    .child(
-                        Button::new("port-cancel").label(t("cancel"))
-                            .on_click(|_, window, cx| window.close_dialog(cx)),
-                    )
-                    .child(
-                        Button::new("port-ok").label(t("save")).primary()
-                            .on_click(move |_, window, cx| {
-                                let port = inp.read(cx).value().trim().parse::<i64>().ok();
-                                let weak3 = weak2.clone();
-                                if let Some(port) = port {
-                                    if (1..=65535).contains(&port) {
-                                        let _ = weak3.update(cx, |this, cx| this.apply_gw_port(port, cx));
-                                    }
-                                }
-                                window.close_dialog(cx);
-                            }),
-                    )
-                )
-        });
-    }
-
-    /// RPM 编辑对话框
-    pub fn edit_gw_rpm(&mut self, current: i64, window: &mut Window, cx: &mut Context<Self>) {
-        let input = cx.new(|cx| InputState::new(window, cx).default_value(current.to_string()));
-        let weak = cx.weak_entity();
-        window.open_dialog(cx, move |dialog, _window, _cx| {
-            let inp = input.clone();
-            let weak2 = weak.clone();
-            dialog
-                .title(t("rate_limit"))
-                .child(Input::new(&inp).w(px(180.)))
-                .footer(h_flex().gap(px(8.)).justify_end()
-                    .child(
-                        Button::new("rpm-cancel").label(t("cancel"))
-                            .on_click(|_, window, cx| window.close_dialog(cx)),
-                    )
-                    .child(
-                        Button::new("rpm-ok").label(t("save")).primary()
-                            .on_click(move |_, window, cx| {
-                                let rpm = inp.read(cx).value().trim().parse::<i64>().ok().unwrap_or(0);
-                                let weak3 = weak2.clone();
-                                let _ = weak3.update(cx, |this, cx| this.apply_gw_rpm(rpm, cx));
-                                window.close_dialog(cx);
-                            }),
-                    )
-                )
-        });
-    }
-
-    /// 应用端口设置（由对话框回调）
-    pub fn apply_gw_port(&mut self, port: i64, cx: &mut Context<Self>) {
-        cx.spawn(async move |this, cx| {
-            let r = backend::bg(async move { backend::gateway_set_limits(Some(port), None, None).await })
-                .await.unwrap_or_else(|_| Err("task aborted".into()));
-            this.update(cx, |v, cx| {
-                match r {
-                    Ok(res) => v.toast(if res.get("needsRestart").and_then(|x| x.as_bool()).unwrap_or(false) {
-                        t("port_saved_restart") } else { t("port_saved") }, cx),
-                    Err(e) => v.toast(format!("{}{}", t("save_failed"), e), cx),
-                }
-                v.refresh_gateway(cx);
-            }).ok();
-        }).detach();
-    }
-
-    /// 应用 RPM 设置（由对话框回调）
-    pub fn apply_gw_rpm(&mut self, rpm: i64, cx: &mut Context<Self>) {
-        cx.spawn(async move |this, cx| {
-            let r = backend::bg(async move { backend::gateway_set_limits(None, Some(rpm), None).await })
-                .await.unwrap_or_else(|_| Err("task aborted".into()));
-            this.update(cx, |v, cx| {
-                match r { Ok(_) => v.toast(t("rate_saved"), cx), Err(e) => v.toast(format!("{}{}", t("save_failed"), e), cx) }
-                v.refresh_gateway(cx);
-            }).ok();
-        }).detach();
-    }
 
     pub fn save_gw_port(&mut self, cx: &mut Context<Self>) {
         let port_opt = self.gw_port_input.as_ref()
@@ -783,7 +685,7 @@ impl AppView {
             self.toast(t("tools_dl_path_ph"), cx);
             return;
         }
-        cx.spawn(async move |this, cx| {
+        cx.spawn(async move |_this, _cx| {
             let _ = backend::bg(async move { backend::open_url(dir).await }).await;
         }).detach();
     }
@@ -871,7 +773,7 @@ impl AppView {
     }
 
     pub fn open_release(&mut self, url: String, cx: &mut Context<Self>) {
-        cx.spawn(async move |this, cx| {
+        cx.spawn(async move |_this, _cx| {
             let _ = backend::bg(async move { backend::open_url(url).await }).await;
         }).detach();
     }
