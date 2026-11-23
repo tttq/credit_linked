@@ -187,6 +187,8 @@ pub struct AppView {
     // 路由页
     pub gw_status: Option<serde_json::Value>,
     pub gw_accounts: Option<serde_json::Value>,
+    /// 网关数据（状态/账号/日志）刷新进行中：刷新与清空按钮的加载态
+    pub gw_loading: bool,
     pub gw_models: Vec<String>,
     pub gw_test_model: Option<String>,
     pub gw_test_status: String,
@@ -218,6 +220,8 @@ pub struct AppView {
     pub auto_refresh_started: bool,
     /// 安装包下载进度轮询是否进行中
     pub tools_poll_running: bool,
+    /// 网关日志刷新/清空进行中（按钮禁用 + 文案变化，给用户可感知的状态）
+    pub gw_logs_busy: bool,
 }
 
 impl AppView {
@@ -253,6 +257,7 @@ impl AppView {
             checkin_filter: "all".into(),
             gw_status: None,
             gw_accounts: None,
+            gw_loading: false,
             gw_models: Vec::new(),
             gw_test_model: None,
             gw_test_status: String::new(),
@@ -275,7 +280,7 @@ impl AppView {
             scroll: gpui_kit::ScrollHandle::new(),
             auto_refresh_started: false,
             tools_poll_running: false,
-
+            gw_logs_busy: false,
         }
     }
 
@@ -508,7 +513,13 @@ impl AppView {
         let weak = cx.weak_entity();
         // 自定义标题栏：只保留「最小化」「关闭」两个按钮（不要最大化）。
         // 组件 TitleBar 会无条件画出最大化按钮，所以这里自己渲染。
+        //
+        // 拖动区域：`app_owns_titlebar_drag: true`（见 main.rs）时系统不再把
+        // 顶栏当标题栏处理，必须显式声明 WindowControlArea::Drag，否则按住顶栏
+        // 拖不动窗口（gpui 官方 TitleBar 的 "bar" 容器正是这么做的）。
         h_flex()
+            .id("title-bar")
+            .window_control_area(WindowControlArea::Drag)
             .items_center()
             .w_full()
             .bg(grad)

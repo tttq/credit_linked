@@ -312,11 +312,22 @@ pub async fn trae_fetch_models(cred: &Cred, intl: bool) -> Result<Vec<ModelInfo>
             continue;
         }
         let context = row.get("context_window_tokens").cloned().unwrap_or(Value::Null);
-        let ctx = context.get("dev").and_then(|v| v.as_u64());
+        let dev_ctx = context.get("dev").and_then(|v| v.as_u64());
         let max_ctx = if row.get("max_mode").and_then(|v| v.as_bool()).unwrap_or(false) {
             context.get("max").and_then(|v| v.as_u64())
         } else {
             None
+        };
+        // max_mode 的 max 是「最大上下文窗口」档位，不是输出 token 上限。
+        // 历史缺陷：把 max(=1000000) 当 max_tokens 下发，客户端（pi-ai discovery）
+        // 存为输出上限后，切换模型时 compaction-basic 以
+        // maxTokens(1000000) >= contextWindow(116000) 计算预算，直接报
+        // 「leaving no message budget」导致无法切换模型。
+        // 现在窗口取两档较大值；输出上限一律不下发，客户端按自身默认上限请求。
+        let ctx = match (dev_ctx, max_ctx) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (Some(a), None) => Some(a),
+            (None, b) => b,
         };
         let features = row.get("features").cloned().unwrap_or(Value::Null);
         let multimodal = row.get("multimodal").and_then(|v| v.as_bool());
@@ -325,7 +336,9 @@ pub async fn trae_fetch_models(cred: &Cred, intl: bool) -> Result<Vec<ModelInfo>
             name: row.get("display_name").and_then(|n| n.as_str()).filter(|s| !s.is_empty()).unwrap_or(&id).to_string(),
             id,
             context_window: ctx,
-            max_tokens: max_ctx,
+            // max_mode 的 max 是上下文档位而非输出上限（见上注释），不下发 max_tokens；
+            // 否则 discovery 客户端会把它当输出 cap 存下来，compaction 预算直接溢出。
+            max_tokens: None,
             credit_multiplier: rate,
             supports_images: multimodal,
         });
@@ -614,7 +627,10 @@ pub fn decode_trae_event(event_name: &str, data: &str) -> Option<StreamEvent> {
             let msg = v.get("message").and_then(|m| m.as_str()).unwrap_or("").to_string();
             let readable = match code {
                 1005 => "该模型需要付费套餐".to_string(),
-                4011 | 4001 => "该账号被限频或模型不在套餐内（可换账号/模型重试）".to_string(),
+                // 4011/4001 是限频/套餐类错误：换账号即可恢复。文案里带「额度」关键词，
+                // 让 wrap_quota_to_retry 的 is_quota_exhausted_msg 命中，转成可重试 Err
+                // 并自动换号重发（仅尚未产出内容时），而不是透传给客户端报「本轮运行失败」。
+                4011 | 4001 => "该账号被限频或不在套餐内（额度/限频类，已自动换账号重试）".to_string(),
                 _ => format!("上游错误 code={code}: {msg}"),
             };
             Some(StreamEvent::Error(readable, code.to_string()))

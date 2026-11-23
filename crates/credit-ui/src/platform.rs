@@ -82,8 +82,10 @@ pub const GW_PLATFORMS: &[(&str, &str, bool)] = &[
     ("zcode",            "gw_zcode",             true),
     ("minimax",          "gw_minimax",           true),
     ("qoder",            "gw_qoder",             true),
-    ("codearts",         "gw_codearts",          false),
-    ("codearts-desktop", "gw_codearts_desktop",  false),
+    // codearts 双通道均已支持对话（网关 dispatch_once 有 CodeArts 分支，走
+    // desktop/IDE 通道 + 会话池）；不再是「仅签到」。
+    ("codearts",         "gw_codearts",          true),
+    ("codearts-desktop", "gw_codearts_desktop",  true),
 ];
 
 pub fn gw_chat(channel: &str) -> bool {

@@ -73,7 +73,8 @@ impl AppView {
                                     .when(show_token && tokens.iter().any(|x| *x > 0.0), |el| el.child(self.legend_dot(token_blue(), t("token_usage")))),
                             ),
                     )
-                    .child(div().w_full().h(px(if show_token { 200. } else { 190. })).child(Self::chart_line(items, tokens, show_token, &period, cx)))
+                    // 图表自身已带高度（chart_line 内部按 show_token 定高），外层只约束宽度
+                    .child(div().w_full().child(Self::chart_line(items, tokens, show_token, &period, cx)))
                     .child(div().text_size(px(11.)).text_color(rgb(subtle())).pt(px(8.)).child(note)),
             )
     }
@@ -156,8 +157,12 @@ impl AppView {
             .into_any_element()
     }
 
-    /// 统计折线图（官方 LineChart：积分 + token）
+    /// 统计折线图（官方 LineChart：积分 + token 双曲线同图）
     /// period 决定 x 轴标签粒度：按天只显示「月-日」，按周显示「W03」，按月「01月」，按年「2025」。
+    ///
+    /// gpui_kit 的 LineChart 是单序列：两个曲线用**两个 LineChart 绝对定位叠加**实现。
+    /// 积分（主色）画在下层带轴，token（蓝）画在上层隐藏轴，两层共享同一绘图区；
+    /// 各自按自身数据归一化（各自 y 缩放），曲线形态都是真实的相对趋势。
     pub(crate) fn chart_line(items: Vec<(String, f64, i64)>, tokens: Vec<f64>, show_token: bool, period: &str, cx: &mut Context<Self>) -> AnyElement {
         let dark = matches!(cx.theme().mode, gpui_kit::component::ThemeMode::Dark);
         let (accent, _, _, _, _, _, _, _, _, _, _, _, _) = crate::theme::palette(dark);
@@ -183,6 +188,7 @@ impl AppView {
         }).collect();
         let peak = items.iter().map(|(_, p, _)| *p).fold(0.0f64, f64::max);
         let total: f64 = items.iter().map(|(_, p, _)| *p).sum();
+        let height = if show_token { 150. } else { 180. };
         v_flex().w_full().gap(px(4.))
             // 数值摘要：替代 Y 轴刻度（官方 LineChart 在小尺寸下不画刻度数字）
             .child(
@@ -193,31 +199,38 @@ impl AppView {
                         .child(format!("{} {}", t("total_points"), crate::i18n::fmt_num(total)))),
             )
             .child(
-                div().w_full().h(px(if show_token { 96. } else { 180. }))
+                // 双曲线容器：relative 定位，两张图绝对定位铺满同一绘图区
+                div().w_full().h(px(height)).relative()
                     .child(
-                        LineChart::new(series.clone())
-                            .id("chart-points")
-                            .x(|d| d.x.clone())
-                            .y(|d| d.points)
-                            .stroke(rgb(accent))
-                            .grid(true)
-                            .x_tick_count(if series.len() > 8 { 6 } else { series.len().max(1) })
-                            .dot()
-                    ),
+                        // 下层：积分曲线（带 x 轴与网格）
+                        div().absolute().inset_0()
+                            .child(
+                                LineChart::new(series.clone())
+                                    .id("chart-points")
+                                    .x(|d| d.x.clone())
+                                    .y(|d| d.points)
+                                    .stroke(rgb(accent))
+                                    .grid(true)
+                                    .x_tick_count(if series.len() > 8 { 6 } else { series.len().max(1) })
+                                    .dot()
+                            ),
+                    )
+                    .when(show_token, |el| el.child(
+                        // 上层：token 曲线（隐藏轴与网格，避免与下层重叠；交互层让给下层）
+                        div().absolute().inset_0()
+                            .child(
+                                LineChart::new(series.clone())
+                                    .id("chart-tokens")
+                                    .x(|d| d.x.clone())
+                                    .y(|d| d.tokens)
+                                    .stroke(rgb(token_blue()))
+                                    .grid(false)
+                                    .x_axis(false)
+                                    .x_tick_count(if series.len() > 8 { 6 } else { series.len().max(1) })
+                                    .interactive(false)
+                            ),
+                    )),
             )
-            .when(show_token, |el| el.child(
-                div().w_full().h(px(96.))
-                    .child(
-                        LineChart::new(series)
-                            .id("chart-tokens")
-                            .x(|d| d.x.clone())
-                            .y(|d| d.tokens)
-                            .stroke(rgb(token_blue()))
-                            .grid(true)
-                            // 第二张图不再重复画日期轴，避免出现两行日期
-                            .x_axis(false)
-                    ),
-            ))
             .into_any_element()
     }
 }

@@ -452,7 +452,7 @@ pub async fn account_list_all() -> Result<serde_json::Value, String> {
     serde_json::to_value(rows).map_err(|e| e.to_string())
 }
 
-/// 用系统默认浏览器打开 URL
+/// 用系统默认浏览器打开 URL（引号修复：`&` 不再被 cmd 截断）
 pub async fn open_url(url: String) -> Result<(), String> {
     #[cfg(windows)]
     credit_core::proc_util::hide_console(std::process::Command::new("cmd"))
@@ -462,6 +462,19 @@ pub async fn open_url(url: String) -> Result<(), String> {
     #[cfg(target_os = "linux")]
     std::process::Command::new("xdg-open").arg(&url).spawn().map_err(|e| e.to_string())?;
     Ok(())
+}
+
+// ===== 登录授权小窗（Chrome/Edge --app 模式） =====
+
+/// 用 Chrome/Edge app 模式弹登录小窗（480×680，无地址栏；找不到时退回系统浏览器）。
+/// 窗口进程句柄存于 login_window 模块；登录终态由 close_login_window 关闭。
+pub async fn login_open_window(url: String) -> Result<bool, String> {
+    crate::login_window::open_login_window(&url, 480, 680)
+}
+
+/// 关闭登录授权小窗（登录终态 / 取消时调用）
+pub async fn login_close_window() {
+    crate::login_window::close_login_window();
 }
 
 // ===== 自动签到调度器 =====

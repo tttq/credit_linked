@@ -1192,7 +1192,7 @@ fn is_quota_exhausted_msg(msg: &str) -> bool {
         || m.contains("personalcreditsdrainedout")
         || m.contains("billinggroupcreditslimitreached")
         || m.contains("vela free limit") // 119 velaModelFreeLimitReached
-        || msg.contains("额度") || msg.contains("余额不足")
+        || msg.contains("额度") || msg.contains("余额不足") || msg.contains("限频") // Trae 4011/4001：限频/套餐类，换账号即可恢复
         || m.contains("insufficient_balance")
         || m.contains("quota exhausted")
         || m.contains("rate_limit")

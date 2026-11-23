@@ -12,6 +12,7 @@
 mod app;
 mod backend;
 mod i18n;
+mod login_window;
 mod platform;
 mod theme;
 

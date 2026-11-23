@@ -19,6 +19,9 @@ use std::sync::Arc;
 // =====================================================================
 impl AppView {
     pub fn refresh_gateway(&mut self, cx: &mut Context<Self>) {
+        // busy 态立即反馈：按钮变「刷新中…」并禁用（清空按钮共用该标志）
+        self.gw_logs_busy = true;
+        cx.notify();
         cx.spawn(async move |this, cx| {
             let (st, accts) = backend::bg(async {
                 (
@@ -31,6 +34,7 @@ impl AppView {
             this.update(cx, |v, cx| {
                 v.gw_status = st.ok();
                 v.gw_accounts = accts.ok();
+                v.gw_logs_busy = false;
                 cx.notify();
             })
             .ok();
@@ -614,8 +618,11 @@ impl AppView {
                                         .gap(px(8.))
                                         .child(
                                             Button::new("gw-logs-refresh")
-                                                .label(t("refresh"))
+                                                // busy 态：文案换成「刷新中…」并禁用，
+                                                // 让点击有即时可感知的状态反馈
+                                                .label(if self.gw_logs_busy { t("refreshing") } else { t("refresh") })
                                                 .small()
+                                                .disabled(self.gw_logs_busy)
                                                 .on_click(cx.listener(|this, _, _w, cx| {
                                                     this.refresh_gateway(cx)
                                                 })),
@@ -623,10 +630,11 @@ impl AppView {
                                         .when(log_total > 0, |el| {
                                             el.child(
                                                 Button::new("gw-logs-clear")
-                                                    .label(t("clear_log"))
+                                                    .label(if self.gw_logs_busy { t("clearing") } else { t("clear_log") })
                                                     .small()
                                                     .text()
                                                     .text_color(rgb(red()))
+                                                    .disabled(self.gw_logs_busy)
                                                     .on_click(cx.listener(|this, _, _w, cx| {
                                                         this.clear_gw_logs(cx)
                                                     })),

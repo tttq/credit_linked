@@ -150,7 +150,8 @@ impl AppView {
             if let Ok(res) = r {
                 let sid = res.get("sessionId").and_then(|v| v.as_str()).unwrap_or("").to_string();
                 let url = res.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                let _ = backend::bg(async move { backend::open_url(url).await }).await;
+                // Chrome/Edge app 模式小窗（480×680 无地址栏）；退回系统浏览器时也能用（引号已修复）
+                let _ = backend::bg(async move { backend::login_open_window(url).await }).await;
                 // 轮询至终态（sleep 放进 runtime，避免阻塞 gpui 执行器）
                 loop {
                     let sid_loop = sid.clone();
@@ -167,6 +168,10 @@ impl AppView {
                             _ => {}
                         }
                     } else { done = true; }
+                    if done {
+                        // 终态：自动关闭登录小窗（成功取到凭据 / 失败 / 超时都关）
+                        let _ = backend::bg(async { backend::login_close_window().await }).await;
+                    }
                     let poll_v = poll.ok();
                     this.update(cx, move |v, cx| {
                         if done {
@@ -195,7 +200,12 @@ impl AppView {
                     if done { break; }
                 }
             } else {
-                this.update(cx, |v, cx| v.toast(format!("{}: task aborted", t("login_failed")), cx)).ok();
+                // 发起失败：关掉可能已开的登录窗
+                let _ = backend::bg(async { backend::login_close_window().await }).await;
+                this.update(cx, |v, cx| {
+                    let msg = r.err().unwrap_or_else(|| "task aborted".into());
+                    v.toast(format!("{}: {msg}", t("login_failed")), cx);
+                }).ok();
             }
         }).detach();
     }
@@ -631,10 +641,14 @@ impl AppView {
     }
 
     pub fn clear_gw_logs(&mut self, cx: &mut Context<Self>) {
+        // busy 态立即反馈：清空按钮变「清空中…」并禁用（刷新按钮共用该标志）
+        self.gw_logs_busy = true;
+        cx.notify();
         cx.spawn(async move |this, cx| {
             let r = backend::bg(async { backend::gateway_clear_logs().await })
                 .await.unwrap_or_else(|_| Err("task aborted".into()));
             this.update(cx, |v, cx| {
+                v.gw_logs_busy = false;
                 match r {
                     Ok(res) => {
                         let n = res.get("cleared").and_then(|x| x.as_i64()).unwrap_or(0);
