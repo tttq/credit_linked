@@ -3,6 +3,8 @@
 //! billing/profile 类端点只认 zcodejwttoken（无 exp 的长效会话 JWT）；
 //! 短效 OAuth access_token（exp≈1h）可经 GET /api/v1/oauth/profile 的
 //! `data.bigmodel.access_token` 动态换新 —— 这是官方客户端的取票通道。
+//! 
+//! 新增：zcode_client_simulator - 完整模拟官方客户端行为（在 mod.rs 中声明）
 
 use serde_json::{json, Value};
 
@@ -69,6 +71,7 @@ impl Adapter for ZcodeAdapter {
         let v = billing_request(c, &format!("/api/v1/zcode-plan/billing/preview?app_version={ver}&platform=win32-x64"), Method::GET, None).await?;
         let d = business(v)?;
         let plans: Vec<Value> = d.get("plans").and_then(|p| p.as_array()).cloned().unwrap_or_default();
+        
         // captcha 门（仅提示用）：enabled 且 skip_model_request!==true 时 claim 需要验证码
         let cfg = business(request(c, &format!("/api/v1/client/configs?app_version={ver}&platform=win32-x64"), Method::GET, None).await?).unwrap_or(Value::Null);
         let captcha_block = cfg.pointer("/configs/captcha/enabled").and_then(|b| b.as_bool()).unwrap_or(false)

@@ -25,6 +25,8 @@ pub mod codearts_local;
 pub mod zcode;
 /// ZCode 本机客户端凭据读取。
 pub mod zcode_local;
+/// ZCode 客户端模拟器（完整模拟官方客户端行为）。
+pub mod zcode_client_simulator;
 
 use async_trait::async_trait;
 use serde_json::Value;

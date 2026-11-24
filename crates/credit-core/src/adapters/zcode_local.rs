@@ -243,6 +243,7 @@ pub fn zcode_v2_dir() -> Option<std::path::PathBuf> {
 }
 
 /// 本机 ZCode 登录态（含 plan/billing 专用 zcodejwttoken）
+#[derive(Debug, Clone)]
 pub struct ZcodeLiveAuth {
     pub uid: String,
     pub name: Option<String>,
@@ -402,7 +403,7 @@ pub fn wait_for_token_change(old_fp: Option<&str>, timeout: std::time::Duration)
 ///
 /// 硬编码版本号是**致命**的：客户端升级后服务端会以 `app_version too old`
 /// 拒绝 preview/claim/balance 与模型请求，表现为「整个 ZCode 都用不了」。
-/// 探测顺序：环境变量 → 安装目录里的 package.json → 目录名中的版本号 → 兜底。
+/// 探测顺序：环境变量 → exe 文件版本信息 → 安装目录里的 package.json → 目录名中的版本号 → 兜底。
 pub fn client_version() -> String {
     static CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     CACHE.get_or_init(|| {
@@ -410,16 +411,27 @@ pub fn client_version() -> String {
             let v = v.trim().to_string();
             if !v.is_empty() { return v; }
         }
+        
         let Some(exe) = find_client_exe() else { return "3.18.2".into() };
+        
+        // 优先从 exe 文件版本信息读取（适用于 4.0.0+）
+        if let Some(version) = read_exe_version(&exe) {
+            eprintln!("[ZCode] Detected version from exe: {}", version);
+            return version;
+        }
+        
         let root = exe.parent().map(|p| p.to_path_buf());
         if let Some(root) = root {
-            // Electron 打包：resources/app/package.json 或 resources/app/package.json
-            for rel in ["resources/app/package.json", "resources/app/package.json", "package.json"] {
+            // Electron 打包：resources/app/package.json
+            for rel in ["resources/app/package.json", "package.json"] {
                 let p = root.join(rel);
                 if let Ok(s) = std::fs::read_to_string(&p) {
                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
                         if let Some(ver) = v.get("version").and_then(|x| x.as_str()) {
-                            if ver.split('.').count() >= 2 { return ver.to_string(); }
+                            if ver.split('.').count() >= 2 { 
+                                eprintln!("[ZCode] Detected version from package.json: {}", ver);
+                                return ver.to_string(); 
+                            }
                         }
                     }
                 }
@@ -427,10 +439,48 @@ pub fn client_version() -> String {
             // 便携版常见布局：<root>/<版本号>/ZCode.exe
             if let Some(name) = root.file_name().and_then(|n| n.to_str()) {
                 if name.split('.').count() >= 3 && name.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+                    eprintln!("[ZCode] Detected version from directory name: {}", name);
                     return name.to_string();
                 }
             }
         }
-        "3.18.2".into()
+        "4.0.0".into()
     }).clone()
+}
+
+/// 从 exe 文件读取版本信息（Windows 专用）
+#[cfg(windows)]
+fn read_exe_version(exe: &std::path::Path) -> Option<String> {
+    // 简化实现：直接从目录名或文件名中提取版本号
+    // ZCode 4.0.0 的目录结构通常是 D:\ProgramFiles\develop\ZCode\ZCode.exe
+    // 或者便携版可能是 D:\ProgramFiles\develop\ZCode-4.0.0\ZCode.exe
+    
+    let filename = exe.file_name()?.to_str()?;
+    
+    // 如果文件名包含版本号模式 (X.Y.Z...)
+    if filename.starts_with("ZCode") && filename.contains('.') {
+        let parts: Vec<&str> = filename.split('.').collect();
+        if parts.len() >= 3 && parts[1].chars().all(|c| c.is_ascii_digit()) {
+            return Some(format!("{}.{}", parts[1], parts[2]));
+        }
+    }
+    
+    // 尝试从父目录名提取
+    if let Some(parent) = exe.parent()?.file_name()?.to_str() {
+        if parent.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+            let parts: Vec<&str> = parent.split('.').collect();
+            if parts.len() >= 3 {
+                return Some(format!("{}.{}", parts[0], parts[1]));
+            }
+        }
+    }
+    
+    None
+}
+
+/// 从 exe 文件读取版本信息（非 Windows 备用实现）
+#[cfg(not(windows))]
+fn read_exe_version(_exe: &std::path::Path) -> Option<String> {
+    // 非 Windows 平台暂不支持，返回 None
+    None
 }

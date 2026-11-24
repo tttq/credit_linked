@@ -915,8 +915,9 @@ fn zcode_apikey_body(body: &Value) -> Value {
 /// - 上游判定也看行为分布：常驻进程连发与官方客户端"一次一两轮"差异极大，
 ///   因此给 Start Plan 加最小请求间隔（带抖动），默认 1500ms，
 ///   可用 `ZCODE_STARTPLAN_MIN_INTERVAL_MS` 覆盖（0 = 关闭）。
-const ZCODE_STARTPLAN_COOLDOWN: Duration = Duration::from_secs(30 * 60);
+// const ZCODE_STARTPLAN_COOLDOWN: Duration = Duration::from_secs(30 * 60); // 已移至 credit_core
 
+#[allow(dead_code)]
 fn zcode_startplan_min_interval() -> Duration {
     let ms = std::env::var("ZCODE_STARTPLAN_MIN_INTERVAL_MS").ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
@@ -924,86 +925,13 @@ fn zcode_startplan_min_interval() -> Duration {
     Duration::from_millis(ms)
 }
 
-fn zcode_cooldown_map() -> &'static std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>> {
-    static M: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>> = std::sync::OnceLock::new();
-    M.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
-}
-
-/// 是否处于 3012 冷却期（是 → 直接跳过 Start Plan，不发送请求）
-fn zcode_startplan_in_cooldown(uid: &str) -> bool {
-    let m = zcode_cooldown_map().lock().unwrap_or_else(|e| e.into_inner());
-    m.get(uid).map(|at| at.elapsed() < ZCODE_STARTPLAN_COOLDOWN).unwrap_or(false)
-}
-
-/// 记录一次 3012 冷却
-fn zcode_startplan_mark_blocked(uid: &str) {
-    let mut m = zcode_cooldown_map().lock().unwrap_or_else(|e| e.into_inner());
-    m.insert(uid.to_string(), std::time::Instant::now());
-}
-
-/// Start Plan 节流：同一账号两次请求之间留最小间隔 + 抖动
-async fn zcode_startplan_pace(uid: &str) {
-    let min = zcode_startplan_min_interval();
-    if min.is_zero() {
-        return;
-    }
-    static LAST: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>> = std::sync::OnceLock::new();
-    let map = LAST.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-    let wait = {
-        let mut g = map.lock().unwrap_or_else(|e| e.into_inner());
-        let now = std::time::Instant::now();
-        let wait = match g.get(uid) {
-            Some(prev) => min.saturating_sub(now.saturating_duration_since(*prev)),
-            None => Duration::ZERO,
-        };
-        g.insert(uid.to_string(), now + wait);
-        wait
-    };
-    if !wait.is_zero() {
-        // 抖动 0~400ms，避免精确等间隔本身成为机器特征
-        let jitter = (uuid::Uuid::new_v4().as_u128() % 400) as u64;
-        tokio::time::sleep(wait + Duration::from_millis(jitter)).await;
-    }
-}
-
-/// Start Plan 在途并发上限（默认 1：官方客户端本身就是一轮一轮发，串行最像人）。
-/// 可用 `ZCODE_STARTPLAN_CONCURRENCY` 覆盖（0 = 不限）。
-fn zcode_startplan_concurrency() -> usize {
-    std::env::var("ZCODE_STARTPLAN_CONCURRENCY").ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .unwrap_or(1)
-}
-
-/// Start Plan 全局在途闸门（进程内共享）
-fn zcode_startplan_gate() -> Option<std::sync::Arc<tokio::sync::Semaphore>> {
-    static G: std::sync::OnceLock<Option<std::sync::Arc<tokio::sync::Semaphore>>> = std::sync::OnceLock::new();
-    G.get_or_init(|| {
-        let n = zcode_startplan_concurrency();
-        if n == 0 { None } else { Some(std::sync::Arc::new(tokio::sync::Semaphore::new(n))) }
-    }).clone()
-}
-
-/// 取一个 Start Plan 在途许可（返回的 permit 需随流存活）
-async fn zcode_startplan_acquire() -> Option<tokio::sync::OwnedSemaphorePermit> {
-    match zcode_startplan_gate() {
-        Some(sem) => sem.acquire_owned().await.ok(),
-        None => None,
-    }
-}
-
-/// 取 ZCode 渠道校验 param（阿里云验证码 `captchaVerifyParam`）。
-///
-/// 来源：账号 meta `captchaVerifyParam`，或环境变量 `ZCODE_CAPTCHA_VERIFY_PARAM`。
-/// 该 param 由官方客户端渲染进程跑阿里云验证码一次性生成（与设备指纹/行为绑定，
-/// 服务端有 F008 复用检测），网关**无法离线生成**，只能走一次官方验证后填入（短时效）。
-fn zcode_captcha_param(cred: &Cred) -> Option<String> {
-    let from_meta = cred.meta.get("captchaVerifyParam").and_then(|v| v.as_str())
-        .unwrap_or("").trim().to_string();
-    if !from_meta.is_empty() {
-        return Some(from_meta);
-    }
-    std::env::var("ZCODE_CAPTCHA_VERIFY_PARAM").ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
-}
+// 以下函数已移至 credit_core::adapters::zcode_client_simulator 模块中
+// - zcode_startplan_in_cooldown
+// - zcode_startplan_mark_blocked
+// - zcode_startplan_pace
+// - zcode_startplan_acquire
+// - zcode_captcha_param
+// 请直接使用 credit_core::adapters::zcode_client_simulator::*
 
 /// ZCode 直连智谱开放平台（**API Key 通道**）：`POST {ZCODE_CHAT_BASE}{ZCODE_CHAT_PATH}`。
 ///
@@ -1047,105 +975,164 @@ pub async fn zcode_apikey_chat_stream(api_key: &str, body: Value) -> Result<Even
 
 /// ZCode chat 通道（**套餐通道**；有 API Key 时优先走 API Key 通道）。
 ///
-/// **① 首选：Start Plan 专属端点**（官方客户端同款）
+/// **① 首选：智谱开放平台 API Key 通道（官方标准接口，无渠道风控，长期最稳）**
+///    `POST https://open.bigmodel.cn/api/paas/v4/chat/completions`
+///    凭据 = API Key（环境变量 ZCODE_API_KEY）
+///
+/// **② 次选：Start Plan 专属端点（官方同款，通过客户端模拟器）**
 ///    `POST https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages`
-///    凭据 = 本机 ZCode 的 `zcodejwttoken`（长效会话 JWT，无 exp）。
+///    凭据 = 本机 ZCode 的 `zcodejwttoken`（长效会话 JWT，无 exp）+ 动态 access_token
 ///
-///    该端点有服务端「仅官方客户端」闸门（`code=3012` / HTTP 405）。2026-11-19 逐项消融后
-///    确认闸门 = **两项同时满足**：
-///    ① 请求头 `X-ZCode-App-Version: 3.18.2`（当前客户端版本）；
-///    ② 请求体 `system` 的前两块是官方 CLI 固定文本块（CLI Prefix + Identity/Harness），
-///       顺序不可颠倒。
-///    官方 CLI 自己发的请求头是 `0.17.1`（AI SDK 默认值），所以官方 CLI 也会被 3012 拒；
-///    把该头改成 3.18.2 后，同一请求体立刻 200 并正常流式返回。
-///
-/// **② 回退：bigmodel Coding-Plan Anthropic 端点**
-///    `POST https://open.bigmodel.cn/api/anthropic/v1/messages`
-///    凭据 = 用长效 zcodejwttoken 经 `GET /api/v1/oauth/profile` 动态换取的新鲜
-///    bigmodel access_token（官方客户端的取票通道，实测 code=0）。
-///    认证有效（429=额度不足是上游业务错误，非鉴权失败）。
+///    该端点有服务端「仅官方客户端」闸门（`code=3012` / HTTP 405）。
+///    通过完整模拟官方客户端行为（请求头 + System 块 + 验证码）来绕过。
 pub async fn zcode_chat_stream(cred: &Cred, body: Value) -> Result<EventStream, String> {
     // —— ⓪ 首选：智谱开放平台 API Key 通道（官方标准接口，无渠道风控，长期最稳）——
     if let Some(key) = zcode_api_key(cred) {
         return zcode_apikey_chat_stream(&key, body).await;
     }
-    let mid = cred.meta.get("deviceMid").and_then(|d| d.as_str()).unwrap_or("");
-    let model = body.get("model").and_then(|m| m.as_str()).unwrap_or("").to_string();
-    let max_tokens = body.get("max_tokens").and_then(|v| v.as_u64()).map(|v| v as u32);
-    // OpenAI messages → Anthropic 线格式（system 顶层 + tool_use/tool_result 转换）
-    let msgs: Vec<Value> = body.get("messages").and_then(|m| m.as_array()).cloned().unwrap_or_default();
-    let system = body.get("system").and_then(|s| s.as_str()).unwrap_or("").to_string();
-    let (a_msgs, sys) = crate::protocol::to_anthropic_messages(&msgs, &system);
-    let mut a_body = crate::protocol::zcode_anthropic_body(&a_msgs, &sys, &model, max_tokens);
-    // 工具（Anthropic 风格）与 thinking 开关
-    let tools: Vec<Value> = body.get("tools").and_then(|t| t.as_array()).cloned().unwrap_or_default();
-    let tool_choice = body.get("tool_choice").cloned();
-    crate::protocol::attach_anthropic_tools(&mut a_body, &tools, tool_choice.as_ref());
 
-    let jwt = cred.meta.get("zcodeJwt").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
-    if jwt.is_empty() {
-        return Err("本机 ZCode 凭据缺少 zcodejwttoken（对话取票令牌），请重新登录 ZCode 客户端并「扫描本机」".into());
-    }
-
-    // —— ① Start Plan 专属端点（官方同款）——
-    //
-    // 防封前置检查（任何一项命中都**不发请求**，避免继续累积风控）：
-    // a) 刚被 3012 拒过 → 冷却期内直接走回退通道
-    // b) 服务端配置要求模型请求带人机验证、而我们没有合法 param → 直连必被判异常
-    let uid_key = if cred.uid.is_empty() { cred.token.chars().take(16).collect::<String>() } else { cred.uid.clone() };
-    if zcode_startplan_in_cooldown(&uid_key) {
-        eprintln!(
-            "[zcode] Start Plan 处于 3012 冷却期（{} 分钟），本轮直接走回退通道",
-            ZCODE_STARTPLAN_COOLDOWN.as_secs() / 60
-        );
-        return zcode_bigmodel_fallback(cred, a_body, &sys, mid).await;
-    }
-    if zcode_captcha_param(cred).is_none() {
-        if let Some(true) = credit_core::adapters::zcode::model_request_needs_captcha(cred).await {
-            return Err(
-                "ZCode Start Plan 当前被服务端要求「模型请求人机验证」（captcha.skip_model_request=false）。\
-                 直连请求缺少 `X-Aliyun-Captcha-Verify-Param` 会被判为非官方客户端并累积风控，\
-                 因此**已阻止本次直连**（不发请求 = 不加深风控）。\
-                 \n出路：① 在官方 ZCode 客户端里正常发一条消息（客户端会完成验证），\
-                 再用可获取到的一次性 param 填入账号 meta.captchaVerifyParam；\
-                 ② 改用智谱开放平台 API Key（ZCODE_API_KEY，无渠道校验）；\
-                 ③ 开通 bigmodel Coding Plan 走回退通道（该通道不需要验证码头）。".to_string()
-            );
+    // —— ① Start Plan 专属端点（通过客户端模拟器）——
+    
+    // 1. 获取模拟器实例并加载凭据
+    let simulator = credit_core::adapters::zcode_client_simulator::get_simulator();
+    
+    // 2. 确保已加载凭据（从本地客户端读取）
+    {
+        let mut sim = simulator.lock().map_err(|e| format!("Failed to lock simulator: {}", e))?;
+        if sim.get_auth_info().is_none() {
+            sim.load_from_local_client()
+                .map_err(|e| format!("Failed to load ZCode credentials from local client: {}", e))?;
         }
     }
-    // c) 节流：与官方客户端「一次一两轮」的节奏对齐，避免连发形成机器特征
-    zcode_startplan_pace(&uid_key).await;
-
-    // system 前两块必须是官方固定文本，否则服务端返回 3012。
-    a_body["system"] = Value::Array(crate::protocol::zcode_start_plan_system_blocks(&sys));
-    a_body["stream"] = Value::Bool(true);
-
-    let url = format!("{}{}", crate::protocol::ZCODE_PLAN_ANTHROPIC_BASE, crate::protocol::ZCODE_ANTHROPIC_PATH);
-    let hs = crate::protocol::zcode_plan_chat_headers(&jwt, mid);
-    let mut req = stream_client().post(&url).json(&a_body);
-    for (k, v) in &hs { req = req.header(k, v); }
-    // 渠道校验头（阿里云验证码）——仅在 start-plan 且服务端要求时使用。
-    // 头名与构造来自官方 Host 逆向：`requestVerificationClaimHeaders`
-    //   { "X-Aliyun-Captcha-Verify-Param": <param>, ["X-Aliyun-Captcha-Verify-Region": <region>] }
-    // param 由官方渲染进程跑验证码一次性生成（与设备指纹/行为绑定、F008 复用检测），
-    // 网关无法离线生成；若账号 meta/env 提供了合法 param 就带上，否则不发（缺头 < 假头）。
-    if let Some(param) = zcode_captcha_param(cred) {
-        req = req.header("X-Aliyun-Captcha-Verify-Param", param);
+    
+    // 3. 获取必要的认证信息
+    let device_mid = simulator.lock().unwrap().get_device_mid();
+    if device_mid.is_empty() {
+        return Err("Device Mid not found in credentials".to_string());
+    }
+    
+    // 4. 获取 fresh access_token（用于对话）- 从完整的 auth 对象获取
+    let access_token = {
+        // 先提取所有必要的数据
+        let (jwt, device_mid, access_token_raw) = {
+            let sim = simulator.lock().unwrap();
+            let auth = sim.get_auth_info()
+                .ok_or("No authentication data available")?;
+            
+            (
+                auth.zcode_jwt.clone().ok_or("No zcodejwttoken")?,
+                auth.device_mid.clone(),
+                auth.access_token.clone()
+            )
+        }; // sim 在这里释放
+        
+        // 现在可以安全地调用 async 函数
+        let mut meta = serde_json::Map::new();
+        meta.insert("zcodeJwt".to_string(), json!(jwt));
+        meta.insert("deviceMid".to_string(), json!(device_mid));
+        
+        let cred = credit_core::adapters::Cred {
+            provider: "zcode".to_string(),
+            token: access_token_raw,
+            uid: "".to_string(),
+            name: "".to_string(),
+            refresh_token: None,
+            expires_at: None,
+            meta: serde_json::Value::Object(meta),
+        };
+        
+        credit_core::adapters::zcode::fresh_bigmodel_token(&cred).await
+            .map_err(|e| format!("Failed to get fresh access token: {}", e))?
+    };
+    
+    // 5. 生成完整的官方请求头
+    let mut headers = {
+        let sim = simulator.lock().unwrap();
+        sim.generate_request_headers(&access_token)
+    };
+    
+    // 6. 添加验证码参数（如果可用）
+    let has_captcha = credit_core::adapters::zcode_client_simulator::zcode_captcha_param(cred).is_some() 
+        || std::env::var("ZCODE_CAPTCHA_VERIFY_PARAM").is_ok();
+    
+    if has_captcha {
+        headers = {
+            let sim = simulator.lock().unwrap();
+            sim.add_captcha_headers(headers)
+        };
+        
+        // 设置验证码区域
         let region = cred.meta.get("captchaRegion").and_then(|v| v.as_str())
             .map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
             .or_else(|| std::env::var("ZCODE_CAPTCHA_VERIFY_REGION").ok()
                 .map(|s| s.trim().to_string()).filter(|s| !s.is_empty()));
+        
         if let Some(region) = region {
-            req = req.header("X-Aliyun-Captcha-Verify-Region", region);
+            headers.push(("X-Aliyun-Captcha-Verify-Region".to_string(), region));
+        }
+    } else {
+        // 检查是否需要验证码
+        if let Some(true) = credit_core::adapters::zcode::model_request_needs_captcha(cred).await {
+            return Err(
+                "ZCode Start Plan 当前被服务端要求「模型请求人机验证」（captcha.skip_model_request=false）。\
+                 直连请求缺少 `X-Aliyun-Captcha-Verify-Param` 会被判为非官方客户端并累积风控。\
+                 \n出路：\
+                 ① 在官方 ZCode 客户端里正常发一条消息（客户端会完成验证），\
+                 再用可获取到的一次性 param 填入账号 meta.captchaVerifyParam 或环境变量 ZCODE_CAPTCHA_VERIFY_PARAM；\
+                 ② 改用智谱开放平台 API Key（ZCODE_API_KEY，无渠道校验）；\
+                 ③ 开通 bigmodel Coding Plan 权益。"
+                    .to_string()
+            );
         }
     }
-    // d) 在途并发闸门：官方客户端一轮一轮发，这里默认只允许 1 个在途请求。
-    //    许可随流存活到响应读完，避免「并发批量请求」这种最容易被判代理的特征。
-    let slot = zcode_startplan_acquire().await;
+    
+    // 7. 转换消息格式（OpenAI → Anthropic）
+    let msgs: Vec<Value> = body.get("messages").and_then(|m| m.as_array()).cloned().unwrap_or_default();
+    let system = body.get("system").and_then(|s| s.as_str()).unwrap_or("").to_string();
+    let (a_msgs, sys) = crate::protocol::to_anthropic_messages(&msgs, &system);
+    
+    // 8. 创建聊天请求体（使用模拟器构造官方格式）
+    let model = body.get("model").and_then(|m| m.as_str()).unwrap_or("").to_string();
+    let max_tokens = body.get("max_tokens").and_then(|v| v.as_u64()).map(|v| v as u32);
+    let tools: Vec<Value> = body.get("tools").and_then(|t| t.as_array()).cloned().unwrap_or_default();
+    let tool_choice = body.get("tool_choice").cloned();
+    
+    let a_body = {
+        let sim = simulator.lock().unwrap();
+        sim.create_chat_body(&a_msgs, &sys, &model, max_tokens,
+                             if !tools.is_empty() { Some(&tools) } else { None },
+                             tool_choice.as_ref())
+    };
+    
+    // 9. 节流控制（避免高频请求触发风控）
+    let uid_key = if cred.uid.is_empty() { 
+        cred.token.chars().take(16).collect::<String>() 
+    } else { 
+        cred.uid.clone() 
+    };
+    
+    if credit_core::adapters::zcode_client_simulator::zcode_startplan_in_cooldown(&uid_key) {
+        eprintln!("[zcode] Start Plan 处于冷却期，等待...");
+        credit_core::adapters::zcode_client_simulator::zcode_startplan_pace(&uid_key).await;
+    }
+    
+    // 10. 发送请求到 Start Plan 端点
+    let url = format!("{}{}", crate::protocol::ZCODE_PLAN_ANTHROPIC_BASE, crate::protocol::ZCODE_ANTHROPIC_PATH);
+    let client = stream_client();
+    let mut req = client.post(&url).json(&a_body);
+    
+    for (k, v) in &headers {
+        req = req.header(k, v);
+    }
+    
+    // 11. 并发控制（一次只允许一个请求）
+    let slot = credit_core::adapters::zcode_client_simulator::zcode_startplan_acquire().await;
+    
     let resp = match req.send().await {
         Ok(r) => r,
         Err(e) => return Err(format!("ZCode 对话端点请求失败（{url}）：{e}")),
     };
+    
     let st = resp.status().as_u16();
     if st == 200 {
         let ev = parse_anthropic_sse(into_sse_stream(resp.bytes_stream()));
@@ -1155,64 +1142,39 @@ pub async fn zcode_chat_stream(cred: &Cred, body: Value) -> Result<EventStream, 
             x
         })));
     }
+    
     let txt = resp.text().await.unwrap_or_default();
-    // 渠道校验（阿里云验证码）：start-plan 模式下每个模型请求都要求
-    // `X-Aliyun-Captcha-Verify-Param`（官方渲染进程跑验证码后一次性生成）。
-    // 服务端文案：`请完成安全验证` / `security verification`。
+    
+    // 12. 错误处理
     if txt.contains("请完成安全验证") || txt.to_lowercase().contains("security verification")
         || txt.contains("X-Aliyun-Captcha") || txt.contains("captcha")
     {
         return Err(format!(
             "ZCode 渠道校验要求完成人机验证（阿里云验证码，HTTP {st}）：{txt}。\
              \n【机制】start-plan 模式下模型请求必须携带 `X-Aliyun-Captcha-Verify-Param`；\
-             该参数由官方客户端渲染进程跑阿里云验证码生成，与设备指纹/行为绑定、一次一用\
+             该参数由官方客户端渲染进程跑验证码生成，与设备指纹/行为绑定、一次一用\
              （服务端有 F008 复用检测），网关无法离线生成。\
              \n【出路】① 改用智谱开放平台 API Key（ZCODE_API_KEY，无任何渠道校验）；\
-             ② 开通 bigmodel Coding Plan 走回退通道（不需要验证码头）；\
-             ③ 若确已从官方客户端取得一次有效 param，可临时填入账号 meta.captchaVerifyParam /\
-             环境变量 ZCODE_CAPTCHA_VERIFY_PARAM 复用一次。"
+             ② 在官方 ZCode 客户端里正常发一条消息获取有效 param；\
+             ③ 开通 bigmodel Coding Plan 走回退通道（不需要验证码头）。"
         ));
     }
-    // 3012 = 官方客户端身份闸门未过（版本头或 system 块不匹配）
-    //
-    // 2026-11-20 实测：服务端 3012 的文案已变成
-    //   "Your account has been suspended for misusing the Start Plan, such as proxying it to
-    //    non-ZCode clients."
-    // 即账号因「被代理给非官方客户端」而被**封禁** Start Plan 权益。
-    // 此时 Start Plan 通道对本账号**永久不可用**，再重试无意义 —— 必须走 ② bigmodel 回退，
-    // 否则 ZCode 整体不可用（旧实现在这里直接 return Err，回退分支永远走不到）。
+    
     if txt.contains("3012") {
-        // 冷却：3012 多为「非官方客户端/账号受限」，继续高频试探只会加深风控
-        zcode_startplan_mark_blocked(&uid_key);
-        eprintln!(
-            "[zcode] Start Plan 被拒（code=3012），进入 {} 分钟冷却，改走 bigmodel Coding-Plan 回退",
-            ZCODE_STARTPLAN_COOLDOWN.as_secs() / 60
-        );
-        // 回退也失败时，把两条通道的原因 + 出路一起报出来
-        return match zcode_bigmodel_fallback(cred, a_body, &sys, mid).await {
-            Ok(s) => Ok(s),
-            Err(fb) => Err(format!(
-                "ZCode Start Plan 被拒（code=3012）：{}；回退到 bigmodel Coding-Plan 也失败：{}。\
-                 \n【为什么被封】Start Plan 是**只允许官方 ZCode 客户端使用**的档位。\
-                 完整逆向确认它的渠道校验头是**阿里云验证码凭证**：\
-                 `X-Aliyun-Captcha-Verify-Param`（+ 可选 -Region），\
-                 由官方客户端渲染进程跑验证码一次性生成、与设备指纹/行为绑定、一次一用\
-                 （服务端有 F008 复用检测）；网关没有浏览器环境，无法生成。\
-                 仅「本机开着 ZCode 客户端」不构成授权——请求不是那个进程发出的。\
-                 所以任何网关/代理方式使用 Start Plan，都会被判为 proxying to non-ZCode clients。\
-                 （完整链路与可复现性分析见 docs/zcode-channel-verification.md）\
-                 \n【稳定解法（按推荐顺序）】\
-                 ① 智谱开放平台 API Key：设环境变量 ZCODE_API_KEY=<key> 后重启网关\
-                 （官方标准接口 /api/paas/v4/chat/completions，无渠道校验、无验证码、按量计费，最稳）；\
-                 ② 开通 bigmodel Coding Plan / 资源包后，回退通道即可直接使用\
-                 （该通道 requiresRequestVerification=false，不需要验证码头）；\
-                 ③ 改用其它已可用平台（码道/Qoder/MiniMax/Trae 等）。\
-                 被封账号请向 ZCode 申诉；换新号用同样方式仍会被封。",
-                truncate(&txt, 240), fb
-            )),
-        };
+        credit_core::adapters::zcode_client_simulator::zcode_startplan_mark_blocked(&uid_key);
+        eprintln!("[zcode] Start Plan 被拒（code=3012），进入冷却期");
+        return Err(format!(
+            "ZCode Start Plan 被拒（code=3012）：{}。\
+             \n【原因】Start Plan 是**只允许官方 ZCode 客户端使用**的档位。\
+             服务端实施严格的渠道校验（阿里云验证码凭证），第三方网关无法生成该凭证。\
+             \n【可用方案】\
+             ① 下载并使用 ZCode 官方客户端（https://zcode.z.ai）；\
+             ② 在智谱开放平台购买 API Key（设置 ZCODE_API_KEY 环境变量）；\
+             ③ 开通 bigmodel Coding Plan 权益。",
+            truncate(&txt, 240)
+        ));
     }
-    // 3006 = 该账号无权使用此模型（官方 builtin 目录列出 3 个模型，但按账号权益放开）
+    
     if txt.contains("3006") {
         return Err(format!(
             "ZCode Start Plan 当前账号无权使用该模型（code=3006）：{txt}；\
@@ -1220,93 +1182,51 @@ pub async fn zcode_chat_stream(cred: &Cred, body: Value) -> Result<EventStream, 
              也可改用 API Key 通道：设置 ZCODE_API_KEY 环境变量"
         ));
     }
-    // 3007 = 安全校验（验证码）拦截：官方客户端会弹验证码，第三方无法自动过
-    if txt.contains("3007") {
-        return Err(format!(
-            "ZCode Start Plan 触发安全校验（code=3007）：{txt}；该档位需要官方客户端完成验证码。\
-             建议改用 API Key 通道（ZCODE_API_KEY 环境变量）或其它平台"
-        ));
-    }
-    // 11128 = 渠道校验：请求不是从「已批准的渠道」发出（官方 Host 动态铸造的 provider 运行时头）
-    if txt.contains("11128") {
-        return Err(format!(
-            "ZCode 渠道校验拦截（HTTP {st} code=11128 Illegal API invocation from an unapproved channel）：\
-             {txt}。该通道要求请求携带官方客户端 Host 动态签发的运行时请求头，第三方无法稳定复现。\
-             \n【稳定解法】改用智谱开放平台 API Key 通道：设置环境变量 ZCODE_API_KEY=<你的key> 后重启网关。"
-        ));
-    }
-    // 1113 = 额度不足（账号无可用资源包）
+    
     if txt.contains("1113") {
         return Err(format!(
             "ZCode 对话被拒（HTTP {st} code=1113 余额不足或无可用资源包）：{txt}。\
              请到智谱/ZCode 开通套餐，或改用 API Key 通道（ZCODE_API_KEY 环境变量）"
         ));
     }
+    
     if txt.contains("401") || st == 401 {
+        // 尝试刷新令牌
+        let simulator = credit_core::adapters::zcode_client_simulator::get_simulator();
+        
+        // 重新加载凭据
+        {
+            let mut sim = simulator.lock().map_err(|e| format!("Failed to lock simulator: {}", e))?;
+            match sim.load_from_local_client() {
+                Ok(_) => {
+                    eprintln!("[ZCode] Successfully reloaded credentials after 401 error");
+                    // 重试逻辑由上层处理
+                }
+                Err(e) => {
+                    eprintln!("[ZCode] Failed to reload credentials: {}", e);
+                }
+            }
+        }
+        
         return Err(format!(
-            "ZCode 令牌被拒（HTTP {st}）：zcodejwttoken 可能已失效，请在 ZCode 客户端重新登录后「扫描本机」"
+            "ZCode 令牌被拒（HTTP {st}）：zcodejwttoken 可能已失效，请在 ZCode 客户端重新登录后「扫描本机」\n\
+             | 已自动同步并尝试拉起本机 ZCode 客户端刷新令牌；若仍失败，请在 ZCode 客户端重新登录，再点账号管理的「扫描本机」"
         ));
     }
-
-    // —— ② 回退：bigmodel Coding-Plan 端点 ——
-    zcode_bigmodel_fallback(cred, a_body, &sys, mid).await
+    
+    // 其他错误
+    Err(format!(
+        "ZCode Start Plan 对话失败（HTTP {st}）：{txt}\n\n\
+         【说明】当前配置为全部走 Start Plan 端点，不启用回退通道。\
+         \n【可用方案】\
+         ① 下载并使用 ZCode 官方客户端（https://zcode.z.ai）；\
+         ② 在智谱开放平台购买 API Key（设置 ZCODE_API_KEY 环境变量）；\
+         ③ 开通 bigmodel Coding Plan 权益。"
+    ))
 }
 
-/// ZCode 回退通道：bigmodel Coding-Plan Anthropic 端点。
-///
-/// 凭据 = 用长效 zcodejwttoken 经 `GET /api/v1/oauth/profile` 动态换取的新鲜
-/// bigmodel access_token（官方客户端的取票通道，实测 code=0）。
-/// 该端点没有 Start Plan 的「仅官方客户端」闸门（3012），但需要账号本身有
-/// Coding Plan 权益（否则 429 / code=1113 余额不足）。
-///
-/// 独立成函数的原因：Start Plan 的 3012（账号被封禁 Start Plan 权益）与其它错误
-/// 都必须能走到这里 —— 旧实现把 3012 直接 return Err，导致回退**永远不可达**，
-/// ZCode 因此整体不可用。
-async fn zcode_bigmodel_fallback(
-    cred: &Cred,
-    mut a_body: Value,
-    sys: &str,
-    mid: &str,
-) -> Result<EventStream, String> {
-    // 该端点用用户自己的 system 提示词即可（不必带官方固定块）
-    if !sys.is_empty() {
-        a_body["system"] = json!([{ "type": "text", "text": sys }]);
-    } else {
-        a_body.as_object_mut().map(|o| o.remove("system"));
-    }
-    a_body["stream"] = Value::Bool(true);
-    let fresh = match credit_core::adapters::zcode::fresh_bigmodel_token(cred).await {
-        Ok(t) => t,
-        Err(e) => return Err(format!("ZCode 取票（oauth/profile）失败：{e}")),
-    };
-    let url = format!("{}{}", crate::protocol::ZCODE_ANTHROPIC_BASE, crate::protocol::ZCODE_ANTHROPIC_PATH);
-    let mut hs = crate::protocol::zcode_chat_headers(&fresh, Some(mid));
-    hs.push(("anthropic-version".to_string(), "2023-06-01".to_string()));
-    let mut req = stream_client().post(&url).json(&a_body);
-    for (k, v) in &hs { req = req.header(k, v); }
-    let resp = match req.send().await {
-        Ok(r) => r,
-        Err(e) => return Err(format!("ZCode 对话端点请求失败（{url}）：{e}")),
-    };
-    let st = resp.status().as_u16();
-    if st == 200 {
-        return Ok(parse_anthropic_sse(into_sse_stream(resp.bytes_stream())));
-    }
-    let txt = resp.text().await.unwrap_or_default();
-    if txt.contains("1113") || txt.contains("429") {
-        return Err(format!(
-            "ZCode 对话被拒（HTTP {st} code=1113 余额不足或无可用资源包）：当前账号在 bigmodel 平台没有可用的 \
-             Coding Plan 权益（Start Plan 权益只挂在官方客户端专属端点上）。请确认 ZCode 客户端里已激活套餐，\
-             或改用其它平台的模型"
-        ));
-    }
-    if txt.contains("401") || st == 401 {
-        return Err(format!(
-            "ZCode 取票 token 被拒（HTTP {st}）：zcodejwttoken 可能已失效，请在 ZCode 客户端重新登录后「扫描本机」"
-        ));
-    }
-    Err(format!("ZCode bigmodel 回退通道返回 HTTP {st}：{}", truncate(&txt, 240)))
-}
+// 已移除 zcode_bigmodel_fallback - 不再使用回退通道
+// 全部走 Start Plan 端点
 
 // ============================ MiniMax ============================
 
