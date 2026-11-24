@@ -1428,7 +1428,7 @@ async fn dispatch_once(
             let mut last: Result<EventStream, (String, String)> =
                 Err(("upstream".to_string(), "trae: no attempt".to_string()));
             for f in funcs {
-                let mut body = crate::protocol::trae_chat_body(messages, model, &f, max_tokens, reasoning_effort, enterprise);
+                let mut body = crate::protocol::trae_chat_body(messages, system, model, &f, max_tokens, reasoning_effort, enterprise);
                 crate::protocol::attach_trae_tools(&mut body, tools);
                 match upstream::trae_chat_stream(cred, intl, enterprise, body).await {
                     Ok(s) => return Ok(s),
@@ -1466,7 +1466,7 @@ async fn dispatch_once(
             upstream::minimax_chat_stream(cred, body).await.map_err(|e| ("upstream".to_string(), e))
         }
         Platform::Qoder => {
-            let mut body = crate::protocol::qoder_chat_body(messages, model);
+            let mut body = crate::protocol::qoder_chat_body(messages, system, model);
             crate::protocol::attach_openai_tools(&mut body, tools, tool_choice);
             upstream::qoder_chat_stream(cred, body).await.map_err(|e| ("upstream".to_string(), e))
         }

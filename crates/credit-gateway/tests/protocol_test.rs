@@ -29,10 +29,39 @@ fn test_wb_chat_body() {
 #[test]
 fn test_trae_chat_body() {
     let msgs = serde_json::json!([{"role": "user", "content": [{"type": "text", "text": "hi"}]}]);
-    let body = credit_gateway::protocol::trae_chat_body(msgs.as_array().unwrap(), "glm-5.2", "solo_work_lite", None, None, true);
+    let body = credit_gateway::protocol::trae_chat_body(msgs.as_array().unwrap(), "", "glm-5.2", "solo_work_lite", None, None, true);
     assert_eq!(body["config_name"], "glm-5.2");
     assert_eq!(body["function"], "solo_work_lite");
     assert!(body["session_id"].is_string());
+}
+
+/// 回归（2026-11-24）：Trae/Qoder 曾把 system 提示词整体丢弃
+/// —— 导致 Agent 拿不到「项目目录 / 必须用工具」指令，
+/// 模型退化成纯文本作答（不执行工具、目录猜错）。
+/// 两者都必须把 system 还原成 messages 数组的**首条** `role:"system"`。
+#[test]
+fn test_trae_and_qoder_keep_system_prompt_as_first_message() {
+    let msgs = serde_json::json!([{"role": "user", "content": [{"type": "text", "text": "hi"}]}]);
+    let sys = "You are running in E:\\proj. Use tools to inspect the filesystem.";
+
+    // Trae
+    let t = credit_gateway::protocol::trae_chat_body(msgs.as_array().unwrap(), sys, "glm-5.2", "solo_work_lite", None, None, false);
+    assert_eq!(t["messages"][0]["role"], "system");
+    assert_eq!(t["messages"][0]["content"], sys);
+    // system 必须在 user 之前
+    assert_eq!(t["messages"][1]["role"], "user");
+
+    // Qoder
+    let q = credit_gateway::protocol::qoder_chat_body(msgs.as_array().unwrap(), sys, "model-y");
+    assert_eq!(q["messages"][0]["role"], "system");
+    assert_eq!(q["messages"][0]["content"], sys);
+    assert_eq!(q["messages"][1]["role"], "user");
+
+    // 空 system 时不应插入空条目
+    let q0 = credit_gateway::protocol::qoder_chat_body(msgs.as_array().unwrap(), "", "model-y");
+    assert_eq!(q0["messages"][0]["role"], "user");
+    let q0w = credit_gateway::protocol::qoder_chat_body(msgs.as_array().unwrap(), "   ", "model-y");
+    assert_eq!(q0w["messages"][0]["role"], "user");
 }
 
 #[test]
@@ -109,9 +138,10 @@ fn test_all_platforms_relay_body_and_tools() {
     assert_eq!(b["tools"][0]["function"]["name"], "read_file");
 
     // trae / trae-enterprise / trae-intl（tools[].function.parameters 需序列化成字符串）
-    let mut t = credit_gateway::protocol::trae_chat_body(msgs.as_array().unwrap(), "glm-5.2", "solo_work_lite", None, None, true);
+    let mut t = credit_gateway::protocol::trae_chat_body(msgs.as_array().unwrap(), "sys", "glm-5.2", "solo_work_lite", None, None, true);
     credit_gateway::protocol::attach_trae_tools(&mut t, &tools);
     assert!(t["tools"][0]["function"]["parameters"].is_string());
+    assert_eq!(t["messages"][0]["role"], "system");
 
     // zcode（Anthropic 风格工具 + input_schema）
     let mut z = credit_gateway::protocol::zcode_chat_body(msgs.as_array().unwrap(), "sys", "model-x", None, true);
@@ -125,9 +155,10 @@ fn test_all_platforms_relay_body_and_tools() {
     assert_eq!(m["tools"][0]["name"], "read_file");
 
     // qoder（OpenAI 风格）
-    let mut q = credit_gateway::protocol::qoder_chat_body(msgs.as_array().unwrap(), "model-y");
+    let mut q = credit_gateway::protocol::qoder_chat_body(msgs.as_array().unwrap(), "sys", "model-y");
     credit_gateway::protocol::attach_openai_tools(&mut q, &tools, Some(&choice));
     assert_eq!(q["tools"][0]["function"]["name"], "read_file");
+    assert_eq!(q["messages"][0]["role"], "system");
 
     // codearts / codearts-desktop（OpenAI 风格）
     let mut c = credit_gateway::protocol::codearts_chat_body(msgs.as_array().unwrap(), "sys", "model-z", Some(256), Some("medium"));

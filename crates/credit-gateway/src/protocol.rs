@@ -368,10 +368,25 @@ pub fn trae_remote_headers(token: &str, intl: bool) -> Vec<(String, String)> {
 /// Trae chat body（对齐 prepareSoloBody 的 SOLO 形状 + 企业路由补 session_id）。
 /// `function` 必须与模型所属通道一致：模型只在列出它的 function 下可调用
 /// （如 glm-5.3 在 CN 上仅 solo_work_remote 提供），映射来自模型目录。
-pub fn trae_chat_body(messages: &[Value], model: &str, function: &str, max_tokens: Option<u32>, reasoning_effort: Option<&str>, enterprise: bool) -> Value {
+///
+/// ## system 提示词作为 messages 首条下发（2026-11-24 修复）
+///
+/// 旧签名没有 system 参数 → `normalize_messages()` 拆出来的 system 被**整体丢弃**。
+/// 官方 `prepareSoloBody` @5924-5965 是把 `input.messages` **原样透传**的，
+/// 其中 system 提示词就是 messages 数组里 `role:"system"` 的首条
+/// （@5939 还负责把 `developer` 改写成 `system`）。
+/// 因此这里必须把 system 还原成 messages 首条，否则 Agent 的项目目录/
+/// 工具使用指令根本到不了上游。
+pub fn trae_chat_body(messages: &[Value], system: &str, model: &str, function: &str, max_tokens: Option<u32>, reasoning_effort: Option<&str>, enterprise: bool) -> Value {
     let request_id = uuid::Uuid::new_v4().to_string();
+    let mut msgs: Vec<Value> = Vec::new();
+    // system 置首（官方 prepareSoloBody 的 messages 形状）
+    if !system.trim().is_empty() {
+        msgs.push(json!({ "role": "system", "content": system }));
+    }
+    msgs.extend(messages.iter().cloned());
     let mut body = json!({
-        "messages": messages,
+        "messages": msgs,
         "model": model,
         "config_name": model,
         "function": if function.is_empty() { "solo_work_lite" } else { function },
@@ -1169,10 +1184,27 @@ pub fn anthropic_frame_decode(data: &str) -> Vec<crate::upstream::StreamEvent> {
 /// 这里补齐**语义确定且无副作用**的那部分（固定值/派生值）；
 /// 形状未知的 `chat_context`/`parameters`/`patches`/`business`/`custom_context`
 /// 暂不臆造，避免上游校验失败。
-pub fn qoder_chat_body(messages: &[Value], model: &str) -> Value {
+///
+/// ## system 提示词必须作为 messages 里的 `role:"system"` 条目下发（2026-11-24 修复）
+///
+/// 旧签名是 `qoder_chat_body(messages, model)` —— **根本没有 system 参数**，
+/// 于是 `normalize_messages()` 拆出来的 system 提示词被**整体丢弃**。
+/// 后果（DSH 实测）：
+/// - 模型拿不到「你在哪个项目目录 / 必须用工具查文件系统」这类指令；
+/// - 上游 agent runtime 拿不到 agent 指令，退化成「纯聊天」模式，直接输出
+///   「我无法访问您的本地文件系统……请您在终端里执行 dir」这类**不执行工具**的文本；
+/// - 项目目录（cwd）随之丢失，模型猜路径 → 工具作用在错误目录。
+///
+/// 官方 Qoder worker 的 `qFr` 也是把 system 放在 messages 数组头部
+/// （`role:"system"` 首条），不是单独的 `system` 字段。故这里按同样形状注入。
+pub fn qoder_chat_body(messages: &[Value], system: &str, model: &str) -> Value {
     let request_id = uuid::Uuid::new_v4().to_string();
     // messages 转为 OpenAI 线格式（string content 展平）
     let mut msgs: Vec<Value> = Vec::new();
+    // system 置首（官方形状：system 是 messages 数组的第一条）
+    if !system.trim().is_empty() {
+        msgs.push(json!({ "role": "system", "content": system }));
+    }
     for m in messages {
         let mut mm = m.clone();
         if mm.get("content").map(|c| c.is_string()).unwrap_or(false) {

@@ -1,4 +1,4 @@
-//! 逆向探针：把 DSH 侧 `skill` 工具 schema 原样发给 Qoder 上游，
+﻿//! 逆向探针：把 DSH 侧 `skill` 工具 schema 原样发给 Qoder 上游，
 //! dump **未经任何清洗** 的原始 SSE 帧，用来判定「工具参数丢失」发生在哪一层：
 //!   上游没产参数 / 上游产了异形字段 / 网关解析丢了 / 网关 sanitize 归零。
 //!
@@ -52,7 +52,7 @@ async fn main() -> anyhow::Result<()> {
         "content": "可用技能目录里只有 novel-comic-drama 一个技能。请立刻调用 skill 工具加载它（name 参数填技能名），不要输出其它文字。"
     })];
 
-    let mut body = qoder_chat_body(&messages, &model);
+    let mut body = qoder_chat_body(&messages, "", &model);
     attach_openai_tools(&mut body, &tools, Some(&json!("auto")));
     println!("=== 送上游的 body（tools 部分）===");
     println!("{}", serde_json::to_string_pretty(body.get("tools").unwrap_or(&Value::Null))?);

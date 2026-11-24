@@ -1,4 +1,4 @@
-//! 诊断探针：读取本机真实凭据，逐个验证各平台最小请求链路。
+﻿//! 诊断探针：读取本机真实凭据，逐个验证各平台最小请求链路。
 //! 用法：cargo run -p credit-gateway --example probe -- <cmd>
 //!   dump            列出全部账号（打印 cred.meta 键）
 //!   ca-session      解密本机码道会话，打印字段与过期时间
@@ -281,7 +281,7 @@ async fn main() -> anyhow::Result<()> {
         "qoder-raw" => {
             let c = read_cred("qoder").ok_or_else(|| anyhow::anyhow!("no qoder cred"))?;
             let model = std::env::args().nth(2).unwrap_or_else(|| "performance".into());
-            let body = credit_gateway::protocol::qoder_chat_body(&[json!({"role":"user","content":"只回复 ok"})], &model);
+            let body = credit_gateway::protocol::qoder_chat_body(&[json!({"role":"user","content":"只回复 ok"})], "", &model);
             let signed = credit_gateway::upstream::qoder_sign_request(&c, body).await.map_err(|e| anyhow::anyhow!(e))?;
             let url = signed.get("url").and_then(|u| u.as_str()).unwrap_or("").to_string();
             let body_str = signed.get("body").and_then(|b| b.as_str()).unwrap_or("").to_string();
@@ -300,7 +300,7 @@ async fn main() -> anyhow::Result<()> {
         "qoder-chat" => {
             let c = read_cred("qoder").ok_or_else(|| anyhow::anyhow!("no qoder cred"))?;
             let model = std::env::args().nth(2).unwrap_or_else(|| "mmodel".into());
-            let body = credit_gateway::protocol::qoder_chat_body(&[json!({"role":"user","content":"只回复 ok"})], &model);
+            let body = credit_gateway::protocol::qoder_chat_body(&[json!({"role":"user","content":"只回复 ok"})], "", &model);
             match credit_gateway::upstream::qoder_chat_stream(&c, body).await {
                 Ok(events) => {
                     use futures_util::StreamExt;
@@ -324,7 +324,7 @@ async fn main() -> anyhow::Result<()> {
             let c = read_cred("qoder").ok_or_else(|| anyhow::anyhow!("no qoder cred"))?;
             let ids = ["auto", "fast", "efficient", "lite", "performance", "ultimate", "cmodel", "dfmodel", "dmodel", "gfmodel", "gm51model", "gmodel", "kmodel", "kmodel_latest", "mmodel", "q37fmodel", "qfmodel", "qmodel", "qmodel_38max", "qmodel_latest"];
             for model in ids {
-                let body = credit_gateway::protocol::qoder_chat_body(&[json!({"role":"user","content":"只回复 ok"})], model);
+                let body = credit_gateway::protocol::qoder_chat_body(&[json!({"role":"user","content":"只回复 ok"})], "", model);
                 match credit_gateway::upstream::qoder_chat_stream(&c, body).await {
                     Ok(events) => {
                         use futures_util::StreamExt;
