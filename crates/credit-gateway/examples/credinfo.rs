@@ -8,7 +8,7 @@ async fn main() {
     let want: Vec<String> = std::env::args().skip(1).collect();
     let s = Store::open_default().unwrap();
     for (p, u, n, _sec, auth) in s.list_accounts().unwrap() {
-        if !want.is_empty() && !want.iter().any(|w| *w == p) {
+        if !want.is_empty() && !want.contains(&p) {
             continue;
         }
         let Ok(c) = serde_json::from_str::<Cred>(&auth) else { continue };

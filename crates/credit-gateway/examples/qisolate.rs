@@ -1,4 +1,4 @@
-﻿//! 隔离实验：判定 Qoder 上游进入「agent 模式」到底靠哪个字段。
+//! 隔离实验：判定 Qoder 上游进入「agent 模式」到底靠哪个字段。
 //!
 //! 逐组递增字段，观察「工具调用数」与「文本分片数」的变化：
 //!   G0 = 基准（当前实现，无 system/chat_context）
@@ -53,7 +53,7 @@ fn dsh_tools() -> Vec<Value> {
 }
 
 /// 统计一组 body 直打上游后返回的：文本分片 / 思考分片 / 工具调用 / 错误
-async fn probe(label: &str, cred: &Cred, model: &str, body: Value) -> anyhow::Result<()> {
+async fn probe(label: &str, cred: &Cred, _model: &str, body: Value) -> anyhow::Result<()> {
     let signed = credit_gateway::upstream::qoder_sign_request(cred, body.clone())
         .await
         .map_err(|e| anyhow::anyhow!(e))?;
@@ -70,7 +70,7 @@ async fn probe(label: &str, cred: &Cred, model: &str, body: Value) -> anyhow::Re
         }
     let t0 = std::time::Instant::now();
     let resp = req.body(body_str).send().await?;
-    let status = resp.status().as_u16();
+    let _status = resp.status().as_u16();
     let raw = resp.text().await.unwrap_or_default();
 
     let (mut n_text, mut n_reason, mut n_tool, mut n_err) = (0usize, 0usize, 0usize, 0usize);

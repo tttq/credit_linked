@@ -940,7 +940,8 @@ pub const MINIMAX_ANTHROPIC_PATH: &str = "/mavis/api/v1/llm/v1/messages";
 fn wb_session_triplet(uid: &str) -> (String, String, String) {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
-    static CACHE: OnceLock<Mutex<HashMap<String, (String, String, String)>>> = OnceLock::new();
+    type SessionTriplet = (String, String, String);
+    static CACHE: OnceLock<Mutex<HashMap<String, SessionTriplet>>> = OnceLock::new();
     let map = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     let mut g = map.lock().unwrap_or_else(|e| e.into_inner());
     g.entry(uid.to_string())
@@ -1032,6 +1033,7 @@ pub fn minimax_chat_body(messages: &[Value], system: &str, model: &str, max_toke
 /// 官方取值 `initial / iteration / compaction`（managed Token Plan 的 agentic 多轮）：
 /// - 历史里最后一条是 `tool` 结果 → 正在工具循环里继续 → `iteration`
 /// - 否则新一轮用户输入 → `initial`
+///
 /// 旧实现恒为 `initial`，agentic 多轮看起来永远像首轮。
 pub fn minimax_turn_phase(messages: &[Value]) -> &'static str {
     let last_role = messages

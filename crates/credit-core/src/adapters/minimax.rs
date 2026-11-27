@@ -56,11 +56,9 @@ async fn post_form(url: &str, token: Option<&str>, pairs: &[(&str, &str)]) -> Re
     Ok(v)
 }
 
-fn chrono_now_plus(secs: u64) -> String {
-    // RFC3339 UTC now + secs（std-only：用 SystemTime 手算日期）
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() + secs;
-    let days = now / 86400;
-    let rem = now % 86400;
+fn iso_from_unix_secs(secs: u64) -> String {
+    let days = secs / 86400;
+    let rem = secs % 86400;
     let (h, m, s) = (rem / 3600, rem % 3600 / 60, rem % 60);
     // civil_from_days (Howard Hinnant)
     let z = days as i64 + 719468;
@@ -74,6 +72,102 @@ fn chrono_now_plus(secs: u64) -> String {
     let mo = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if mo <= 2 { y + 1 } else { y };
     format!("{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
+}
+
+fn chrono_now_plus(secs: u64) -> String {
+    // RFC3339 UTC now + secs（std-only：用 SystemTime 手算日期）
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() + secs;
+    iso_from_unix_secs(now)
+}
+
+fn value_u64(v: Option<&Value>) -> Option<u64> {
+    match v? {
+        Value::Number(n) => n.as_u64(),
+        Value::String(s) => s.trim().parse().ok(),
+        _ => None,
+    }
+}
+
+/// OAuth token 响应里的绝对过期时间：兼容 expires_at / expiresAt / expire_time。
+fn absolute_expiry_to_iso(v: &Value) -> Option<String> {
+    if let Some(s) = v.as_str() {
+        if crate::adapters::codearts::iso_to_epoch_ms(s).is_some() {
+            return Some(s.to_string());
+        }
+        let raw = s.trim().parse::<u64>().ok()?;
+        let ms = if raw > 4_294_967_295 { raw } else { raw.saturating_mul(1000) };
+        return Some(iso_from_unix_secs(ms / 1000));
+    }
+    let raw = value_u64(Some(v))?;
+    let ms = if raw > 4_294_967_295 { raw } else { raw.saturating_mul(1000) };
+    Some(iso_from_unix_secs(ms / 1000))
+}
+
+/// token 响应的 access token 过期时间。
+///
+/// MiniMax OAuth 正常返回 `expires_in`（秒）；少数客户端/代理会返回绝对时间，
+/// 这里一并兼容，避免续期后仍沿用旧的 `expires_at` 导致每次巡检都再次刷新。
+fn token_response_expires_at(v: &Value) -> Option<String> {
+    if let Some(secs) = value_u64(v.get("expires_in")) {
+        return Some(chrono_now_plus(secs));
+    }
+    for key in ["expires_at", "expiresAt", "expire_time"] {
+        if let Some(exp) = v.get(key).and_then(absolute_expiry_to_iso) {
+            return Some(exp);
+        }
+    }
+    v.get("expiresAtMs")
+        .and_then(|v| value_u64(Some(v)))
+        .map(|ms| iso_from_unix_secs(ms / 1000))
+}
+
+/// 把 OAuth token 响应合并进凭据。
+///
+/// 设备登录与 refresh 共用此函数，确保两条入口都保存：
+/// 新 access token、轮换后的 refresh token、真实过期时间和刷新时间。
+pub fn apply_token_response(mut cred: Cred, tok: &Value) -> Result<Cred, PlatformError> {
+    if !cred.meta.is_object() {
+        cred.meta = json!({});
+    }
+    if let Some(err) = tok.get("error").and_then(|e| e.as_str()) {
+        return Err(PlatformError::Business {
+            code: serde_json::json!(err),
+            message: if err == "invalid_grant" {
+                "MiniMax 授权已失效（refresh_token 已轮换作废），请重新登录 MiniMax Code 账号".into()
+            } else {
+                format!("MiniMax token 交换失败: {err}")
+            },
+        });
+    }
+    let at = tok.get("access_token").and_then(|t| t.as_str())
+        .ok_or_else(|| PlatformError::Auth)?;
+    let superseded_local = cred.meta.get("localFingerprint").cloned();
+    cred.token = at.to_string();
+    if let Some(r) = tok.get("refresh_token").and_then(|t| t.as_str()).filter(|r| !r.trim().is_empty()) {
+        cred.refresh_token = Some(r.to_string());
+    }
+
+    let ttl = value_u64(tok.get("expires_in"));
+    let expires_at = token_response_expires_at(tok).unwrap_or_else(|| {
+        cred.meta.get("tokenTtlSecs").and_then(Value::as_u64)
+            .map(chrono_now_plus)
+            .unwrap_or_else(|| chrono_now_plus(3600))
+    });
+    cred.expires_at = Some(expires_at.clone());
+    if let Some(ttl) = ttl {
+        cred.meta["tokenTtlSecs"] = json!(ttl);
+    }
+    if let Some(ms) = crate::adapters::codearts::iso_to_epoch_ms(&expires_at) {
+        cred.meta["expiresAtMs"] = json!(ms);
+    }
+    cred.meta["lastRefreshAtMs"] = json!(
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default().as_millis() as u64
+    );
+    if let Some(fp) = superseded_local.filter(|v| !v.is_null()) {
+        cred.meta["supersededLocalFingerprint"] = fp;
+    }
+    Ok(cred)
 }
 
 /// 设备码登录起始上下文（device_code + 验证 URI + PKCE verifier）
@@ -224,26 +318,76 @@ impl Adapter for MiniMaxAdapter {
             ("scope", "agent.default"),
             ("audience", "agent-backend"),
         ]).await?;
-        // OAuth 端点 400 也返回 JSON（invalid_grant 等）—— 必须显式检查 error 字段
-        if let Some(err) = v.get("error").and_then(|e| e.as_str()) {
-            return Err(PlatformError::Business {
-                code: serde_json::json!(err),
-                message: if err == "invalid_grant" {
-                    "MiniMax 授权已失效（refresh_token 已轮换作废），请重新登录 MiniMax Code 账号".into()
-                } else {
-                    format!("MiniMax refresh 失败: {err}")
-                },
-            });
+        apply_token_response(c.clone(), &v)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cred() -> Cred {
+        Cred {
+            provider: "minimax".into(),
+            uid: "user-1".into(),
+            name: "MiniMax Code".into(),
+            token: "mmoat_old".into(),
+            refresh_token: Some("mmort_old".into()),
+            expires_at: Some("2026-11-27T00:00:00Z".into()),
+            meta: json!({}),
         }
-        let Some(at) = v.get("access_token").and_then(|t| t.as_str()) else {
-            return Err(PlatformError::Auth);
-        };
-        let mut out = c.clone();
-        out.token = at.to_string();
-        // refresh_token 轮换：新 RT 必须保存，否则旧 RT 立即作废
-        if let Some(r) = v.get("refresh_token").and_then(|t| t.as_str()) { out.refresh_token = Some(r.to_string()); }
-        out.expires_at = v.get("expires_in").and_then(|e| e.as_u64())
-            .map(chrono_now_plus);
-        Ok(out)
+    }
+
+    #[test]
+    fn token_response_rotates_refresh_token_and_expiry() {
+        let before = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let mut c = cred();
+        c.meta["localFingerprint"] = json!("fp-old");
+        let out = apply_token_response(c, &json!({
+            "access_token": "mmoat_new",
+            "refresh_token": "mmort_new",
+            "expires_in": 86400
+        })).unwrap();
+        let after = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let exp = crate::adapters::codearts::iso_to_epoch_ms(out.expires_at.as_deref().unwrap()).unwrap() / 1000;
+        assert_eq!(out.token, "mmoat_new");
+        assert_eq!(out.refresh_token.as_deref(), Some("mmort_new"));
+        assert!(((before + 86399) as i64..=(after + 86400) as i64).contains(&exp));
+        assert_eq!(out.meta["tokenTtlSecs"], 86400);
+        assert!(out.meta["lastRefreshAtMs"].is_u64());
+        assert_eq!(out.meta["supersededLocalFingerprint"], "fp-old");
+    }
+
+    #[test]
+    fn token_response_keeps_refresh_token_when_server_omits_it() {
+        let mut c = cred();
+        c.meta = Value::Null;
+        let out = apply_token_response(c, &json!({
+            "access_token": "mmoat_new",
+            "expires_in": 3600
+        })).unwrap();
+        assert_eq!(out.refresh_token.as_deref(), Some("mmort_old"));
+        assert!(out.meta.is_object());
+    }
+
+    #[test]
+    fn token_response_accepts_absolute_expiry_and_previous_ttl() {
+        let absolute = apply_token_response(cred(), &json!({
+            "access_token": "mmoat_new",
+            "expiresAtMs": 1_900_000_000_000_u64
+        })).unwrap();
+        let exp = crate::adapters::codearts::iso_to_epoch_ms(absolute.expires_at.as_deref().unwrap()).unwrap();
+        assert!((1_900_000_000_000..1_900_000_000_999).contains(&exp));
+
+        let mut c = cred();
+        c.meta["tokenTtlSecs"] = json!(7200);
+        let fallback = apply_token_response(c, &json!({ "access_token": "mmoat_new" })).unwrap();
+        assert!(fallback.expires_at.is_some());
+    }
+
+    #[test]
+    fn token_response_maps_invalid_grant() {
+        let err = apply_token_response(cred(), &json!({ "error": "invalid_grant" })).unwrap_err();
+        assert!(matches!(err, PlatformError::Business { code, .. } if code.as_str() == Some("invalid_grant")));
     }
 }

@@ -6,6 +6,9 @@
 //! 但 SDK 的 bin 目录不在 PATH 中，所以这里先自动定位并临时加入 PATH，再编译资源。
 //! 找不到 rc.exe 时只打印警告，绝不阻断构建。
 
+// `PathBuf` 只被 Windows 专属的 `find_rc()` 使用；非 Windows 构建要显式收进 cfg，
+// 否则 mac/linux 上会报 unused import（CI 打包失败）。
+#[cfg(windows)]
 use std::path::PathBuf;
 
 /// 在 Windows SDK 安装目录里找最新版本的 x64 rc.exe

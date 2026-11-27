@@ -757,7 +757,7 @@ pub fn t(key: &str) -> &'static str {
     let loc = LOCALE.read().map(|g| *g).unwrap_or("zh-CN");
     let dict = table(loc);
     if let Some(v) = dict.get(key) {
-        return *v;
+        return v;
     }
     table("zh-CN").get(key).copied().unwrap_or("")
 }

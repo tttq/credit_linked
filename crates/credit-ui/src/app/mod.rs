@@ -688,7 +688,7 @@ pub(crate) fn platform_name(p: &str) -> String {
 }
 
 pub(crate) fn mix_color(base: u32, ratio: f32) -> Hsla {
-    let c: Hsla = Rgba::from(rgb(base)).into();
+    let c: Hsla = rgb(base).into();
     c.opacity(ratio)
 }
 

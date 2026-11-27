@@ -87,12 +87,14 @@ pub fn resolve_dark(setting: &str) -> bool {
 
 /// 当前色板：
 /// (accent, accent_soft, line, subtle, text, green, amber, red, bg, shell_bg, topbar_a, topbar_b, progress_track)
-pub fn current_palette() -> (u32, u32, u32, u32, u32, u32, u32, u32, u32, u32, u32, u32, u32) {
+pub type Palette = (u32, u32, u32, u32, u32, u32, u32, u32, u32, u32, u32, u32, u32);
+
+pub fn current_palette() -> Palette {
     palette(is_dark())
 }
 
 /// 指定模式的色板（同上元组顺序）
-pub fn palette(dark_mode: bool) -> (u32, u32, u32, u32, u32, u32, u32, u32, u32, u32, u32, u32, u32) {
+pub fn palette(dark_mode: bool) -> Palette {
     if dark_mode {
         (
             dark::ACCENT, dark::ACCENT_SOFT, dark::LINE, dark::SUBTLE, dark::TEXT,

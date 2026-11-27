@@ -727,7 +727,7 @@ where
                         st.attempts, STREAM_RETRY_MAX_ATTEMPTS - 1
                     );
                     // 指数退避 + 抖动，避免多个并发请求同时重试打爆上游
-                    let backoff = 300u64 * (1u64 << (st.attempts.min(3) - 1).max(0));
+                    let backoff = 300u64 * (1u64 << (st.attempts.min(3) - 1));
                     let jitter = (uuid::Uuid::new_v4().as_u128() % 200) as u64;
                     tokio::time::sleep(Duration::from_millis(backoff + jitter)).await;
                     // **先丢弃旧流再重新申请**：旧流可能持有码道会话槽位租约，
@@ -916,7 +916,6 @@ fn zcode_apikey_body(body: &Value) -> Value {
 ///   因此给 Start Plan 加最小请求间隔（带抖动），默认 1500ms，
 ///   可用 `ZCODE_STARTPLAN_MIN_INTERVAL_MS` 覆盖（0 = 关闭）。
 // const ZCODE_STARTPLAN_COOLDOWN: Duration = Duration::from_secs(30 * 60); // 已移至 credit_core
-
 #[allow(dead_code)]
 fn zcode_startplan_min_interval() -> Duration {
     let ms = std::env::var("ZCODE_STARTPLAN_MIN_INTERVAL_MS").ok()
@@ -1686,7 +1685,6 @@ async fn qoder_sign(req: &Value) -> Result<Value, String> {
 /// 因此不能按账号固定 session id（会把所有并发请求绑进同一会话互相掐），
 /// 必须每请求独立：并发请求各占一个会话槽位互不干扰。
 /// 多轮上下文不依赖 session（上游无 sessionId/agentId 概念，多轮靠完整 messages 重发）。
-
 /// 华为码道 chat：POST {snap-access}/api/v2/chat/completions（OpenAI 兼容 SSE）。
 /// 签名头集与 PromptCenter 门面不同：无 agent-type；x-auth-token 与 x-security-token 同值。
 /// desktop/IDE 仅影响通道头（x-ot-client-type / ide-name / plugin-name）。
@@ -1836,10 +1834,7 @@ fn single_error_stream(msg: String, code: &str) -> EventStream {
 /// （reqwest 表现为 "error decoding response body"）。
 fn hold_lease(stream: EventStream, lease: CodeartsSessionLease) -> EventStream {
     Box::pin(futures_util::stream::unfold((stream, Some(lease)), |(mut s, lease)| async move {
-        match s.next().await {
-            Some(item) => Some((item, (s, lease))),
-            None => None,
-        }
+        s.next().await.map(|item| (item, (s, lease)))
     }))
 }
 
@@ -1860,7 +1855,8 @@ struct CodeartsSessionLease {
 /// 槽位数 = 3（对齐上游上限）；账号维度隔离（不同账号各用各的配额）。
 fn codearts_session_pool(uid: &str) -> Arc<Vec<Arc<tokio::sync::Semaphore>>> {
     use std::sync::{Mutex, OnceLock};
-    static MAP: OnceLock<Mutex<std::collections::HashMap<String, Arc<Vec<Arc<tokio::sync::Semaphore>>>>>> = OnceLock::new();
+    type SessionPool = Arc<Vec<Arc<tokio::sync::Semaphore>>>;
+    static MAP: OnceLock<Mutex<std::collections::HashMap<String, SessionPool>>> = OnceLock::new();
     let map = MAP.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
     let mut g = map.lock().unwrap();
     g.entry(uid.to_string())

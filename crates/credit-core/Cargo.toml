@@ -32,5 +32,10 @@ keyring = { version = "3", features = ["linux-native"] }
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { version = "3", features = ["apple-native"] }
 
+# keyring 代码在 #[cfg(not(windows))] 下使用，必须对所有非 Windows 平台可用；
+# 其它平台没有原生后端时回落到 keyring 自带的 mock store。
+[target.'cfg(all(not(windows), not(target_os = "linux"), not(target_os = "macos")))'.dependencies]
+keyring = { version = "3" }
+
 [dev-dependencies]
 hex = "0.4"

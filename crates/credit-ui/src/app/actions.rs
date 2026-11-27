@@ -526,7 +526,7 @@ impl AppView {
                     Ok(data) => {
                         if let Some(err) = data.get("error") {
                             v.gw_test_result = format!("{}{}", tf("test_failed", &[("s", format!("{secs:.1}"))]),
-                                err.get("message").and_then(|m| m.as_str()).unwrap_or("").to_string());
+                                err.get("message").and_then(|m| m.as_str()).unwrap_or(""));
                         } else {
                             let content = data.pointer("/choices/0/message/content")
                                 .and_then(|c| c.as_str()).unwrap_or("").to_string();

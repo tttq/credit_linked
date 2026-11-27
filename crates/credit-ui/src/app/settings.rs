@@ -493,7 +493,7 @@ impl AppView {
                                                 gpui_kit::component::progress::Progress::new(
                                                     SharedString::from(format!("dl-p-{p}")),
                                                 )
-                                                .value(dl_prog.max(0).min(100) as f32 / 100.0),
+                                                .value(dl_prog.clamp(0, 100) as f32 / 100.0),
                                             ),
                                         )
                                     })

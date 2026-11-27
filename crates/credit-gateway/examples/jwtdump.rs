@@ -1,7 +1,7 @@
 ﻿use credit_core::db::Store;
 fn b64(s:&str)->Option<Vec<u8>>{
     let mut t = s.replace('-', "+").replace('_', "/");
-    while t.len() % 4 != 0 { t.push('='); }
+    while !t.len().is_multiple_of(4) { t.push('='); }
     use base64::Engine;
     base64::engine::general_purpose::STANDARD.decode(t).ok()
 }

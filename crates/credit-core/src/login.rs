@@ -419,19 +419,22 @@ pub async fn poll_login(session_id: &str) -> Result<PollOut, PlatformError> {
             let st = crate::adapters::minimax::MiniStart { device_code, verification_uri: String::new(), interval_secs, verifier };
             match crate::adapters::minimax::poll_device_login(&st).await? {
                 crate::adapters::minimax::MiniPoll::Pending { interval_secs: _ } => None,
-                #[allow(unused_variables)]
                 crate::adapters::minimax::MiniPoll::Ready(at_v, tok) => {
                     let at = at_v.as_str().unwrap_or_default().to_string();
-                    let prof = minimax_profile(&at).await?;
-                    Some(Cred {
+                    let mut cred = crate::adapters::minimax::apply_token_response(Cred {
                         provider: "minimax".into(),
-                        uid: prof.0,
-                        name: prof.1,
+                        uid: String::new(),
+                        name: String::new(),
                         token: at,
-                        refresh_token: tok.get("refresh_token").and_then(|r| r.as_str()).map(|s| s.to_string()),
-                        expires_at: Some(iso_from_ms(now_ms() + tok.get("expires_in").and_then(|e| e.as_u64()).unwrap_or(3600) * 1000)),
+                        refresh_token: None,
+                        expires_at: None,
                         meta: json!({}),
-                    })
+                    }, &tok)?;
+                    let prof = minimax_profile(&cred.token).await?;
+                    cred.uid = prof.0;
+                    cred.name = prof.1;
+                    cred.meta["identityResolved"] = json!(true);
+                    Some(cred)
                 }
             }
         }

@@ -24,6 +24,12 @@ pub struct ZcodeClientSimulator {
     last_captcha_time: Option<std::time::Instant>,
 }
 
+impl Default for ZcodeClientSimulator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ZcodeClientSimulator {
     /// 创建新的模拟器实例
     pub fn new() -> Self {
@@ -391,6 +397,12 @@ pub fn zcode_captcha_param(cred: &Cred) -> Option<String> {
 pub struct ZcodeAccountManager {
     accounts: HashMap<String, ZcodeClientSimulator>, // key: uid
     current_uid: Option<String>,
+}
+
+impl Default for ZcodeAccountManager {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ZcodeAccountManager {

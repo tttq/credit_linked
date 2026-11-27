@@ -135,7 +135,7 @@ fn os_key(cred_file: &std::path::Path) -> Option<[u8; 32]> {
         let secret = entry.get_password().ok()?;
         let key = B64URL.decode(secret.as_bytes()).ok()?;
         if key.len() != 32 { return None; }
-        let mut r = [u8; 32]; r.copy_from_slice(&key); Some(r)
+        let mut r = [0u8; 32]; r.copy_from_slice(&key); Some(r)
     }
 }
 

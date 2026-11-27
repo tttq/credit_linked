@@ -98,25 +98,34 @@ impl Service {
         let lock = cred_lock(&key);
         let _guard = lock.lock_owned().await;
 
-        // 拿锁后重读库：若别的路径已经刷新过（token 变了），直接复用，不再消耗 RT
+        // 拿锁后重读库：若别的路径已经刷新过（token 或一次性 RT 变了），直接复用，不再消耗 RT
         if let Some(latest) = self.pick_cred(provider, uid) {
-            if !latest.token.is_empty() && latest.token != cred.token {
+            if !latest.token.is_empty()
+                && (latest.token != cred.token || latest.refresh_token != cred.refresh_token)
+            {
                 return Ok(latest);
             }
         }
 
         let adapter = adapter_for(provider).ok_or_else(|| PlatformError::Local(format!("no adapter for {provider}")))?;
         if provider == "minimax" {
-            if let Some(live) = crate::adapters::minimax_local::read_live_auth() {
+            // 多账号必须按 accountKey/token/RT 精确匹配；旧实现读本机第一条记录，
+            // 会把账号 A 的登录态写进账号 B。
+            if let Some(live) = crate::adapters::minimax_local::find_matching_live_auth(cred) {
                 let mut nc = crate::adapters::minimax_local::to_cred(live);
                 nc.uid = uid.to_string();
                 nc.name = cred.name.clone();
-                // **只有本机 token 与当前不同（客户端真的轮换过）才采用**。
-                // 旧实现无条件返回本机凭据：当本机文件里也是同一个过期 token 时，
-                // 会把真正的 `adapter.refresh()` 短路掉 → minimax 永远停在 auth-expired。
-                if !nc.token.is_empty() && nc.token != cred.token {
+                let nc = self.merge_minimax_local_cred(nc);
+                // 本机文件没变时不能短路 refresh；只有凭据材料确实变化才直接复用。
+                if nc.token != cred.token
+                    || nc.refresh_token != cred.refresh_token
+                    || nc.expires_at != cred.expires_at
+                {
                     if let Ok(auth) = serde_json::to_string(&nc) {
                         let _ = self.store.upsert_account(provider, uid, &nc.name, "", &auth);
+                    }
+                    if let Some(exp) = &nc.expires_at {
+                        let _ = self.store.update_account_expires(provider, uid, Some(exp));
                     }
                     return Ok(nc);
                 }
@@ -148,6 +157,129 @@ impl Service {
         rows.iter()
             .find(|(p, u, _, _, _)| p == provider && u == uid)
             .and_then(|(_, _, _, _, auth)| serde_json::from_str::<Cred>(auth).ok())
+    }
+
+    /// 合并 MiniMax 元数据：以库里已有身份信息为底，只覆盖本机文件提供的区域/账号键。
+    fn merge_minimax_meta(existing: &Cred, incoming: &Cred) -> Value {
+        let mut meta = existing.meta.clone();
+        if !meta.is_object() {
+            meta = json!({});
+        }
+        for key in ["region", "accountKey", "localFingerprint"] {
+            if let Some(v) = incoming.meta.get(key).filter(|v| !v.is_null()) {
+                meta[key] = v.clone();
+            }
+        }
+        meta
+    }
+
+    /// 防止本机旧登录态覆盖服务端刚续期的新凭据。
+    ///
+    /// MiniMax refresh token 是一次性的：服务端 refresh 成功后 RT 立即轮换，
+    /// 随后后台 sync_from_local 若把客户端文件里的旧 AT/RT 写回，下一次 refresh
+    /// 必然 invalid_grant。到期时间较新的凭据更新；时间相同或缺失时保守保留库里凭据。
+    fn merge_minimax_local_cred(&self, incoming: Cred) -> Cred {
+        let Some(existing) = self.pick_cred(&incoming.provider, &incoming.uid) else {
+            return incoming;
+        };
+        if existing.token.is_empty() {
+            return incoming;
+        }
+        let incoming_fp = incoming.meta.get("localFingerprint").and_then(Value::as_str);
+        let existing_fp = existing.meta.get("localFingerprint").and_then(Value::as_str);
+        let superseded_fp = existing.meta.get("supersededLocalFingerprint").and_then(Value::as_str);
+        // 服务端 refresh 成功后，本机文件可能仍是刷新前的旧 AT/RT；该指纹已被标记作废。
+        let stale_after_server_refresh = incoming_fp.is_some() && incoming_fp == superseded_fp;
+        // 本机客户端确实换过凭据时接受新值，即使平台把过期时间固定在同一个日界。
+        let local_changed = incoming_fp.is_some() && existing_fp.is_some() && incoming_fp != existing_fp;
+        let keep_existing = if stale_after_server_refresh {
+            true
+        } else if local_changed {
+            false
+        } else {
+            match (
+                cred_expiry_ms(&existing.provider, &existing),
+                cred_expiry_ms(&incoming.provider, &incoming),
+            ) {
+                (Some(old), Some(new)) => old >= new,
+                (Some(_), None) => true,
+                (None, Some(_)) => false,
+                (None, None) => existing.refresh_token.is_some() || incoming.refresh_token.is_none(),
+            }
+        };
+        let mut out = incoming;
+        if keep_existing {
+            out.uid = existing.uid.clone();
+            out.name = existing.name.clone();
+            out.token = existing.token.clone();
+            out.refresh_token = existing.refresh_token.clone();
+            out.expires_at = existing.expires_at.clone();
+        }
+        out.meta = Self::merge_minimax_meta(&existing, &out);
+        if !keep_existing && local_changed {
+            if let Some(obj) = out.meta.as_object_mut() {
+                obj.remove("supersededLocalFingerprint");
+            }
+        }
+        if let Some(ms) = out.expires_at.as_deref().and_then(crate::adapters::codearts::iso_to_epoch_ms) {
+            out.meta["expiresAtMs"] = json!(ms);
+        }
+        out
+    }
+
+    /// 按稳定 accountKey / token / RT 找到本机记录对应的已存账号。
+    fn find_minimax_cred_for_live(&self, live: &crate::adapters::minimax_local::MiniMaxLiveAuth) -> Option<Cred> {
+        let rows = self.store.list_accounts().ok()?;
+        let creds: Vec<Cred> = rows.iter()
+            .filter(|(p, _, _, _, _)| p == "minimax")
+            .filter_map(|(_, _, _, _, auth)| serde_json::from_str::<Cred>(auth).ok())
+            .collect();
+        if let Some(key) = live.account_key.as_deref().filter(|k| !k.trim().is_empty()) {
+            if let Some(c) = creds.iter().find(|c| c.meta.get("accountKey").and_then(Value::as_str) == Some(key)) {
+                return Some(c.clone());
+            }
+        }
+        creds.into_iter().find(|c| {
+            c.token == live.token
+                || (!live.refresh_token.is_none() && c.refresh_token == live.refresh_token)
+        })
+    }
+
+    /// 准备本机 MiniMax 凭据：保留已存账号 uid，避免 token 过期导致 profile 查询失败后
+    /// 用 accountKey 新建重复账号；身份已解析过则不再每次同步都请求 profile。
+    async fn prepare_minimax_local_cred(&self, live: crate::adapters::minimax_local::MiniMaxLiveAuth) -> Cred {
+        let mut cred = crate::adapters::minimax_local::to_cred(live.clone());
+        let existing = self.find_minimax_cred_for_live(&live);
+        let stable_uid = existing.as_ref().map(|c| c.uid.clone());
+        if let Some(c) = existing {
+            cred.uid = c.uid.clone();
+            cred.name = c.name.clone();
+            if c.meta.get("identityResolved").and_then(Value::as_bool) == Some(true) {
+                return self.merge_minimax_local_cred(cred);
+            }
+        }
+        if Self::resolve_minimax_identity(&mut cred).await {
+            cred.meta["identityResolved"] = json!(true);
+        }
+        if let Some(uid) = stable_uid {
+            cred.uid = uid;
+        }
+        self.merge_minimax_local_cred(cred)
+    }
+
+    /// MiniMax 本机同步落库：与 refresh 共用同一账号单飞锁，避免“先读旧库再写”竞态
+    /// 把刚续期的新 RT 覆盖掉。
+    async fn persist_minimax_local_cred(&self, incoming: Cred) -> Result<Cred, PlatformError> {
+        let key = format!("{}:{}", incoming.provider, incoming.uid);
+        let _guard = cred_lock(&key).lock_owned().await;
+        let cred = self.merge_minimax_local_cred(incoming);
+        let auth = serde_json::to_string(&cred).map_err(|e| PlatformError::Local(e.to_string()))?;
+        self.store.upsert_account(&cred.provider, &cred.uid, &cred.name, "", &auth)
+            .map_err(|e| PlatformError::Local(e.to_string()))?;
+        if let Some(exp) = cred.expires_at.as_deref().filter(|e| !e.trim().is_empty()) {
+            let _ = self.store.update_account_expires(&cred.provider, &cred.uid, Some(exp.trim()));
+        }
+        Ok(cred)
     }
 
     /// CodeArts 凭据自动续期（STS 一次性 RT 场景的标准做法）：
@@ -258,6 +390,7 @@ impl Service {
     /// - 等客户端刷新要 15~20s/账号，多个账号会把巡检拖到分钟级；
     /// - 拉起 GUI 客户端属于「打扰用户」的操作，只应在用户请求失败时做一次，
     ///   不该由后台定时器反复触发。
+    ///
     /// 真正需要等待/拉起时，由请求命中 401 后的 [`Self::heal_cred`] 兜底。
     pub async fn heal_cred_quick(&self, platform: &str, stale: &Cred) -> Option<Cred> {
         self.heal_cred_opts(platform, stale, false).await
@@ -267,6 +400,17 @@ impl Service {
         // 码道：STS 一次性 RT + 需回写客户端 secretStorage，链路特殊，复用既有实现
         if platform.starts_with("codearts") {
             return self.ensure_codearts_fresh_opts(stale, allow_wait).await.ok();
+        }
+        // MiniMax 的 import_account 会扫描全部账号；按单账号自愈时不能走“导入全部再随便取一个”，
+        // 否则多账号会串号。refreshed_cred 已包含精确匹配本机记录 + refresh_token 两条路径。
+        if platform == "minimax" {
+            if let Ok(c) = self.refreshed_cred(platform, &stale.uid, stale).await {
+                return Some(c);
+            }
+            if !allow_wait {
+                return None;
+            }
+            return self.launch_and_rescan(platform, stale).await;
         }
         let (import_platform, intl) = import_target(platform);
         // ① 扫描本机（客户端可能已静默刷新）
@@ -287,7 +431,7 @@ impl Service {
         if !allow_wait {
             return None;
         }
-        self.launch_and_rescan(platform).await
+        self.launch_and_rescan(platform, stale).await
     }
 
     /// 取该 provider 的凭据：优先同 uid（常规刷新），其次任意（重新登录会换 uid）
@@ -303,17 +447,19 @@ impl Service {
 
     /// 拉起本机平台客户端并等它刷新登录态（最长 15s），然后重新扫描导入。
     /// 进程拉起与轮询都在线程池里做，不阻塞异步运行时。
-    async fn launch_and_rescan(&self, platform: &str) -> Option<Cred> {
+    async fn launch_and_rescan(&self, platform: &str, stale: &Cred) -> Option<Cred> {
         let p = platform.to_string();
+        let stale = stale.clone();
         let old_fp = tokio::task::spawn_blocking({
             let p = p.clone();
+            let stale = stale.clone();
             move || match p.as_str() {
                 "trae" | "trae-device" | "trae-intl" => crate::adapters::trae_local::token_fingerprint(),
                 "workbuddy" => crate::adapters::wb_local::session_fingerprint(false),
                 "workbuddy-intl" => crate::adapters::wb_local::session_fingerprint(true),
                 "qoder" => crate::adapters::qoder_local::token_fingerprint(false),
                 "qoder-intl" => crate::adapters::qoder_local::token_fingerprint(true),
-                "minimax" => crate::adapters::minimax_local::token_fingerprint(),
+                "minimax" => crate::adapters::minimax_local::token_fingerprint_for(&stale),
                 "zcode" => crate::adapters::zcode_local::token_fingerprint(),
                 _ => None,
             }
@@ -342,18 +488,29 @@ impl Service {
         let changed = tokio::task::spawn_blocking({
             let p = p.clone();
             let old = old_fp.clone();
+            let stale = stale.clone();
             move || match p.as_str() {
                 "trae" | "trae-device" | "trae-intl" => {
                     crate::adapters::trae_local::wait_for_token_change(old.as_deref(), std::time::Duration::from_secs(15)).is_some()
                 }
-                "workbuddy" | "workbuddy-intl" => {
-                    crate::adapters::wb_local::wait_for_session_change(p == "workbuddy-intl", old.as_deref(), std::time::Duration::from_secs(15)).is_some()
+                "workbuddy" => {
+                    crate::adapters::wb_local::wait_for_session_change(false, old.as_deref(), std::time::Duration::from_secs(15)).is_some()
                 }
-                "qoder" | "qoder-intl" => {
-                    crate::adapters::qoder_local::wait_for_token_change(p == "qoder-intl", old.as_deref(), std::time::Duration::from_secs(15)).is_some()
+                "workbuddy-intl" => {
+                    crate::adapters::wb_local::wait_for_session_change(true, old.as_deref(), std::time::Duration::from_secs(15)).is_some()
                 }
-                "minimax" => crate::adapters::minimax_local::wait_for_token_change(old.as_deref(), std::time::Duration::from_secs(15)).is_some(),
-                "zcode" => crate::adapters::zcode_local::wait_for_token_change(old.as_deref(), std::time::Duration::from_secs(15)).is_some(),
+                "qoder" => {
+                    crate::adapters::qoder_local::wait_for_token_change(false, old.as_deref(), std::time::Duration::from_secs(15)).is_some()
+                }
+                "qoder-intl" => {
+                    crate::adapters::qoder_local::wait_for_token_change(true, old.as_deref(), std::time::Duration::from_secs(15)).is_some()
+                }
+                "minimax" => crate::adapters::minimax_local::wait_for_matching_token_change(
+                    &stale, std::time::Duration::from_secs(15)
+                ).is_some(),
+                "zcode" => {
+                    crate::adapters::zcode_local::wait_for_token_change(old.as_deref(), std::time::Duration::from_secs(15)).is_some()
+                }
                 _ => false,
             }
         })
@@ -361,6 +518,9 @@ impl Service {
         .unwrap_or(false);
         if !changed {
             return None;
+        }
+        if platform == "minimax" {
+            return self.refreshed_cred(platform, &stale.uid, &stale).await.ok();
         }
         let (import_platform, intl) = import_target(platform);
         if self.import_account(import_platform, intl).await.is_ok() {
@@ -396,7 +556,8 @@ impl Service {
     }
 
     /// 自动续期巡检（**全部平台**，不再只码道）：对「剩余有效期 < within 秒」的账号
-    /// 执行 `heal_cred`。没有到期信息的平台跳过（由请求时的 401 自愈兜底）。
+    /// 执行快速自愈。MiniMax 历史账号若没有到期时间但有 refresh token，也会主动续期一次，
+    /// 以服务器返回的新过期时间补齐后续巡检条件。
     /// `within` = 提前多久开始续期（秒）。
     ///
     /// 每个账号的续期都套**硬超时**：续期链会等官方客户端刷新（最长 15~20s）、
@@ -410,12 +571,20 @@ impl Service {
             .as_millis() as i64;
         for (p, u, _n, _s, auth) in rows {
             let Ok(cred) = serde_json::from_str::<Cred>(&auth) else { continue };
-            let Some(exp_ms) = cred_expiry_ms(&p, &cred) else { continue };
-            if exp_ms - now_ms > within * 1000 {
+            let exp_ms = cred_expiry_ms(&p, &cred);
+            let due = match exp_ms {
+                Some(ms) => ms - now_ms <= within * 1000,
+                None => p == "minimax" && cred.refresh_token.is_some(),
+            };
+            if !due {
                 continue;
             }
             let t0 = std::time::Instant::now();
-            eprintln!("[renew] {p}:{u} 即将过期（剩余 {}s），开始自动续期…", (exp_ms - now_ms) / 1000);
+            if let Some(ms) = exp_ms {
+                eprintln!("[renew] {p}:{u} 即将过期（剩余 {}s），开始自动续期…", (ms - now_ms) / 1000);
+            } else {
+                eprintln!("[renew] {p}:{u} 缺少到期时间，尝试 refresh 以获取服务器过期时间…");
+            }
             // 后台巡检走 **快速路径**：不等客户端刷新、不拉起 GUI 客户端（否则会拖到分钟级）。
             // 仍套硬超时兜底：万一底层阻塞调用卡住，也不会让巡检永久停摆。
             let healed = tokio::time::timeout(HEAL_TIMEOUT, self.heal_cred_quick(&p, &cred)).await;
@@ -717,13 +886,13 @@ impl Service {
 
     /// MiniMax Code 账号身份校正（best-effort）：GET /matrix/api/v1/user/profile
     /// 取 `user_id` / `user_name`，覆盖 `to_cred` 从本机文件猜出来的 uid/name。
-    /// 失败（离线 / token 过期）时保留原值，不阻塞导入。
-    async fn resolve_minimax_identity(cred: &mut Cred) {
+    /// 失败（离线 / token 过期）时保留原值，不阻塞导入。返回是否成功解析身份。
+    async fn resolve_minimax_identity(cred: &mut Cred) -> bool {
         if cred.token.is_empty() {
-            return;
+            return false;
         }
         let adapter = crate::adapters::minimax::MiniMaxAdapter;
-        let Ok(profile) = Adapter::verify(&adapter, cred).await else { return };
+        let Ok(profile) = Adapter::verify(&adapter, cred).await else { return false };
         let uid = json_id_string(profile.get("user_id").unwrap_or(&Value::Null));
         let name = profile.get("user_name").and_then(|n| n.as_str()).unwrap_or("").trim().to_string();
         if !uid.is_empty() {
@@ -740,6 +909,7 @@ impl Service {
                 }
             }
         }
+        true
     }
 
     /// 本机扫描导入（trae/wb/qoder/minimax/zcode/codearts），对齐 CLI import 逻辑。
@@ -819,25 +989,16 @@ impl Service {
                 let Some(first) = all.first().cloned() else {
                     return Err(PlatformError::Local("未发现 MiniMax Code 登录信息（客户端未安装或未登录）".into()));
                 };
-                // 主记录：本机 auth.json 的 accessToken 是 `mmoat_*` 不透明串（不是 JWT），
-                // uid 拿不到时会退化成记录键/哈希。这里用 profile 接口（user_id/user_name）
-                // 校正成权威账号标识——否则入库 uid 可能为空，被 ui_snapshot 的脏行清理删掉，
-                // 现象就是「提示导入成功但账号列表里没有」。
-                let mut cred = crate::adapters::minimax_local::to_cred(first);
-                Self::resolve_minimax_identity(&mut cred).await;
-                // 客户端多账号登录时 records 会有多条：其余记录一并入库（失败不影响主账号）
+                // 先按 accountKey/token/RT 找回已存账号，再补身份信息；token 过期时不会
+                // 因 profile 查询失败而用 accountKey 新建重复账号。
+                let cred = self.prepare_minimax_local_cred(first).await;
+                // 客户端多账号登录时 records 会有多条：其余记录逐账号独立续期/落库。
                 for live in all.into_iter().skip(1) {
-                    let mut extra = crate::adapters::minimax_local::to_cred(live);
-                    Self::resolve_minimax_identity(&mut extra).await;
+                    let extra = self.prepare_minimax_local_cred(live).await;
                     if extra.uid.trim().is_empty() || extra.uid == cred.uid {
                         continue;
                     }
-                    if let Ok(auth) = serde_json::to_string(&extra) {
-                        let _ = self.store.upsert_account(&extra.provider, &extra.uid, &extra.name, "", &auth);
-                        if let Some(exp) = extra.expires_at.as_deref().filter(|e| !e.trim().is_empty()) {
-                            let _ = self.store.update_account_expires(&extra.provider, &extra.uid, Some(exp.trim()));
-                        }
-                    }
+                    let _ = self.persist_minimax_local_cred(extra).await;
                 }
                 cred
             }
@@ -931,6 +1092,10 @@ impl Service {
                 "未能解析出 {} 的账号标识（uid），本次不写入（请确认客户端已登录后重新扫描）",
                 cred.provider
             )));
+        }
+        if cred.provider == "minimax" {
+            let cred = self.persist_minimax_local_cred(cred).await?;
+            return Ok(json!({ "provider": cred.provider, "uid": cred.uid, "name": cred.name }));
         }
         let auth = serde_json::to_string(&cred).map_err(|e| PlatformError::Local(e.to_string()))?;
         self.store.upsert_account(&cred.provider, &cred.uid, &cred.name, "", &auth)
@@ -1081,20 +1246,26 @@ fn cred_expiry_ms(provider: &str, cred: &Cred) -> Option<i64> {
             return Some(ms);
         }
     }
-    let s = cred.expires_at.as_deref()?.trim();
-    if s.is_empty() {
-        return None;
+    let s = cred.expires_at.as_deref().unwrap_or("").trim();
+    if !s.is_empty() {
+        if let Some(ms) = crate::adapters::codearts::iso_to_epoch_ms(s) {
+            return Some(ms);
+        }
+        // 仅日期 YYYY-MM-DD → 该日结束（UTC）。ZCode 的 zcodeJwt exp 就是按 UTC 日期解出来的，
+        // 故按 end-of-day UTC 作为上界即可（宁可略早续期，不要误判为已过期而反复拉起客户端）。
+        let y: i64 = s.get(0..4)?.parse().ok()?;
+        let mo: i64 = s.get(5..7)?.parse().ok()?;
+        let d: i64 = s.get(8..10)?.parse().ok()?;
+        let days = crate::adapters::days_from_civil(y, mo, d);
+        return Some((days + 1) * 86_400_000 - 1);
     }
-    if let Some(ms) = crate::adapters::codearts::iso_to_epoch_ms(s) {
-        return Some(ms);
+    // MiniMax 老记录可能只有 meta.expiresAtMs；续期后会同步更新该字段。
+    if provider == "minimax" {
+        if let Some(ms) = cred.meta.get("expiresAtMs").and_then(Value::as_i64).filter(|ms| *ms > 0) {
+            return Some(ms);
+        }
     }
-    // 仅日期 YYYY-MM-DD → 该日结束（UTC）。ZCode 的 zcodeJwt exp 就是按 UTC 日期解出来的，
-    // 故按 end-of-day UTC 作为上界即可（宁可略早续期，不要误判为已过期而反复拉起客户端）。
-    let y: i64 = s.get(0..4)?.parse().ok()?;
-    let mo: i64 = s.get(5..7)?.parse().ok()?;
-    let d: i64 = s.get(8..10)?.parse().ok()?;
-    let days = crate::adapters::days_from_civil(y, mo, d);
-    Some((days + 1) * 86_400_000 - 1)
+    None
 }
 
 /// 从 Trae JWT payload 取 /data/id 作为 uid（解析失败返回空串）。
@@ -1117,4 +1288,133 @@ fn jwt_exp_of(token: &str) -> Option<String> {
     let exp = v.get("exp").and_then(|e| e.as_i64())?;
     let (y, mo, d) = crate::adapters::civil_from_days(exp / 86400);
     Some(format!("{y:04}-{mo:02}-{d:02}"))
+}
+
+#[cfg(test)]
+mod minimax_refresh_tests {
+    use super::*;
+    use crate::adapters::minimax_local::{MiniMaxLiveAuth, to_cred};
+
+    struct TempDb(std::path::PathBuf);
+
+    impl Drop for TempDb {
+        fn drop(&mut self) {
+            for suffix in ["", "-wal", "-shm"] {
+                let _ = std::fs::remove_file(format!("{}{suffix}", self.0.display()));
+            }
+        }
+    }
+
+    fn test_service() -> (Service, TempDb) {
+        let path = std::env::temp_dir().join(format!("credit-rs-minimax-{}.sqlite", uuid::Uuid::new_v4()));
+        let store = Arc::new(Store::open(&path).unwrap());
+        (Service { store }, TempDb(path))
+    }
+
+    fn cred(uid: &str, token: &str, refresh: &str, expiry: &str, account_key: &str) -> Cred {
+        Cred {
+            provider: "minimax".into(),
+            uid: uid.into(),
+            name: format!("MiniMax {uid}"),
+            token: token.into(),
+            refresh_token: Some(refresh.into()),
+            expires_at: Some(expiry.into()),
+            meta: json!({
+                "accountKey": account_key,
+                "localFingerprint": format!("fp-{account_key}"),
+                "identityResolved": true,
+                "region": "cn",
+            }),
+        }
+    }
+
+    fn save(store: &Store, c: &Cred) {
+        let auth = serde_json::to_string(c).unwrap();
+        store.upsert_account(&c.provider, &c.uid, &c.name, "", &auth).unwrap();
+    }
+
+    fn live(account_key: &str, token: &str, refresh: &str, expiry_ms: u64) -> MiniMaxLiveAuth {
+        MiniMaxLiveAuth {
+            token: token.into(),
+            refresh_token: Some(refresh.into()),
+            expires_at: Some(crate::adapters::codearts::epoch_ms_to_iso(expiry_ms as i64)),
+            expires_ms: Some(expiry_ms),
+            region: "cn".into(),
+            account_key: Some(account_key.into()),
+        }
+    }
+
+    #[test]
+    fn stale_local_auth_cannot_overwrite_newer_refresh() {
+        let (svc, _tmp) = test_service();
+        let mut existing = cred("user-a", "server-new", "rt-new", "2026-11-28T00:00:00Z", "account-a");
+        existing.meta["supersededLocalFingerprint"] = json!("fp-account-a");
+        save(&svc.store, &existing);
+        // 即使旧文件的到期时间更晚，只要指纹已被服务端 refresh 标记作废，也必须保留新 RT。
+        let mut incoming = to_cred(live("account-a", "local-old", "rt-old", 1_900_000_000_000));
+        incoming.uid = existing.uid.clone();
+        incoming.meta["localFingerprint"] = json!("fp-account-a");
+        let merged = svc.merge_minimax_local_cred(incoming);
+        assert_eq!(merged.token, "server-new");
+        assert_eq!(merged.refresh_token.as_deref(), Some("rt-new"));
+        assert_eq!(merged.expires_at.as_deref(), Some("2026-11-28T00:00:00Z"));
+        assert_eq!(merged.meta["identityResolved"], true);
+        drop(svc);
+    }
+
+    #[test]
+    fn newer_local_auth_can_replace_older_db_auth() {
+        let (svc, _tmp) = test_service();
+        let existing = cred("user-a", "db-old", "rt-old", "2026-11-27T00:00:00Z", "account-a");
+        save(&svc.store, &existing);
+        let mut incoming = to_cred(live("account-a", "local-new", "rt-new", 1_900_000_000_000));
+        incoming.uid = existing.uid.clone();
+        incoming.expires_at = existing.expires_at.clone();
+        incoming.meta["localFingerprint"] = json!("fp-account-a-new");
+        let merged = svc.merge_minimax_local_cred(incoming);
+        assert_eq!(merged.token, "local-new");
+        assert_eq!(merged.refresh_token.as_deref(), Some("rt-new"));
+        assert!(merged.meta.get("supersededLocalFingerprint").is_none());
+        drop(svc);
+    }
+
+    #[test]
+    fn missing_local_expiry_keeps_refreshable_db_auth() {
+        let (svc, _tmp) = test_service();
+        let existing = cred("user-a", "server-new", "rt-new", "2026-11-28T00:00:00Z", "account-a");
+        save(&svc.store, &existing);
+        let mut incoming = to_cred(live("account-a", "local-old", "rt-old", 1_794_000_000_000));
+        incoming.uid = existing.uid.clone();
+        incoming.expires_at = None;
+        incoming.meta["localFingerprint"] = json!("fp-account-a");
+        let merged = svc.merge_minimax_local_cred(incoming);
+        assert_eq!(merged.token, "server-new");
+        drop(svc);
+    }
+
+    #[tokio::test]
+    async fn multi_account_prepare_is_stable_and_does_not_cross_accounts() {
+        let (svc, _tmp) = test_service();
+        let live_a = live("account-a", "local-a-old", "rt-a-old", 1_794_000_000_000);
+        let local_a_fp = to_cred(live_a.clone()).meta["localFingerprint"].clone();
+        let mut a = cred("profile-a", "server-a", "rt-a", "2026-11-28T00:00:00Z", "account-a");
+        a.meta["localFingerprint"] = local_a_fp;
+        let b = cred("profile-b", "server-b", "rt-b", "2026-11-29T00:00:00Z", "account-b");
+        save(&svc.store, &a);
+        save(&svc.store, &b);
+
+        let prepared = svc.prepare_minimax_local_cred(live_a).await;
+        assert_eq!(prepared.uid, "profile-a");
+        assert_eq!(prepared.token, "server-a");
+        assert_eq!(svc.pick_cred("minimax", "profile-b").unwrap().token, "server-b");
+        drop(svc);
+    }
+
+    #[test]
+    fn minimax_expiry_falls_back_to_meta_ms() {
+        let mut c = cred("user-a", "token", "rt", "2026-11-28T00:00:00Z", "account-a");
+        c.expires_at = None;
+        c.meta["expiresAtMs"] = json!(1_900_000_000_000_i64);
+        assert_eq!(cred_expiry_ms("minimax", &c), Some(1_900_000_000_000));
+    }
 }

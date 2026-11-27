@@ -39,7 +39,7 @@ impl AppView {
                                 .on_click(cx.listener(|this, _, _w, cx| this.checkin_all(cx)))),
                     ),
             )
-            .children(plats.iter().map(|p| self.render_platform_group(*p, &accs, cx)))
+            .children(plats.iter().map(|p| self.render_platform_group(p, &accs, cx)))
     }
 
     pub(crate) fn render_platform_group(&self, p: &'static str, accs: &[AccountRow], cx: &mut Context<Self>) -> AnyElement {

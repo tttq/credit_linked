@@ -46,7 +46,7 @@ async fn main() {
     // 4. 创建聊天请求示例
     println!("\nStep 4: Creating chat request body...");
     
-    let messages = vec![
+    let messages = [
         json!({
             "role": "user",
             "content": "你好，请介绍一下你自己"

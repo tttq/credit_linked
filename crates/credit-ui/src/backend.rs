@@ -100,9 +100,7 @@ pub async fn quota_refresh_all() -> Result<serde_json::Value, String> {
     let mut ok = 0usize;
     let mut fail = 0usize;
     for (p, uid, _, _, _) in &accounts {
-        if p.starts_with("codearts") {
-            if p == "codearts-desktop" { continue; } // 两通道共享额度，只刷主通道
-        }
+        if p.starts_with("codearts") && p == "codearts-desktop" { continue; } // 两通道共享额度，只刷主通道
         match s.quota_account(p, uid).await {
             Ok(_) => ok += 1,
             Err(_) => fail += 1,

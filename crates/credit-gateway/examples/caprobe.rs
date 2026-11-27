@@ -55,7 +55,7 @@ async fn one_chat(
     let body = credit_gateway::protocol::codearts_chat_body(
         &[json!({"role":"user","content":"say hi"})],
         "",
-        &model,
+        model,
         Some(64),
         None,
     );
@@ -241,8 +241,8 @@ async fn main() -> anyhow::Result<()> {
         println!("reuse sid={sid} model={model}");
         for i in 0..n {
             match one_chat(&cred, i, "fixed", &sid, &model).await {
-                Ok((_, msg)) => println!("[{i}] OK: {}", &msg.chars().take(120).collect::<String>()),
-                Err((_, msg)) => println!("[{i}] ERR: {}", &msg.chars().take(160).collect::<String>()),
+                Ok((_, msg)) => println!("[{i}] OK: {}", msg.chars().take(120).collect::<String>()),
+                Err((_, msg)) => println!("[{i}] ERR: {}", msg.chars().take(160).collect::<String>()),
             }
         }
         return Ok(());

@@ -382,8 +382,10 @@ pub fn system_information() -> SysInfo {
 }
 
 fn collect_system_information() -> SysInfo {
-    let mut si = SysInfo::default();
-    si.os_name = if cfg!(windows) { "windows".to_string() } else { std::env::consts::OS.to_string() };
+    let mut si = SysInfo {
+        os_name: if cfg!(windows) { "windows".to_string() } else { std::env::consts::OS.to_string() },
+        ..Default::default()
+    };
     if cfg!(windows) {
         // 一次 PowerShell 取齐：Model / Manufacturer / CPU / ProductName
         let script = "$ErrorActionPreference='SilentlyContinue';\
@@ -679,18 +681,15 @@ pub async fn exchange_auth_code(login: &TraeLogin, callback: &std::collections::
         ("x-cloudide-token", token.clone()),
     ];
     let info_body = json!({ "ReqSource": "IDE", "IDEVersion": app_version, "GetUIDFusionInfo": true });
-    match platform_fetch(&format!("{base}{USERINFO_PATH}"), Method::POST, Some(info_body), &info_hs).await {
-        Ok(u) => {
-            let r = u.get("Result").cloned().unwrap_or(u);
-            uid = match r.get("UserID") {
-                Some(Value::String(s)) => s.trim().to_string(),
-                Some(Value::Number(n)) => n.to_string(),
-                _ => String::new(),
-            };
-            name = r.get("ScreenName").and_then(|s| s.as_str()).unwrap_or("").to_string();
-            region = r.get("AIRegion").and_then(|s| s.as_str()).unwrap_or("").to_string();
-        }
-        Err(_) => {}
+    if let Ok(u) = platform_fetch(&format!("{base}{USERINFO_PATH}"), Method::POST, Some(info_body), &info_hs).await {
+        let r = u.get("Result").cloned().unwrap_or(u);
+        uid = match r.get("UserID") {
+            Some(Value::String(s)) => s.trim().to_string(),
+            Some(Value::Number(n)) => n.to_string(),
+            _ => String::new(),
+        };
+        name = r.get("ScreenName").and_then(|s| s.as_str()).unwrap_or("").to_string();
+        region = r.get("AIRegion").and_then(|s| s.as_str()).unwrap_or("").to_string();
     }
     // 用户信息拿不到时退回回调里的 userInfo / JWT
     if uid.is_empty() {

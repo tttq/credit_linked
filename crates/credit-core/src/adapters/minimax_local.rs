@@ -4,6 +4,7 @@
 use crate::debug_log;
 use crate::adapters::Cred;
 use base64::Engine;
+use serde_json::Value;
 
 /// 本机 MiniMax Code 登录态（auth.json records 中一条有效记录）
 #[derive(Clone)]
@@ -168,6 +169,37 @@ pub fn read_live_auth() -> Option<MiniMaxLiveAuth> {
     read_all_live_auths().into_iter().next()
 }
 
+/// 从候选登录态中精确匹配一个已有账号。
+///
+/// 匹配优先级：稳定 accountKey → access token → refresh token。
+/// 故意不提供“只有一个候选就返回”的兜底：浏览器登录账号与本机客户端账号可能不同，
+/// 多账号场景下这种兜底会把 A 的 token 写进 B。
+pub fn select_matching_live_auth<'a>(all: &'a [MiniMaxLiveAuth], cred: &Cred) -> Option<&'a MiniMaxLiveAuth> {
+    let account_key = cred.meta.get("accountKey").and_then(Value::as_str)
+        .map(str::trim).filter(|s| !s.is_empty());
+    if let Some(key) = account_key {
+        if let Some(auth) = all.iter().find(|a| a.account_key.as_deref().map(str::trim) == Some(key)) {
+            return Some(auth);
+        }
+    }
+    if !cred.token.is_empty() {
+        if let Some(auth) = all.iter().find(|a| a.token == cred.token) {
+            return Some(auth);
+        }
+    }
+    if let Some(rt) = cred.refresh_token.as_deref().filter(|s| !s.is_empty()) {
+        if let Some(auth) = all.iter().find(|a| a.refresh_token.as_deref() == Some(rt)) {
+            return Some(auth);
+        }
+    }
+    None
+}
+
+/// 读取与指定账号匹配的本机登录态；没有可靠匹配时返回 None。
+pub fn find_matching_live_auth(cred: &Cred) -> Option<MiniMaxLiveAuth> {
+    select_matching_live_auth(&read_all_live_auths(), cred).cloned()
+}
+
 /// 直接转换为入库凭据。
 ///
 /// uid 解析顺序（**绝不允许为空**）：
@@ -176,6 +208,7 @@ pub fn read_live_auth() -> Option<MiniMaxLiveAuth> {
 /// ③ 都拿不到 → refreshToken/accessToken 短哈希。
 /// 空 uid 会被 `ui_snapshot()` 里的脏行清理删掉，UI 表现为「导入成功但列表没有」。
 pub fn to_cred(auth: MiniMaxLiveAuth) -> Cred {
+    let local_fingerprint = auth_fingerprint(&auth);
     let mut uid = extract_uid_from_token(&auth.token);
     if uid.trim().is_empty() {
         if let Some(k) = auth.account_key.as_deref() {
@@ -199,6 +232,7 @@ pub fn to_cred(auth: MiniMaxLiveAuth) -> Cred {
             "region": auth.region,
             "accountKey": auth.account_key,
             "expiresAtMs": auth.expires_ms,
+            "localFingerprint": local_fingerprint,
         }),
     }
 }
@@ -236,12 +270,22 @@ fn extract_uid_from_token(token: &str) -> String {
     String::new()
 }
 
+/// 登录态指纹（access token + refresh token，不泄露明文）。
+fn auth_fingerprint(auth: &MiniMaxLiveAuth) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    if auth.token.is_empty() { return None; }
+    let seed = format!("{}\0{}", auth.token, auth.refresh_token.as_deref().unwrap_or(""));
+    Some(Sha256::digest(seed.as_bytes()).iter().map(|b| format!("{b:02x}")).collect::<String>()[..16].to_string())
+}
+
 /// token 指纹（识别 MiniMax Code 客户端是否已刷新登录态；不泄露 token 明文）
 pub fn token_fingerprint() -> Option<String> {
-    use sha2::{Digest, Sha256};
-    let auth = read_live_auth()?;
-    if auth.token.is_empty() { return None; }
-    Some(Sha256::digest(auth.token.as_bytes()).iter().map(|b| format!("{b:02x}")).collect::<String>()[..16].to_string())
+    read_live_auth().and_then(|a| auth_fingerprint(&a))
+}
+
+/// 指定账号的本机登录态指纹（多账号场景不能用第一条记录代替）。
+pub fn token_fingerprint_for(cred: &Cred) -> Option<String> {
+    find_matching_live_auth(cred).and_then(|a| auth_fingerprint(&a))
 }
 
 /// 本机 MiniMax Code 客户端 exe 候选
@@ -271,6 +315,21 @@ pub fn launch_client() -> Option<std::path::PathBuf> {
         .stderr(std::process::Stdio::null())
         .spawn();
     Some(exe)
+}
+
+/// 等待指定账号的本机登录态变化（access token 或 refresh token），最多 timeout。
+pub fn wait_for_matching_token_change(cred: &Cred, timeout: std::time::Duration) -> Option<MiniMaxLiveAuth> {
+    let start = std::time::Instant::now();
+    let old_fp = token_fingerprint_for(cred);
+    loop {
+        if let Some(live) = find_matching_live_auth(cred) {
+            if auth_fingerprint(&live).as_deref() != old_fp.as_deref() {
+                return Some(live);
+            }
+        }
+        if start.elapsed() >= timeout { return None; }
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+    }
 }
 
 /// 等待客户端刷新 token（指纹变化），最多 timeout。返回 Some = 已刷新。
@@ -320,6 +379,7 @@ mod tests {
         assert_eq!(c.uid, "L5v6Na6pPThgjT-L-XpF5lOVe1YvYZs_eM_0P5wd1Ec");
         assert_eq!(c.provider, "minimax");
         assert_eq!(c.meta["region"], "cn");
+        assert!(c.meta["localFingerprint"].is_string());
 
         // 无记录键（老客户端）→ 哈希兜底，仍然非空且稳定
         let mut no_key = live.clone();
@@ -327,5 +387,36 @@ mod tests {
         let c2 = to_cred(no_key.clone());
         assert!(!c2.uid.trim().is_empty());
         assert_eq!(c2.uid, to_cred(no_key).uid);
+    }
+
+    fn live(key: &str, token: &str, refresh: &str) -> MiniMaxLiveAuth {
+        MiniMaxLiveAuth {
+            token: token.into(),
+            refresh_token: Some(refresh.into()),
+            expires_at: Some("2026-11-28T00:00:00Z".into()),
+            expires_ms: Some(1_900_000_000_000),
+            region: "cn".into(),
+            account_key: Some(key.into()),
+        }
+    }
+
+    #[test]
+    fn matching_live_auth_never_crosses_accounts() {
+        let all = vec![
+            live("account-a", "token-a", "refresh-a"),
+            live("account-b", "token-b", "refresh-b"),
+        ];
+        let mut a = to_cred(all[0].clone());
+        a.uid = "profile-a".into();
+        a.meta["accountKey"] = serde_json::json!("account-a");
+        assert_eq!(select_matching_live_auth(&all, &a).unwrap().token, "token-a");
+
+        let mut legacy_b = to_cred(all[1].clone());
+        legacy_b.meta = serde_json::json!({});
+        legacy_b.token = "token-b".into();
+        assert_eq!(select_matching_live_auth(&all, &legacy_b).unwrap().token, "token-b");
+
+        let unknown = Cred { token: "unknown".into(), refresh_token: Some("unknown-r".into()), ..Default::default() };
+        assert!(select_matching_live_auth(&all, &unknown).is_none());
     }
 }
